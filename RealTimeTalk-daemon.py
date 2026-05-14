@@ -39,12 +39,15 @@ import websockets
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-OPENCLAW_CONFIG = os.path.expanduser("~/.openclaw/openclaw.json")
-OPENAI_MODEL    = "gpt-4o-realtime-preview"
-OPENAI_WS_URL   = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
-SAMPLE_RATE     = 24000
-CHANNELS        = 1
-BLOCKSIZE       = 2400   # 100 ms at 24 kHz
+OPENCLAW_CONFIG  = os.path.expanduser("~/.openclaw/openclaw.json")
+OPENAI_MODEL     = "gpt-4o-realtime-preview"
+OPENAI_WS_URL    = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
+SAMPLE_RATE      = 24000        # OpenAI Realtime API rate
+DEVICE_RATE      = 48000        # Hardware rate (USB mic + speaker)
+RESAMPLE_RATIO   = DEVICE_RATE // SAMPLE_RATE   # 2
+CHANNELS         = 1
+BLOCKSIZE        = 2400         # 100 ms at 24 kHz (API frames)
+DEVICE_BLOCKSIZE = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
 DEFAULT_HTTP_PORT = 18790
 RECONNECT_DELAY   = 5    # seconds between reconnect attempts
 
@@ -70,6 +73,23 @@ def load_openai_key() -> str:
            .get("openai", {})
            .get("apiKey", "")
     )
+    # Resolve OpenClaw SecretRef: {"source":"file","provider":"...","id":"/a/b/c"}
+    if isinstance(key, dict) and key.get("source") == "file":
+        provider_name = key.get("provider", "")
+        secret_path = (
+            cfg.get("secrets", {})
+               .get("providers", {})
+               .get(provider_name, {})
+               .get("path", "")
+        )
+        secret_path = os.path.expanduser(secret_path)
+        with open(secret_path) as sf:
+            secrets = json.load(sf)
+        # Navigate id path: "/providers/openai/apiKey" → secrets["providers"]["openai"]["apiKey"]
+        parts = [p for p in key.get("id", "").split("/") if p]
+        for part in parts:
+            secrets = secrets[part]
+        key = secrets
     if not key:
         raise RuntimeError(
             "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json"
@@ -122,13 +142,18 @@ class TalkSession:
     # ── PortAudio callbacks (run in PortAudio thread) ─────────────────────────
 
     def _mic_cb(self, indata, frames, time_info, status):
+        # Decimate DEVICE_RATE→SAMPLE_RATE by taking every RESAMPLE_RATIO-th sample
+        decimated = indata[::RESAMPLE_RATIO, 0].tobytes()
         try:
-            self.loop.call_soon_threadsafe(self._mic_q.put_nowait, bytes(indata))
+            self.loop.call_soon_threadsafe(self._mic_q.put_nowait, decimated)
         except asyncio.QueueFull:
             pass
 
     def _spk_cb(self, outdata, frames, time_info, status):
-        outdata[:, 0] = self._spk_buf.read(frames)
+        # Read API-rate frames then upsample to device rate via sample-and-hold
+        api_frames = frames // RESAMPLE_RATIO
+        pcm_24k = self._spk_buf.read(api_frames)
+        outdata[:, 0] = np.repeat(pcm_24k, RESAMPLE_RATIO)
 
     # ── WebSocket send / receive ──────────────────────────────────────────────
 
@@ -198,13 +223,13 @@ class TalkSession:
             log.info("Session active — speak now")
 
             in_stream  = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=BLOCKSIZE, callback=self._mic_cb,
+                samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
                 device=self.input_device,
             )
             out_stream = sd.OutputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=BLOCKSIZE, callback=self._spk_cb,
+                samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=DEVICE_BLOCKSIZE, callback=self._spk_cb,
                 device=self.output_device,
             )
 

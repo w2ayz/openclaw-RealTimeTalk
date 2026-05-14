@@ -9,7 +9,8 @@ DAEMON="$SKILL_DIR/RealTimeTalk-daemon.py"
 SERVICE_NAME="openclaw-realtimetalk"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
-PYTHON="$(command -v python3)"
+VENV="$HOME/.local/realtimetalk-venv"
+PYTHON="$VENV/bin/python"
 
 echo "=== OpenClaw RealTimeTalk installer ==="
 echo "Daemon:   $DAEMON"
@@ -18,7 +19,10 @@ echo ""
 
 # ── 1. Python dependencies ────────────────────────────────────────────────────
 echo "[1/4] Installing Python dependencies…"
-pip3 install --user --quiet "sounddevice>=0.4" "websockets>=12" "numpy>=1.20"
+# Use a venv — Raspberry Pi OS Bookworm (PEP 668) blocks pip3 --user installs
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install --quiet "sounddevice>=0.4" "websockets>=12" "numpy>=1.20"
+echo "      ✓ venv: $VENV"
 echo "      ✓ sounddevice  websockets  numpy"
 
 # ── 2. System audio library ───────────────────────────────────────────────────
