@@ -13,7 +13,7 @@ Runs as a `systemd` user service that starts automatically on boot and stays act
 - Audio transcripts logged via `journald`
 - HTTP toggle on port 18790 — `/stop` from any phone browser
 - Internal reconnect loop — recovers from network drops without restarting
-- Single `install-pi.sh` deployment — runs on fresh Raspberry Pi OS
+- Single `install-pi.sh` deployment — runs on fresh Raspberry Pi OS Bookworm
 
 ---
 
@@ -29,13 +29,15 @@ Raspberry Pi (headless, battery-powered)
         │
         ├── Reads API key ─────► ~/.openclaw/openclaw.json
         │                         talk.providers.openai.apiKey
+        │                         (plain string or OpenClaw SecretRef)
+        │                         SecretRef → ~/.openclaw/secrets.json
         │
         ├── WebSocket ────────► wss://api.openai.com/v1/realtime
         │                         Authorization: Bearer <api_key>
         │                         OpenAI-Beta: realtime=v1
         │
-        ├── Audio IN ─────────► USB microphone (PortAudio / ALSA)
-        ├── Audio OUT ────────► 3.5mm / USB speaker (PortAudio / ALSA)
+        ├── Audio IN ─────────► USB microphone (48 kHz capture → 24 kHz to API)
+        ├── Audio OUT ────────► 3.5mm / USB speaker (24 kHz from API → 48 kHz playback)
         │
         └── HTTP :18790 ──────► GET /stop    → graceful shutdown
                                  GET /status  → {"status":"running"}
@@ -55,62 +57,98 @@ Raspberry Pi (headless, battery-powered)
 
 | Requirement | Notes |
 |-------------|-------|
-| Raspberry Pi OS (Bookworm recommended) | Pi 5 or Pi 4 |
+| Raspberry Pi OS Bookworm | Pi 5 or Pi 4 |
 | Python 3.9+ | Pre-installed on Bookworm |
 | OpenClaw gateway running locally | Provides the OpenAI API key |
-| OpenAI API key configured in openclaw | `talk.providers.openai.apiKey` in `openclaw.json` |
-| USB microphone | Any USB mic; index configurable |
-| Speaker | 3.5mm or USB; index configurable |
+| OpenAI API key configured in OpenClaw | Plain string or SecretRef at `talk.providers.openai.apiKey` — see below |
+| USB microphone | Any USB mic; 44100 / 48 kHz hardware is fine — resampling is automatic |
+| Speaker | 3.5mm or USB; 48 kHz hardware is fine |
 | Tailscale (recommended) | For remote stop without keyboard |
+
+### OpenAI API key formats
+
+The daemon accepts either format in `~/.openclaw/openclaw.json`:
+
+**Plain string:**
+```json
+"talk": {
+  "providers": {
+    "openai": { "apiKey": "sk-proj-..." }
+  }
+}
+```
+
+**OpenClaw SecretRef** (recommended — keeps the key out of the main config):
+```json
+"talk": {
+  "providers": {
+    "openai": {
+      "apiKey": { "source": "file", "provider": "filemain", "id": "/providers/openai/apiKey" }
+    }
+  }
+},
+"secrets": {
+  "providers": {
+    "filemain": { "source": "file", "path": "~/.openclaw/secrets.json", "mode": "json" }
+  }
+}
+```
+
+With the corresponding `~/.openclaw/secrets.json` (chmod 600):
+```json
+{ "providers": { "openai": { "apiKey": "sk-proj-..." } } }
+```
 
 ---
 
 ## Installation
 
-### 1. Copy skill to Pi
+### 1. Clone the repo on the Pi
 
 ```bash
-scp -r ~/.openclaw/workspace/skills/RealTimeTalk \
-    pi@<pi-ip>:~/.openclaw/workspace/skills/
+git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git ~/openclaw-RealTimeTalk
 ```
 
-Or clone directly on the Pi:
+Or to install as an OpenClaw skill:
 
 ```bash
-git clone https://github.com/w2ayz/openclaw-RealTimeTalk \
+git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git \
     ~/.openclaw/workspace/skills/RealTimeTalk
 ```
 
 ### 2. Run the installer
 
 ```bash
-bash ~/.openclaw/workspace/skills/RealTimeTalk/RealTimeTalk-install-pi.sh
+bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 ```
 
 The installer will:
-1. Install Python deps (`sounddevice`, `websockets>=12`, `numpy`)
+1. Create a Python venv at `~/.local/realtimetalk-venv` and install deps (`sounddevice`, `websockets>=12`, `numpy`)
 2. Install `libportaudio2` via apt
 3. Print all available audio devices
 4. Write `~/.config/systemd/user/openclaw-realtimetalk.service`
-5. Enable linger (service survives without login session)
+5. Enable linger (service survives without a login session)
 6. Start the service immediately
+
+> **Note:** The installer uses a virtualenv because Raspberry Pi OS Bookworm (PEP 668) blocks
+> system-wide `pip install`. The systemd service points at `~/.local/realtimetalk-venv/bin/python`.
 
 ### 3. Set audio devices (if defaults don't work)
 
 List devices:
 ```bash
-bash ~/.openclaw/workspace/skills/RealTimeTalk/RealTimeTalk-toggle.sh devices
+bash ~/openclaw-RealTimeTalk/RealTimeTalk-toggle.sh devices
 ```
 
 Edit the two lines near the top of `RealTimeTalk-install-pi.sh`:
 ```bash
-AUDIO_INPUT="2"    # index of USB microphone
-AUDIO_OUTPUT="0"   # index of speaker
+AUDIO_INPUT="1"    # index of USB microphone
+AUDIO_OUTPUT="2"   # index of speaker
 ```
 
 Re-run the installer:
 ```bash
-bash ~/.openclaw/workspace/skills/RealTimeTalk/RealTimeTalk-install-pi.sh
+bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 ```
 
 ---
@@ -154,18 +192,36 @@ bash RealTimeTalk-toggle.sh start
 
 ### Audio devices
 
-Pass device indices as flags or set them in `RealTimeTalk-install-pi.sh`:
+The installer defaults to `AUDIO_INPUT="none"` / `AUDIO_OUTPUT="none"`, which lets sounddevice
+pick the system defaults. If the wrong device is chosen, list devices and set explicit indices:
 
 ```bash
-python3 RealTimeTalk-daemon.py --input-device 2 --output-device 0
+~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --list-devices
 ```
+
+Then edit `AUDIO_INPUT` / `AUDIO_OUTPUT` in `RealTimeTalk-install-pi.sh` and re-run it.
+
+You can also pass flags directly for testing:
+```bash
+~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --input-device 1 --output-device 2
+```
+
+### Audio sample rate
+
+The OpenAI Realtime API uses 24 kHz PCM16. Most USB audio hardware on Pi OS Bookworm only
+supports 44100 / 48000 Hz. The daemon handles this automatically:
+
+- **Capture:** records at 48 kHz, decimates 2:1 → 24 kHz before sending to OpenAI
+- **Playback:** receives 24 kHz from OpenAI, upsamples 2:1 → 48 kHz for the speaker
+
+No manual configuration is needed.
 
 ### HTTP port
 
 Default is `18790`. Override:
 
 ```bash
-python3 RealTimeTalk-daemon.py --http-port 8080
+~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --http-port 8080
 ```
 
 Update `ExecStart` in the service file accordingly, then:
@@ -206,7 +262,9 @@ RealTimeTalk/
 |---------|-------------|-----|
 | No audio input | Wrong device index | `toggle.sh devices`, set `AUDIO_INPUT` in install script |
 | No audio output | Wrong device index | Same as above for `AUDIO_OUTPUT` |
-| "No OpenAI API key" error | openclaw.json missing `talk.providers.openai` | Configure Talk in openclaw: `openclaw config` |
+| `paInvalidSampleRate` error | Shouldn't happen — resampling is automatic | Check that `DEVICE_RATE=48000` is set in the daemon; verify hardware with `arecord -l` |
+| "No OpenAI API key" error | `talk.providers.openai.apiKey` missing or empty | Add a plain string or SecretRef — see API key formats above |
+| "invalid_api_key" from OpenAI | Wrong key, or SecretRef path is incorrect | Check `secrets.json` exists and the `id` path resolves correctly |
 | Service not starting after reboot | Linger not enabled | `loginctl enable-linger $USER` |
 | Connection keeps dropping | Network instability | Daemon auto-reconnects every 5s; check `toggle.sh log` |
 | `/stop` endpoint unreachable | Tailscale not connected | Verify `tailscale status` on Pi |
