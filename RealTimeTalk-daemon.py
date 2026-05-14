@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-RealTimeTalk-daemon.py — OpenClaw headless RealTime Talk daemon.
+RealTimeTalk-daemon.py — OpenClaw RealTimeTalk daemon (gateway-integrated).
 
-Connects directly to the OpenAI Realtime API via WebSocket.
-No browser or display required — designed for Raspberry Pi.
-
-Reads the OpenAI API key from ~/.openclaw/openclaw.json.
+Audio flow:
+  Mic → OpenAI Realtime API (VAD + STT only) → transcript
+  transcript → OpenClaw gateway (chat.send / agent.wait) → Five's reply
+  Five's reply → Piper TTS → speaker
 
 Stop via:
   http://<pi-ip>:18790/stop          — phone browser (over Tailscale)
@@ -15,11 +15,12 @@ Stop via:
 Usage:
   python3 RealTimeTalk-daemon.py [options]
   python3 RealTimeTalk-daemon.py --list-devices
-  python3 RealTimeTalk-daemon.py --input-device 2 --output-device 0
+  python3 RealTimeTalk-daemon.py --input-device 1 --output-device 2
 
 Requires:
   pip install "websockets>=12" sounddevice numpy
-  sudo apt install libportaudio2      # Raspberry Pi OS
+  sudo apt install libportaudio2
+  piper installed at ~/.local/bin/piper with a voice model
 """
 
 import argparse
@@ -28,9 +29,12 @@ import base64
 import json
 import logging
 import os
+import re
 import signal
+import subprocess
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
@@ -39,17 +43,27 @@ import websockets
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-OPENCLAW_CONFIG  = os.path.expanduser("~/.openclaw/openclaw.json")
-OPENAI_MODEL     = "gpt-4o-realtime-preview"
-OPENAI_WS_URL    = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
-SAMPLE_RATE      = 24000        # OpenAI Realtime API rate
-DEVICE_RATE      = 48000        # Hardware rate (USB mic + speaker)
-RESAMPLE_RATIO   = DEVICE_RATE // SAMPLE_RATE   # 2
-CHANNELS         = 1
-BLOCKSIZE        = 2400         # 100 ms at 24 kHz (API frames)
-DEVICE_BLOCKSIZE = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
+OPENCLAW_CONFIG   = os.path.expanduser("~/.openclaw/openclaw.json")
+OPENCLAW_GW_URL   = "ws://127.0.0.1:18789"
+OPENCLAW_SESSION  = "agent:main:main"
+
+PIPER_CMD         = os.path.expanduser("~/.local/bin/piper")
+PIPER_VOICE       = os.path.expanduser(
+    "~/.local/share/piper/voices/en_US-lessac-medium/en_US-lessac-medium.onnx"
+)
+PIPER_SAMPLE_RATE = 22050
+
+OPENAI_MODEL      = "gpt-4o-realtime-preview"
+OPENAI_WS_URL     = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
+SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
+DEVICE_RATE       = 48000        # USB hardware rate
+RESAMPLE_RATIO    = DEVICE_RATE // SAMPLE_RATE   # 2
+CHANNELS          = 1
+BLOCKSIZE         = 2400         # 100 ms at 24 kHz
+DEVICE_BLOCKSIZE  = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
 DEFAULT_HTTP_PORT = 18790
-RECONNECT_DELAY   = 5    # seconds between reconnect attempts
+RECONNECT_DELAY   = 5
+AGENT_TIMEOUT_S   = 45
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -61,12 +75,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("RealTimeTalk")
 
+# ── Config / secrets ──────────────────────────────────────────────────────────
 
-# ── Config ────────────────────────────────────────────────────────────────────
+def _load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
 
 def load_openai_key() -> str:
-    with open(OPENCLAW_CONFIG) as f:
-        cfg = json.load(f)
+    cfg = _load_json(OPENCLAW_CONFIG)
     key = (
         cfg.get("talk", {})
            .get("providers", {})
@@ -76,18 +92,14 @@ def load_openai_key() -> str:
     # Resolve OpenClaw SecretRef: {"source":"file","provider":"...","id":"/a/b/c"}
     if isinstance(key, dict) and key.get("source") == "file":
         provider_name = key.get("provider", "")
-        secret_path = (
+        secret_path = os.path.expanduser(
             cfg.get("secrets", {})
                .get("providers", {})
                .get(provider_name, {})
                .get("path", "")
         )
-        secret_path = os.path.expanduser(secret_path)
-        with open(secret_path) as sf:
-            secrets = json.load(sf)
-        # Navigate id path: "/providers/openai/apiKey" → secrets["providers"]["openai"]["apiKey"]
-        parts = [p for p in key.get("id", "").split("/") if p]
-        for part in parts:
+        secrets = _load_json(secret_path)
+        for part in [p for p in key.get("id", "").split("/") if p]:
             secrets = secrets[part]
         key = secrets
     if not key:
@@ -96,106 +108,246 @@ def load_openai_key() -> str:
         )
     return key
 
+def load_gateway_token() -> str:
+    cfg = _load_json(OPENCLAW_CONFIG)
+    token = cfg.get("gateway", {}).get("auth", {}).get("token", "")
+    if not token:
+        raise RuntimeError("No gateway.auth.token in openclaw.json")
+    return token
 
-# ── Thread-safe audio output buffer ──────────────────────────────────────────
+# ── Text helpers ──────────────────────────────────────────────────────────────
 
-class AudioOutputBuffer:
-    """Accumulates PCM16 bytes from the WebSocket; drained by the PortAudio output callback."""
+def strip_markdown(text: str) -> str:
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'`{1,3}[^`\n]*`{1,3}', '', text)
+    text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+    return text.strip()
 
-    def __init__(self):
-        self._buf  = bytearray()
-        self._lock = threading.Lock()
+# ── Piper TTS ─────────────────────────────────────────────────────────────────
 
-    def write(self, data: bytes):
-        with self._lock:
-            self._buf.extend(data)
+def speak(text: str, output_device=None):
+    """Synthesise text with Piper and play on the speaker. Blocking."""
+    clean = strip_markdown(text)
+    if not clean:
+        return
+    proc = subprocess.run(
+        [PIPER_CMD, "--model", PIPER_VOICE, "--output-raw", "--quiet"],
+        input=clean.encode(),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        log.error("Piper TTS error: %s", proc.stderr.decode()[:200])
+        return
+    audio = np.frombuffer(proc.stdout, dtype=np.int16)
+    # Resample Piper output rate → device rate (linear interpolation)
+    n_out = int(round(len(audio) * DEVICE_RATE / PIPER_SAMPLE_RATE))
+    indices = np.linspace(0, len(audio) - 1, n_out)
+    upsampled = np.interp(indices, np.arange(len(audio)), audio).astype(np.int16)
+    sd.play(upsampled, samplerate=DEVICE_RATE, device=output_device)
+    sd.wait()
 
-    def read(self, n_frames: int) -> np.ndarray:
-        n_bytes = n_frames * 2  # int16 = 2 bytes per sample
-        with self._lock:
-            if len(self._buf) >= n_bytes:
-                out = bytes(self._buf[:n_bytes])
-                del self._buf[:n_bytes]
-            else:
-                # Not enough data yet — pad with silence
-                out = bytes(self._buf) + bytes(n_bytes - len(self._buf))
-                self._buf.clear()
-        return np.frombuffer(out, dtype=np.int16)
+# ── OpenClaw gateway client ───────────────────────────────────────────────────
 
+class GatewayClient:
+    """
+    Persistent WebSocket operator connection to the local OpenClaw gateway.
 
-# ── Talk session ──────────────────────────────────────────────────────────────
+    Uses the trusted backend-client path (client.id="gateway-client",
+    client.mode="backend") which bypasses device-pairing scope upgrades for
+    loopback connections authenticated with the shared gateway token.
+    """
 
-class TalkSession:
+    def __init__(self, token: str):
+        self.token = token
+        self._ws = None
+        # Maps request-id → Future for chat.send acks
+        self._send_acks: dict[str, asyncio.Future] = {}
+        # Maps runId → Future[str] for final chat replies
+        self._reply_futs: dict[str, asyncio.Future] = {}
+
+    async def connect(self):
+        self._ws = await websockets.connect(OPENCLAW_GW_URL)
+        await self._ws.recv()  # connect.challenge — backend clients skip signing
+        await self._ws.send(json.dumps({
+            "type": "req", "id": "gw-connect", "method": "connect",
+            "params": {
+                "minProtocol": 3, "maxProtocol": 3,
+                "client": {
+                    "id": "gateway-client", "version": "1.2.0",
+                    "platform": "linux", "mode": "backend",
+                },
+                "role": "operator",
+                "scopes": ["operator.read", "operator.write"],
+                "caps": [], "commands": [], "permissions": {},
+                "auth": {"token": self.token},
+                "locale": "en-US",
+                "userAgent": "realtimetalk/1.2",
+            },
+        }))
+        hello = json.loads(await self._ws.recv())
+        if not hello.get("ok"):
+            raise RuntimeError(f"Gateway connect failed: {hello.get('error')}")
+        scopes = hello.get("payload", {}).get("auth", {}).get("scopes", [])
+        log.info("OpenClaw gateway connected (scopes: %s)", scopes)
+
+    async def listen(self, stop_event: asyncio.Event):
+        """Route incoming gateway events to waiting futures. Run as a task."""
+        try:
+            async for raw in self._ws:
+                if stop_event.is_set():
+                    break
+                msg = json.loads(raw)
+                mtype = msg.get("type", "")
+                event = msg.get("event", "")
+                payload = msg.get("payload") or {}
+                msg_id = msg.get("id", "")
+
+                # Resolve chat.send acks
+                if mtype == "res" and msg_id in self._send_acks:
+                    fut = self._send_acks.pop(msg_id)
+                    if not fut.done():
+                        fut.set_result(msg)
+
+                # Resolve agent replies on final chat event
+                elif event == "chat" and payload.get("state") == "final":
+                    run_id = payload.get("runId")
+                    content = payload.get("message", {}).get("content", [])
+                    text = " ".join(
+                        c.get("text", "") for c in content if c.get("type") == "text"
+                    ).strip()
+                    fut = self._reply_futs.pop(run_id, None)
+                    if fut and not fut.done():
+                        fut.set_result(text)
+
+        except websockets.ConnectionClosed:
+            pass
+
+    async def ask(self, message: str, session_key: str = OPENCLAW_SESSION) -> str:
+        """Send a message to the agent and return its complete reply text."""
+        loop = asyncio.get_running_loop()
+        idem = str(uuid.uuid4())
+        req_id = f"send:{idem}"
+
+        ack_fut: asyncio.Future = loop.create_future()
+        self._send_acks[req_id] = ack_fut
+
+        await self._ws.send(json.dumps({
+            "type": "req", "id": req_id, "method": "chat.send",
+            "params": {
+                "sessionKey": session_key,
+                "message": message,
+                "idempotencyKey": idem,
+            },
+        }))
+
+        ack = await asyncio.wait_for(ack_fut, timeout=10)
+        if not ack.get("ok"):
+            raise RuntimeError(f"chat.send failed: {ack.get('error')}")
+
+        run_id = ack.get("payload", {}).get("runId")
+        if not run_id:
+            raise RuntimeError("chat.send returned no runId")
+
+        reply_fut: asyncio.Future = loop.create_future()
+        self._reply_futs[run_id] = reply_fut
+
+        # Register with agent.wait so the gateway tracks this run
+        await self._ws.send(json.dumps({
+            "type": "req", "id": f"wait:{run_id}", "method": "agent.wait",
+            "params": {"runId": run_id, "timeoutMs": AGENT_TIMEOUT_S * 1000},
+        }))
+
+        return await asyncio.wait_for(reply_fut, timeout=AGENT_TIMEOUT_S + 5)
+
+    async def close(self):
+        if self._ws:
+            await self._ws.close()
+
+# ── OpenAI Realtime session (VAD + STT only) ──────────────────────────────────
+
+class RealtimeSession:
+    """
+    Connects to OpenAI Realtime API solely for voice activity detection and
+    speech-to-text. Does not generate AI responses (create_response: false).
+    """
+
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop,
-                 input_device=None, output_device=None):
-        self.api_key       = api_key
-        self.loop          = loop
-        self.input_device  = input_device
+                 gw: GatewayClient, stop_event: asyncio.Event,
+                 input_device=None, output_device=None,
+                 session_key: str = OPENCLAW_SESSION):
+        self.api_key      = api_key
+        self.loop         = loop
+        self.gw           = gw
+        self.stop_event   = stop_event
+        self.input_device = input_device
         self.output_device = output_device
-        self._mic_q  = asyncio.Queue(maxsize=200)
-        self._spk_buf = AudioOutputBuffer()
-        self._stop   = asyncio.Event()
-
-    def stop(self):
-        self.loop.call_soon_threadsafe(self._stop.set)
-
-    # ── PortAudio callbacks (run in PortAudio thread) ─────────────────────────
+        self.session_key  = session_key
+        self._mic_q       = asyncio.Queue(maxsize=200)
+        self._busy        = asyncio.Event()   # set while Five is speaking
 
     def _mic_cb(self, indata, frames, time_info, status):
-        # Decimate DEVICE_RATE→SAMPLE_RATE by taking every RESAMPLE_RATIO-th sample
+        if self._busy.is_set():
+            return  # discard mic input while Five is speaking to prevent feedback
+        # Decimate DEVICE_RATE → SAMPLE_RATE
         decimated = indata[::RESAMPLE_RATIO, 0].tobytes()
         try:
             self.loop.call_soon_threadsafe(self._mic_q.put_nowait, decimated)
         except asyncio.QueueFull:
             pass
 
-    def _spk_cb(self, outdata, frames, time_info, status):
-        # Read API-rate frames then upsample to device rate via sample-and-hold
-        api_frames = frames // RESAMPLE_RATIO
-        pcm_24k = self._spk_buf.read(api_frames)
-        outdata[:, 0] = np.repeat(pcm_24k, RESAMPLE_RATIO)
-
-    # ── WebSocket send / receive ──────────────────────────────────────────────
-
     async def _send_mic(self, ws):
-        while not self._stop.is_set():
+        while not self.stop_event.is_set():
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+            if self._busy.is_set():
                 continue
             await ws.send(json.dumps({
                 "type":  "input_audio_buffer.append",
                 "audio": base64.b64encode(chunk).decode(),
             }))
 
+    async def _handle_transcript(self, transcript: str):
+        self._busy.set()
+        try:
+            log.info("Routing to Five: %s", transcript)
+            reply = await self.gw.ask(transcript, session_key=self.session_key)
+            log.info("Five: %s", reply)
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak, reply, self.output_device
+            )
+        except asyncio.TimeoutError:
+            log.error("OpenClaw agent timed out")
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak, "Sorry, I timed out on that.", self.output_device
+            )
+        except Exception as e:
+            log.error("Error routing transcript: %s", e)
+        finally:
+            self._busy.clear()
+
     async def _recv_ws(self, ws):
         async for raw in ws:
-            if self._stop.is_set():
+            if self.stop_event.is_set():
                 break
             msg = json.loads(raw)
             t   = msg.get("type", "")
 
-            if t == "response.audio.delta":
-                self._spk_buf.write(base64.b64decode(msg["delta"]))
-
-            elif t == "conversation.item.input_audio_transcription.completed":
-                text = msg.get("transcript", "").strip()
-                if text:
-                    log.info(f"You: {text}")
-
-            elif t == "response.done":
-                for item in msg.get("response", {}).get("output", []):
-                    for c in item.get("content", []):
-                        if c.get("type") == "text":
-                            log.info(f"AI: {c['text'].strip()}")
+            if t == "conversation.item.input_audio_transcription.completed":
+                transcript = msg.get("transcript", "").strip()
+                if transcript and not self._busy.is_set():
+                    log.info("You: %s", transcript)
+                    asyncio.create_task(self._handle_transcript(transcript))
 
             elif t == "error":
-                log.error(f"OpenAI error: {msg.get('error', msg)}")
-
-    # ── Session runner ────────────────────────────────────────────────────────
+                log.error("OpenAI error: %s", msg.get("error", msg))
 
     async def run(self):
-        log.info("Connecting to OpenAI Realtime API…")
+        log.info("Connecting to OpenAI Realtime API (STT mode)…")
         async with websockets.connect(
             OPENAI_WS_URL,
             additional_headers={
@@ -208,36 +360,31 @@ class TalkSession:
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "modalities":            ["text", "audio"],
-                    "input_audio_format":    "pcm16",
-                    "output_audio_format":   "pcm16",
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm16",
                     "turn_detection": {
-                        "type":                "server_vad",
-                        "threshold":           0.5,
-                        "prefix_padding_ms":   300,
-                        "silence_duration_ms": 800,
+                        "type":                 "server_vad",
+                        "threshold":            0.5,
+                        "prefix_padding_ms":    300,
+                        "silence_duration_ms":  800,
+                        "create_response":      False,   # STT only, no AI response
                     },
                     "input_audio_transcription": {"model": "whisper-1"},
                 },
             }))
-            log.info("Session active — speak now")
+            log.info("Session active — speak now (routed through Five / OpenClaw)")
 
-            in_stream  = sd.InputStream(
+            in_stream = sd.InputStream(
                 samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
                 blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
                 device=self.input_device,
             )
-            out_stream = sd.OutputStream(
-                samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
-                blocksize=DEVICE_BLOCKSIZE, callback=self._spk_cb,
-                device=self.output_device,
-            )
 
-            with in_stream, out_stream:
+            with in_stream:
                 tasks = [
                     asyncio.create_task(self._send_mic(ws)),
                     asyncio.create_task(self._recv_ws(ws)),
-                    asyncio.create_task(self._stop.wait()),
+                    asyncio.create_task(self.stop_event.wait()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
@@ -245,12 +392,9 @@ class TalkSession:
                 for task in pending:
                     task.cancel()
 
-
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
 def start_http_server(port: int, on_stop):
-    """Serves /stop and /status in a daemon thread."""
-
     def _html(handler, code: int, body: str):
         data = body.encode()
         handler.send_response(code)
@@ -281,10 +425,10 @@ def start_http_server(port: int, on_stop):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Toggle: http://<pi-ip>:%d/stop  |  /status", port)
 
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main(http_port: int, input_device=None, output_device=None):
+async def main(http_port: int, input_device=None, output_device=None,
+               session_key: str = OPENCLAW_SESSION):
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -292,37 +436,40 @@ async def main(http_port: int, input_device=None, output_device=None):
         loop.add_signal_handler(sig, stop_event.set)
 
     try:
-        api_key = load_openai_key()
+        openai_key = load_openai_key()
+        gw_token   = load_gateway_token()
     except Exception as e:
         log.error(str(e))
         sys.exit(1)
 
+    gw = GatewayClient(gw_token)
+    await gw.connect()
+    gw_task = asyncio.create_task(gw.listen(stop_event))
+
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set))
-    log.info("OpenClaw RealTimeTalk daemon starting")
+    log.info("OpenClaw RealTimeTalk daemon starting (gateway-integrated)")
 
     while not stop_event.is_set():
-        session = TalkSession(api_key, loop, input_device, output_device)
-
-        # Propagate global stop → session stop
-        async def _watch_stop():
-            await stop_event.wait()
-            session.stop()
-
-        watcher = asyncio.create_task(_watch_stop())
+        session = RealtimeSession(
+            api_key=openai_key, loop=loop, gw=gw,
+            stop_event=stop_event,
+            input_device=input_device, output_device=output_device,
+            session_key=session_key,
+        )
         try:
             await session.run()
             log.info("Session ended.")
         except websockets.exceptions.ConnectionClosedError as e:
-            log.warning("Connection closed: %s", e)
+            log.warning("Realtime connection closed: %s", e)
         except Exception as e:
             log.error("Session error: %s", e)
-        finally:
-            watcher.cancel()
 
         if not stop_event.is_set():
             log.info("Reconnecting in %ds…", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
 
+    gw_task.cancel()
+    await gw.close()
     log.info("Daemon stopped.")
 
 
@@ -334,6 +481,8 @@ if __name__ == "__main__":
                    help="sounddevice input device index (see --list-devices)")
     p.add_argument("--output-device",  type=int, default=None,
                    help="sounddevice output device index (see --list-devices)")
+    p.add_argument("--session-key",    type=str, default=OPENCLAW_SESSION,
+                   help=f"OpenClaw session key (default: {OPENCLAW_SESSION})")
     p.add_argument("--list-devices",   action="store_true",
                    help="Print available audio devices and exit")
     args = p.parse_args()
@@ -342,4 +491,9 @@ if __name__ == "__main__":
         print(sd.query_devices())
         sys.exit(0)
 
-    asyncio.run(main(args.http_port, args.input_device, args.output_device))
+    asyncio.run(main(
+        args.http_port,
+        args.input_device,
+        args.output_device,
+        args.session_key,
+    ))

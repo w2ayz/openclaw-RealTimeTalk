@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.2 — 2026-05-14
+
+Full OpenClaw gateway integration — voice now routes through Five.
+
+### Changed
+
+- **Architecture: direct OpenAI chat → OpenClaw gateway + Piper TTS.**
+  The daemon no longer generates AI responses directly through the OpenAI Realtime API.
+  Instead it uses the Realtime API solely as a VAD + STT front-end (`create_response: false`),
+  routes every transcript through the OpenClaw gateway (`chat.send` / `agent.wait`),
+  and speaks Five's reply with Piper TTS. Voice conversations now share Five's session,
+  memory, tools, and personality with all other channels (e.g. Telegram).
+
+- **New `GatewayClient` class** — persistent WebSocket to the local gateway using the
+  trusted backend-client path (`client.id: "gateway-client"`, `client.mode: "backend"`),
+  which bypasses device-pairing scope checks on loopback connections. Handles
+  `chat.send` (idempotency-keyed) → `runId`, `agent.wait`, and routes `chat` events
+  with `state: "final"` back to the calling coroutine via `asyncio.Future`.
+
+- **`RealtimeSession` simplified** — output stream and `AudioOutputBuffer` removed.
+  Session config: `modalities: ["text"]`, `create_response: false`. Mic input is
+  suppressed while Five is speaking to prevent feedback (`_busy` event flag).
+
+- **`speak()` function** — strips markdown from Five's reply then synthesises via Piper,
+  resamples 22050 → 48000 Hz for the USB speaker.
+
+- **New `--session-key` CLI flag** — overrides the default OpenClaw session
+  (`agent:main:main`).
+
+- **`load_gateway_token()`** — reads `gateway.auth.token` from `openclaw.json`
+  so no extra config is needed.
+
+### Protocol notes (for contributors)
+
+- `chat.send` requires `idempotencyKey` (not `runId`); returns `{runId, status: "started"}`.
+- `agent.wait` takes `{runId, timeoutMs}` and resolves when the agent turn ends.
+- Final reply text is in the `chat` event with `state: "final"`, at
+  `payload.message.content[].text`.
+- The backend-client connect path omits `device` signing; token auth is sufficient
+  on loopback.
+
+---
+
 ## v1.1 — 2026-05-14
 
 Raspberry Pi OS Bookworm deployment fixes — first successful live deployment on Pi 5.

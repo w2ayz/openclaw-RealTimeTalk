@@ -27,21 +27,37 @@ Raspberry Pi (headless, battery-powered)
 │
 └── RealTimeTalk-daemon.py
         │
-        ├── Reads API key ─────► ~/.openclaw/openclaw.json
-        │                         talk.providers.openai.apiKey
-        │                         (plain string or OpenClaw SecretRef)
-        │                         SecretRef → ~/.openclaw/secrets.json
+        ├── OpenClaw gateway ─► ws://127.0.0.1:18789 (GatewayClient)
+        │   (persistent WS)       chat.send + agent.wait
+        │                         ↕ Five's session: memory, tools, identity
         │
-        ├── WebSocket ────────► wss://api.openai.com/v1/realtime
-        │                         Authorization: Bearer <api_key>
-        │                         OpenAI-Beta: realtime=v1
+        ├── OpenAI Realtime ──► wss://api.openai.com/v1/realtime
+        │   (STT only)            VAD + Whisper transcription
+        │                         create_response: false (no direct AI reply)
         │
-        ├── Audio IN ─────────► USB microphone (48 kHz capture → 24 kHz to API)
-        ├── Audio OUT ────────► 3.5mm / USB speaker (24 kHz from API → 48 kHz playback)
+        ├── Audio IN ─────────► USB microphone (48 kHz → 24 kHz to Realtime)
+        │
+        ├── Piper TTS ────────► ~/.local/bin/piper (22 kHz → 48 kHz to speaker)
+        │
+        ├── Audio OUT ────────► USB speaker (48 kHz playback)
         │
         └── HTTP :18790 ──────► GET /stop    → graceful shutdown
                                  GET /status  → {"status":"running"}
 ```
+
+**Data flow per turn:**
+
+```
+You speak → mic → OpenAI Realtime (VAD detects speech end)
+         → Whisper transcription → "what's the weather?"
+         → GatewayClient.ask() → chat.send to Five's session
+         → Five thinks (memory, tools, OpenClaw agent)
+         → chat event final: "It's 72°F and sunny in Oak Park."
+         → strip_markdown() → Piper TTS → speaker
+```
+
+Voice conversations are part of Five's main session — the same context, memory,
+and tool access as Telegram messages.
 
 **Toggle options (no keyboard/screen):**
 
@@ -59,10 +75,11 @@ Raspberry Pi (headless, battery-powered)
 |-------------|-------|
 | Raspberry Pi OS Bookworm | Pi 5 or Pi 4 |
 | Python 3.9+ | Pre-installed on Bookworm |
-| OpenClaw gateway running locally | Provides the OpenAI API key |
-| OpenAI API key configured in OpenClaw | Plain string or SecretRef at `talk.providers.openai.apiKey` — see below |
-| USB microphone | Any USB mic; 44100 / 48 kHz hardware is fine — resampling is automatic |
-| Speaker | 3.5mm or USB; 48 kHz hardware is fine |
+| **OpenClaw gateway running locally** | Required — daemon routes all AI through it |
+| OpenAI API key configured in OpenClaw | At `talk.providers.openai.apiKey` — used only for STT (Realtime API) |
+| Piper TTS installed | `~/.local/bin/piper` with a voice model in `~/.local/share/piper/voices/` |
+| USB microphone | Any USB mic; 44100 / 48 kHz hardware fine — resampling is automatic |
+| Speaker | 3.5mm or USB; 48 kHz hardware fine |
 | Tailscale (recommended) | For remote stop without keyboard |
 
 ### OpenAI API key formats
@@ -229,15 +246,36 @@ Update `ExecStart` in the service file accordingly, then:
 systemctl --user daemon-reload && systemctl --user restart openclaw-realtimetalk
 ```
 
-### OpenAI model / voice
+### OpenClaw session
 
-The session is configured in `RealTimeTalk-daemon.py` at the `session.update` call. Defaults:
+By default the daemon talks to `agent:main:main` (Five's primary session). Override:
 
-- **Model:** `gpt-4o-realtime-preview`
-- **Turn detection:** server VAD, threshold 0.5, silence 800 ms
-- **Transcription:** `whisper-1`
+```bash
+~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --session-key agent:main:main
+```
 
-Edit those values in the daemon and restart the service.
+Update `ExecStart` in the service file and reload if you want a different session permanently.
+
+### Voice / TTS
+
+Piper voice model is set by `PIPER_VOICE` near the top of `RealTimeTalk-daemon.py`.
+Default: `en_US-lessac-medium`. Change the path to any installed Piper model and restart.
+
+### STT / VAD settings
+
+STT model and VAD parameters are in the `session.update` call in `RealtimeSession.run()`:
+
+- **STT model:** `whisper-1`
+- **VAD threshold:** 0.5
+- **Silence window:** 800 ms
+
+### OpenAI Realtime model
+
+The model used for VAD + STT is set by `OPENAI_MODEL` at the top of the daemon:
+
+```python
+OPENAI_MODEL = "gpt-4o-realtime-preview"
+```
 
 ---
 
