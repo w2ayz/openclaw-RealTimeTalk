@@ -47,10 +47,15 @@ OPENCLAW_CONFIG   = os.path.expanduser("~/.openclaw/openclaw.json")
 OPENCLAW_GW_URL   = "ws://127.0.0.1:18789"
 OPENCLAW_SESSION  = "agent:main:main"
 
-PIPER_CMD         = os.path.expanduser("~/.local/bin/piper")
-PIPER_VOICE       = os.path.expanduser(
+PIPER_CMD         = os.path.expanduser("~/.local/bin/piper-native/piper")
+PIPER_ENV         = {**os.environ, "LD_LIBRARY_PATH": os.path.expanduser("~/.local/bin/piper-native")}
+PIPER_VOICE_EN    = os.path.expanduser(
     "~/.local/share/piper/voices/en_US-lessac-medium/en_US-lessac-medium.onnx"
 )
+PIPER_VOICE_ZH    = os.path.expanduser(
+    "~/.local/share/piper/voices/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx"
+)
+PIPER_VOICE       = PIPER_VOICE_EN   # default; speak() will pick based on language
 PIPER_SAMPLE_RATE = 22050
 ALSA_OUTPUT       = "plughw:3,0"   # USB speaker; plughw handles rate conversion
 
@@ -68,6 +73,84 @@ AGENT_TIMEOUT_S   = 45
 MIC_GAIN          = 8.0          # software gain — PCM2902 USB mic is very quiet
 MIC_GATE_PEAK     = 500          # pre-gain peak below this is treated as silence
                                  # (lets OpenAI's VAD see real silence between words)
+
+CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
+MAX_LOG_ENTRIES = 40
+
+def _log_entry(role: str, text: str):
+    CONVERSATION_LOG.append({"role": role, "text": text})
+    if len(CONVERSATION_LOG) > MAX_LOG_ENTRIES:
+        CONVERSATION_LOG.pop(0)
+
+CALIBRATE_PHRASES = {
+    "calibrate mic", "calibrate microphone", "calibrate noise",
+    "recalibrate mic", "recalibrate microphone",
+    "mic calibration", "microphone calibration",
+    "adjust mic for noise", "adjust microphone for noise",
+}
+
+WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on"}
+SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
+
+def _is_english_or_chinese(text: str) -> bool:
+    """Return True only if the transcript appears to be English or Chinese.
+    Filters out Japanese (hiragana/katakana), Arabic, Cyrillic, Korean, etc.
+    that gpt-4o-transcribe hallucinates when audio is noisy.
+    """
+    # Reject if it contains Japanese kana, Arabic, Cyrillic, Korean, etc.
+    reject_ranges = (
+        (0x3040, 0x30FF),   # hiragana + katakana (Japanese)
+        (0x0600, 0x06FF),   # Arabic
+        (0x0400, 0x04FF),   # Cyrillic
+        (0xAC00, 0xD7AF),   # Korean Hangul
+        (0x0900, 0x097F),   # Devanagari
+    )
+    for ch in text:
+        cp = ord(ch)
+        if any(lo <= cp <= hi for lo, hi in reject_ranges):
+            return False
+    # Accept if all characters are ASCII or CJK (Chinese/Japanese kanji — kanji
+    # without kana means it's Chinese in practice here)
+    for ch in text:
+        cp = ord(ch)
+        if cp <= 0x7F:
+            continue  # ASCII = English
+        if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
+            continue  # CJK unified ideographs = Chinese
+        if ch in ' \t\n\r':
+            continue
+        # Anything else (accented Latin for German/French/etc.) → reject
+        return False
+    return True
+
+def _normalize(text: str) -> str:
+    import string
+    t = text.strip().lower()
+    t = t.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+    # treat digit "5" as "five"
+    t = re.sub(r'\b5\b', 'five', t)
+    return " ".join(t.split())
+
+def _matches_phrase(transcript: str, phrases: set) -> bool:
+    """True if the transcript contains any trigger phrase, or is a fuzzy word-overlap match.
+
+    Two-pass:
+    1. Exact substring after normalisation.
+    2. Fuzzy: if the transcript shares ≥ 60% of a phrase's words it counts as a match
+       (handles car-noise garbling like 'five wake up' → 'five break up').
+    """
+    t = _normalize(transcript)
+    for phrase in phrases:
+        p = _normalize(phrase)
+        # Pass 1: substring
+        if p in t:
+            return True
+        # Pass 2: word overlap ratio
+        t_words = set(t.split())
+        p_words  = set(p.split())
+        if p_words and len(t_words & p_words) / len(p_words) >= 0.6:
+            return True
+    return False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +202,29 @@ def load_gateway_token() -> str:
         raise RuntimeError("No gateway.auth.token in openclaw.json")
     return token
 
+# ── Service file helpers ──────────────────────────────────────────────────────
+
+SERVICE_FILE = os.path.expanduser(
+    "~/.config/systemd/user/openclaw-realtimetalk.service"
+)
+
+def _update_service_gate(new_gate: int):
+    """Persist --mic-gate <n> in the systemd service ExecStart line."""
+    try:
+        with open(SERVICE_FILE) as f:
+            content = f.read()
+        import re as _re
+        content = _re.sub(r" --mic-gate \d+", "", content)
+        content = content.replace(
+            "\nRestart=no",
+            f" --mic-gate {new_gate}\nRestart=no",
+        )
+        with open(SERVICE_FILE, "w") as f:
+            f.write(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    except Exception as e:
+        log.warning("Could not update service file: %s", e)
+
 # ── Text helpers ──────────────────────────────────────────────────────────────
 
 def strip_markdown(text: str) -> str:
@@ -128,9 +234,17 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+    # Strip emoji and other non-ASCII — Piper reads them as their Unicode names
+    # e.g. Five's ⚡ signature becomes "high voltage" without this
+    text = re.sub(r'[^\x00-\x7F]+', '', text)
     return text.strip()
 
 # ── Piper TTS ─────────────────────────────────────────────────────────────────
+
+def _is_chinese_text(text: str) -> bool:
+    """True if the text contains enough CJK characters to warrant a Chinese voice."""
+    cjk = sum(1 for c in text if '一' <= c <= '鿿')
+    return cjk > len(text) * 0.2
 
 def speak(text: str, alsa_output: str = ALSA_OUTPUT):
     """Synthesise text with Piper and play via aplay.
@@ -144,15 +258,16 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT):
     clean = strip_markdown(text)
     if not clean:
         return
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+    voice = PIPER_VOICE_ZH if _is_chinese_text(clean) else PIPER_VOICE_EN
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
         tf.write(clean)
         text_path = tf.name
     wav_path = tempfile.mktemp(suffix=".wav")
     try:
         subprocess.run(
-            [PIPER_CMD, "--model", PIPER_VOICE,
+            [PIPER_CMD, "--model", voice,
              "-i", text_path, "-f", wav_path, "--quiet"],
-            check=True, stderr=subprocess.DEVNULL,
+            check=True, stderr=subprocess.DEVNULL, env=PIPER_ENV,
         )
         subprocess.run(
             ["aplay", "-D", alsa_output, "-q", wav_path],
@@ -300,22 +415,59 @@ class RealtimeSession:
         self.session_key  = session_key
         self._mic_q       = asyncio.Queue(maxsize=200)
         self._busy        = asyncio.Event()   # set while Five is speaking
+        self._cal_peaks: list[int] = []       # raw peaks collected during calibration
+        self._calibrating = False
+        self._active      = False             # start silent; wake phrase enables voice
 
     def _mic_cb(self, indata, frames, time_info, status):
+        raw = indata[::RESAMPLE_RATIO, 0]
+        raw_peak = int(np.max(np.abs(raw)))
+        # While calibrating, record raw peaks (no gain/gate applied, mic suppression off)
+        if self._calibrating:
+            self.loop.call_soon_threadsafe(self._cal_peaks.append, raw_peak)
+            return
         if self._busy.is_set():
             return  # discard mic input while Five is speaking to prevent feedback
-        # Decimate DEVICE_RATE → SAMPLE_RATE
-        raw = indata[::RESAMPLE_RATIO, 0]
-        if int(np.max(np.abs(raw))) < MIC_GATE_PEAK:
-            # noise floor — pass true silence so VAD can detect speech end
+        if raw_peak < MIC_GATE_PEAK:
             out_arr = np.zeros_like(raw)
         else:
             boosted = raw.astype(np.float32) * MIC_GAIN
             out_arr = np.clip(boosted, -32768, 32767).astype(np.int16)
+        self.loop.call_soon_threadsafe(self._enqueue_mic, out_arr.tobytes())
+
+    def _enqueue_mic(self, data: bytes):
         try:
-            self.loop.call_soon_threadsafe(self._mic_q.put_nowait, out_arr.tobytes())
+            self._mic_q.put_nowait(data)
         except asyncio.QueueFull:
             pass
+
+    async def _run_calibration(self):
+        """Measure ambient noise via the live mic stream and update MIC_GATE_PEAK."""
+        global MIC_GATE_PEAK
+        await asyncio.get_running_loop().run_in_executor(
+            None, speak, "Calibrating mic. Stay quiet for three seconds.", self.alsa_output
+        )
+        self._cal_peaks.clear()
+        self._calibrating = True
+        await asyncio.sleep(3.0)
+        self._calibrating = False
+        peaks = self._cal_peaks[2:]  # discard startup frames
+        if not peaks:
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak, "Calibration failed. No mic data.", self.alsa_output
+            )
+            return
+        noise_peak = max(peaks)
+        new_gate = max(int(noise_peak * 2), 200)
+        MIC_GATE_PEAK = new_gate
+        log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
+        # Persist to service file so it survives restarts
+        _update_service_gate(new_gate)
+        await asyncio.get_running_loop().run_in_executor(
+            None, speak,
+            f"Done. Noise gate set to {new_gate}. Speak normally now.",
+            self.alsa_output
+        )
 
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
@@ -331,11 +483,56 @@ class RealtimeSession:
             }))
 
     async def _handle_transcript(self, transcript: str):
+        if not _is_english_or_chinese(transcript):
+            log.debug("Discarded non-EN/ZH: %r", transcript)
+            return
+        normalized = transcript.strip().rstrip(".!?,").lower()
+
+        # Wake phrase — always checked regardless of active state
+        if _matches_phrase(normalized, WAKE_PHRASES):
+            if not self._active:
+                self._active = True
+                log.info("Wake phrase detected — voice active")
+                _log_entry("system", "▶ Voice activated")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "I'm listening.", self.alsa_output
+                )
+            else:
+                log.info("Wake phrase detected — already active")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Yes, I'm here.", self.alsa_output
+                )
+            return
+
+        # Sleep phrase — only meaningful when active
+        if _matches_phrase(normalized, SLEEP_PHRASES):
+            if self._active:
+                self._active = False
+                log.info("Sleep phrase detected — going silent")
+                _log_entry("system", "⏸ Voice silenced")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Going silent now. Say Five wake up to resume.", self.alsa_output
+                )
+            return
+
+        # Calibration — works in both modes (audio feedback either way)
+        if normalized in CALIBRATE_PHRASES:
+            log.info("Voice command: calibrate mic")
+            asyncio.create_task(self._run_calibration())
+            return
+
+        # All other speech: only route to Five when active
+        if not self._active:
+            log.debug("Silent mode — ignoring: %s", transcript)
+            return
+
         self._busy.set()
         try:
             log.info("Routing to Five: %s", transcript)
+            _log_entry("you", transcript)
             reply = await self.gw.ask(transcript, session_key=self.session_key)
             log.info("Five: %s", reply)
+            _log_entry("five", reply)
             await asyncio.get_running_loop().run_in_executor(
                 None, speak, reply, self.alsa_output
             )
@@ -397,7 +594,6 @@ class RealtimeSession:
             ping_interval=20,
             ping_timeout=10,
         ) as ws:
-            # GA transcription session: nested audio.input config
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -437,7 +633,8 @@ class RealtimeSession:
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
-def start_http_server(port: int, on_stop):
+def start_http_server(port: int, on_stop, session_ref: list):
+    """session_ref is a one-element list holding the current RealtimeSession (or None)."""
     def _html(handler, code: int, body: str):
         data = body.encode()
         handler.send_response(code)
@@ -451,11 +648,52 @@ def start_http_server(port: int, on_stop):
             log.debug("[http] %s", fmt % args)
 
         def do_GET(self):
+            sess = session_ref[0]
             if self.path in ("/stop", "/toggle"):
                 _html(self, 200, "<h2>OpenClaw RealTimeTalk: stopping…</h2>")
                 on_stop()
+            elif self.path == "/wake":
+                if sess and not sess._active:
+                    sess._active = True
+                    log.info("HTTP wake")
+                _html(self, 200, "<h2>Five: active 🎙</h2><p><a href='/sleep'>Go to sleep</a> | <a href='/status'>Status</a></p>")
+            elif self.path == "/sleep":
+                if sess and sess._active:
+                    sess._active = False
+                    log.info("HTTP sleep")
+                _html(self, 200, "<h2>Five: silent 🔇</h2><p><a href='/wake'>Wake up</a> | <a href='/status'>Status</a></p>")
+            elif self.path == "/log":
+                active = sess._active if sess else False
+                rows = ""
+                for e in CONVERSATION_LOG:
+                    if e["role"] == "you":
+                        rows += f'<div class="you"><b>You:</b> {e["text"]}</div>'
+                    elif e["role"] == "five":
+                        rows += f'<div class="five"><b>Five:</b> {e["text"]}</div>'
+                    else:
+                        rows += f'<div class="sys">{e["text"]}</div>'
+                state = "ACTIVE 🎙" if active else "SILENT 🔇"
+                body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="3">
+<title>RealTimeTalk</title>
+<style>
+body{{font-family:sans-serif;padding:10px;background:#111;color:#eee;}}
+.you{{background:#1a3a1a;border-radius:8px;padding:8px;margin:6px 0;}}
+.five{{background:#1a2a3a;border-radius:8px;padding:8px;margin:6px 0;}}
+.sys{{color:#888;font-size:0.85em;text-align:center;margin:4px 0;}}
+h3{{margin:0 0 10px;}}
+a{{color:#7af;margin-right:12px;}}
+</style></head><body>
+<h3>Five — {state}</h3>
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/stop">Stop</a>
+<hr>{rows if rows else "<div class='sys'>No conversation yet</div>"}
+</body></html>"""
+                _html(self, 200, body)
             elif self.path == "/status":
-                body = json.dumps({"status": "running"}).encode()
+                sess = session_ref[0]
+                active = sess._active if sess else False
+                body = json.dumps({"status": "running", "voice": "active" if active else "silent"}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -466,7 +704,7 @@ def start_http_server(port: int, on_stop):
 
     server = HTTPServer(("0.0.0.0", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Toggle: http://<pi-ip>:%d/stop  |  /status", port)
+    log.info("Toggle: http://<pi-ip>:%d/stop  |  /wake  |  /sleep  |  /status", port)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -497,8 +735,9 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         return
     gw_task = asyncio.create_task(gw.listen(stop_event))
 
-    start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set))
-    log.info("OpenClaw RealTimeTalk daemon starting (gateway-integrated)")
+    session_ref: list = [None]
+    start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref)
+    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Five wake up' to activate)")
 
     while not stop_event.is_set():
         session = RealtimeSession(
@@ -507,6 +746,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             input_device=input_device, alsa_output=alsa_output,
             session_key=session_key,
         )
+        session_ref[0] = session
         try:
             await session.run()
             log.info("Session ended.")
@@ -524,6 +764,24 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     log.info("Daemon stopped.")
 
 
+def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
+    """Record ambient noise and return a recommended MIC_GATE_PEAK value (2× noise peak)."""
+    print(f"Calibrating mic — measuring ambient noise for {duration:.0f}s. Stay quiet.")
+    peaks = []
+    def cb(indata, frames, t, s):
+        raw = indata[::RESAMPLE_RATIO, 0]
+        peaks.append(int(np.max(np.abs(raw))))
+    with sd.InputStream(samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                        blocksize=DEVICE_BLOCKSIZE, callback=cb,
+                        device=input_device):
+        import time; time.sleep(duration)
+    peaks = peaks[2:]  # discard first two frames (hardware warmup)
+    noise_peak = max(peaks) if peaks else 0
+    recommended = max(int(noise_peak * 2), 200)
+    print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended}")
+    return recommended
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="OpenClaw RealTimeTalk daemon")
     p.add_argument("--http-port",      type=int, default=DEFAULT_HTTP_PORT,
@@ -534,13 +792,25 @@ if __name__ == "__main__":
                    help=f"ALSA output device for TTS playback (default: {ALSA_OUTPUT})")
     p.add_argument("--session-key",    type=str, default=OPENCLAW_SESSION,
                    help=f"OpenClaw session key (default: {OPENCLAW_SESSION})")
+    p.add_argument("--mic-gate",       type=int, default=MIC_GATE_PEAK,
+                   help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
     p.add_argument("--list-devices",   action="store_true",
                    help="Print available audio devices and exit")
+    p.add_argument("--calibrate",      action="store_true",
+                   help="Measure ambient noise and print recommended --mic-gate value, then exit")
     args = p.parse_args()
 
     if args.list_devices:
         print(sd.query_devices())
         sys.exit(0)
+
+    if args.calibrate:
+        val = calibrate_mic(input_device=args.input_device)
+        print(f"\nRun with:  --mic-gate {val}")
+        print(f"Or update service:  systemctl --user edit --force openclaw-realtimetalk")
+        sys.exit(0)
+
+    MIC_GATE_PEAK = args.mic_gate
 
     asyncio.run(main(
         args.http_port,
