@@ -70,7 +70,7 @@ DEVICE_BLOCKSIZE  = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
 DEFAULT_HTTP_PORT = 18790
 RECONNECT_DELAY   = 5
 AGENT_TIMEOUT_S   = 45
-MIC_GAIN          = 8.0          # software gain — PCM2902 USB mic is very quiet
+MIC_GAIN          = 16.0         # software gain — PCM2902 USB mic is very quiet
 MIC_GATE_PEAK     = 500          # pre-gain peak below this is treated as silence
                                  # (lets OpenAI's VAD see real silence between words)
 
@@ -259,23 +259,24 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT):
     if not clean:
         return
     voice = PIPER_VOICE_ZH if _is_chinese_text(clean) else PIPER_VOICE_EN
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as tf:
-        tf.write(clean)
-        text_path = tf.name
     wav_path = tempfile.mktemp(suffix=".wav")
     try:
-        subprocess.run(
-            [PIPER_CMD, "--model", voice,
-             "-i", text_path, "-f", wav_path, "--quiet"],
-            check=True, stderr=subprocess.DEVNULL, env=PIPER_ENV,
+        # Native piper binary reads from stdin (no -i flag)
+        result = subprocess.run(
+            [PIPER_CMD, "--model", voice, "-f", wav_path, "-q"],
+            input=clean.encode("utf-8"),
+            capture_output=True, env=PIPER_ENV,
         )
-        subprocess.run(
-            ["aplay", "-D", alsa_output, "-q", wav_path],
-        )
+        if result.returncode != 0 or not os.path.exists(wav_path):
+            log.error("Piper failed (rc=%d): %s", result.returncode,
+                      result.stderr.decode(errors="replace")[:200])
+            return
+        subprocess.run(["aplay", "-D", alsa_output, "-q", wav_path])
+    except Exception as e:
+        log.error("speak() error: %s", e)
     finally:
-        for p in (text_path, wav_path):
-            try: os.unlink(p)
-            except FileNotFoundError: pass
+        try: os.unlink(wav_path)
+        except FileNotFoundError: pass
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -656,13 +657,24 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 if sess and not sess._active:
                     sess._active = True
                     log.info("HTTP wake")
-                _html(self, 200, "<h2>Five: active 🎙</h2><p><a href='/sleep'>Go to sleep</a> | <a href='/status'>Status</a></p>")
+                self.send_response(302)
+                self.send_header("Location", "/log")
+                self.end_headers()
             elif self.path == "/sleep":
                 if sess and sess._active:
                     sess._active = False
                     log.info("HTTP sleep")
-                _html(self, 200, "<h2>Five: silent 🔇</h2><p><a href='/wake'>Wake up</a> | <a href='/status'>Status</a></p>")
-            elif self.path == "/log":
+                self.send_response(302)
+                self.send_header("Location", "/log")
+                self.end_headers()
+            elif self.path == "/calibrate":
+                if sess:
+                    import asyncio as _aio
+                    _aio.run_coroutine_threadsafe(sess._run_calibration(), sess.loop)
+                self.send_response(302)
+                self.send_header("Location", "/log")
+                self.end_headers()
+            elif self.path in ("/log", "/"):
                 active = sess._active if sess else False
                 rows = ""
                 for e in CONVERSATION_LOG:
@@ -686,7 +698,7 @@ h3{{margin:0 0 10px;}}
 a{{color:#7af;margin-right:12px;}}
 </style></head><body>
 <h3>Five — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/stop">Stop</a>
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/stop">Stop</a>
 <hr>{rows if rows else "<div class='sys'>No conversation yet</div>"}
 </body></html>"""
                 _html(self, 200, body)
@@ -777,7 +789,7 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
         import time; time.sleep(duration)
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
-    recommended = max(int(noise_peak * 2), 200)
+    recommended = max(int(noise_peak * 1.25), 200)
     print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended}")
     return recommended
 
@@ -792,6 +804,8 @@ if __name__ == "__main__":
                    help=f"ALSA output device for TTS playback (default: {ALSA_OUTPUT})")
     p.add_argument("--session-key",    type=str, default=OPENCLAW_SESSION,
                    help=f"OpenClaw session key (default: {OPENCLAW_SESSION})")
+    p.add_argument("--mic-gain",       type=float, default=MIC_GAIN,
+                   help=f"Software mic gain multiplier (default: {MIC_GAIN})")
     p.add_argument("--mic-gate",       type=int, default=MIC_GATE_PEAK,
                    help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
     p.add_argument("--list-devices",   action="store_true",
@@ -810,6 +824,7 @@ if __name__ == "__main__":
         print(f"Or update service:  systemctl --user edit --force openclaw-realtimetalk")
         sys.exit(0)
 
+    MIC_GAIN      = args.mic_gain
     MIC_GATE_PEAK = args.mic_gate
 
     asyncio.run(main(
