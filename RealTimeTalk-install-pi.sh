@@ -45,14 +45,15 @@ echo "      (Leave as 'none' to let sounddevice pick the system default.)"
 echo ""
 
 # ── Edit these two lines if auto-detection picks the wrong device ─────────────
-AUDIO_INPUT="none"     # e.g. "2"  → adds --input-device 2
-AUDIO_OUTPUT="none"    # e.g. "0"  → adds --output-device 0
+AUDIO_INPUT="none"          # e.g. "2"           → adds --input-device 2
+ALSA_OUTPUT="plughw:3,0"    # ALSA PCM for TTS playback (USB speaker is usually card 3)
+                            # Use "default" or "none" to skip the flag.
 # ─────────────────────────────────────────────────────────────────────────────
 
 build_exec_start() {
     local cmd="$PYTHON $DAEMON"
     [ "$AUDIO_INPUT"  != "none" ] && cmd="$cmd --input-device $AUDIO_INPUT"
-    [ "$AUDIO_OUTPUT" != "none" ] && cmd="$cmd --output-device $AUDIO_OUTPUT"
+    [ "$ALSA_OUTPUT"  != "none" ] && cmd="$cmd --alsa-output $ALSA_OUTPUT"
     echo "$cmd"
 }
 

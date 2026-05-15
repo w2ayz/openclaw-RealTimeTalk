@@ -19,7 +19,7 @@ Usage:
 
 Requires:
   pip install "websockets>=12" sounddevice numpy
-  sudo apt install libportaudio2
+  sudo apt install libportaudio2 alsa-utils
   piper installed at ~/.local/bin/piper with a voice model
 """
 
@@ -52,11 +52,12 @@ PIPER_VOICE       = os.path.expanduser(
     "~/.local/share/piper/voices/en_US-lessac-medium/en_US-lessac-medium.onnx"
 )
 PIPER_SAMPLE_RATE = 22050
+ALSA_OUTPUT       = "plughw:3,0"   # USB speaker; plughw handles rate conversion
 
-OPENAI_MODEL      = "gpt-4o-realtime-preview"
-OPENAI_WS_URL     = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
+OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
-DEVICE_RATE       = 48000        # USB hardware rate
+DEVICE_RATE       = 48000        # USB hardware rate (mic capture)
 RESAMPLE_RATIO    = DEVICE_RATE // SAMPLE_RATE   # 2
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
@@ -64,6 +65,9 @@ DEVICE_BLOCKSIZE  = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
 DEFAULT_HTTP_PORT = 18790
 RECONNECT_DELAY   = 5
 AGENT_TIMEOUT_S   = 45
+MIC_GAIN          = 8.0          # software gain — PCM2902 USB mic is very quiet
+MIC_GATE_PEAK     = 500          # pre-gain peak below this is treated as silence
+                                 # (lets OpenAI's VAD see real silence between words)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -128,26 +132,35 @@ def strip_markdown(text: str) -> str:
 
 # ── Piper TTS ─────────────────────────────────────────────────────────────────
 
-def speak(text: str, output_device=None):
-    """Synthesise text with Piper and play on the speaker. Blocking."""
+def speak(text: str, alsa_output: str = ALSA_OUTPUT):
+    """Synthesise text with Piper and play via aplay.
+
+    Writes text to a temp file and runs Piper with `-i <file>` rather than piping
+    via stdin — Piper silently truncates stdin input after a few words, but reads
+    file input completely. Output is captured to a WAV temp file (so aplay reads
+    from disk, avoiding any streaming buffer underruns on the USB speaker).
+    """
+    import tempfile
     clean = strip_markdown(text)
     if not clean:
         return
-    proc = subprocess.run(
-        [PIPER_CMD, "--model", PIPER_VOICE, "--output-raw", "--quiet"],
-        input=clean.encode(),
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        log.error("Piper TTS error: %s", proc.stderr.decode()[:200])
-        return
-    audio = np.frombuffer(proc.stdout, dtype=np.int16)
-    # Resample Piper output rate → device rate (linear interpolation)
-    n_out = int(round(len(audio) * DEVICE_RATE / PIPER_SAMPLE_RATE))
-    indices = np.linspace(0, len(audio) - 1, n_out)
-    upsampled = np.interp(indices, np.arange(len(audio)), audio).astype(np.int16)
-    sd.play(upsampled, samplerate=DEVICE_RATE, device=output_device)
-    sd.wait()
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write(clean)
+        text_path = tf.name
+    wav_path = tempfile.mktemp(suffix=".wav")
+    try:
+        subprocess.run(
+            [PIPER_CMD, "--model", PIPER_VOICE,
+             "-i", text_path, "-f", wav_path, "--quiet"],
+            check=True, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["aplay", "-D", alsa_output, "-q", wav_path],
+        )
+    finally:
+        for p in (text_path, wav_path):
+            try: os.unlink(p)
+            except FileNotFoundError: pass
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -276,14 +289,14 @@ class RealtimeSession:
 
     def __init__(self, api_key: str, loop: asyncio.AbstractEventLoop,
                  gw: GatewayClient, stop_event: asyncio.Event,
-                 input_device=None, output_device=None,
+                 input_device=None, alsa_output: str = ALSA_OUTPUT,
                  session_key: str = OPENCLAW_SESSION):
         self.api_key      = api_key
         self.loop         = loop
         self.gw           = gw
         self.stop_event   = stop_event
         self.input_device = input_device
-        self.output_device = output_device
+        self.alsa_output  = alsa_output
         self.session_key  = session_key
         self._mic_q       = asyncio.Queue(maxsize=200)
         self._busy        = asyncio.Event()   # set while Five is speaking
@@ -292,9 +305,15 @@ class RealtimeSession:
         if self._busy.is_set():
             return  # discard mic input while Five is speaking to prevent feedback
         # Decimate DEVICE_RATE → SAMPLE_RATE
-        decimated = indata[::RESAMPLE_RATIO, 0].tobytes()
+        raw = indata[::RESAMPLE_RATIO, 0]
+        if int(np.max(np.abs(raw))) < MIC_GATE_PEAK:
+            # noise floor — pass true silence so VAD can detect speech end
+            out_arr = np.zeros_like(raw)
+        else:
+            boosted = raw.astype(np.float32) * MIC_GAIN
+            out_arr = np.clip(boosted, -32768, 32767).astype(np.int16)
         try:
-            self.loop.call_soon_threadsafe(self._mic_q.put_nowait, decimated)
+            self.loop.call_soon_threadsafe(self._mic_q.put_nowait, out_arr.tobytes())
         except asyncio.QueueFull:
             pass
 
@@ -318,12 +337,12 @@ class RealtimeSession:
             reply = await self.gw.ask(transcript, session_key=self.session_key)
             log.info("Five: %s", reply)
             await asyncio.get_running_loop().run_in_executor(
-                None, speak, reply, self.output_device
+                None, speak, reply, self.alsa_output
             )
         except asyncio.TimeoutError:
             log.error("OpenClaw agent timed out")
             await asyncio.get_running_loop().run_in_executor(
-                None, speak, "Sorry, I timed out on that.", self.output_device
+                None, speak, "Sorry, I timed out on that.", self.alsa_output
             )
         except Exception as e:
             log.error("Error routing transcript: %s", e)
@@ -337,8 +356,16 @@ class RealtimeSession:
             msg = json.loads(raw)
             t   = msg.get("type", "")
 
-            if t == "conversation.item.input_audio_transcription.completed":
-                transcript = msg.get("transcript", "").strip()
+            if t in ("conversation.item.done", "conversation.item.input_audio_transcription.completed"):
+                # transcription endpoint: transcript in item.content[].transcript
+                # old realtime endpoint: transcript in top-level .transcript
+                transcript = msg.get("transcript", "")
+                if not transcript:
+                    for chunk in msg.get("item", {}).get("content", []):
+                        if chunk.get("type") == "input_audio" and chunk.get("transcript"):
+                            transcript = chunk["transcript"]
+                            break
+                transcript = transcript.strip()
                 if transcript and not self._busy.is_set():
                     log.info("You: %s", transcript)
                     asyncio.create_task(self._handle_transcript(transcript))
@@ -346,30 +373,46 @@ class RealtimeSession:
             elif t == "error":
                 log.error("OpenAI error: %s", msg.get("error", msg))
 
+            elif t not in (
+                "input_audio_buffer.speech_started",
+                "input_audio_buffer.speech_stopped",
+                "input_audio_buffer.committed",
+                "conversation.item.created",
+                "conversation.item.added",
+                "conversation.item.done",
+                "conversation.item.input_audio_transcription.delta",
+                "transcription_session.updated",
+                "session.updated",
+                "session.created",
+            ):
+                log.debug("OpenAI event: %s", t)
+
     async def run(self):
         log.info("Connecting to OpenAI Realtime API (STT mode)…")
         async with websockets.connect(
             OPENAI_WS_URL,
             additional_headers={
                 "Authorization": f"Bearer {self.api_key}",
-                "OpenAI-Beta":   "realtime=v1",
             },
             ping_interval=20,
             ping_timeout=10,
         ) as ws:
+            # GA transcription session: nested audio.input config
             await ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "modalities": ["text"],
-                    "input_audio_format": "pcm16",
-                    "turn_detection": {
-                        "type":                 "server_vad",
-                        "threshold":            0.5,
-                        "prefix_padding_ms":    300,
-                        "silence_duration_ms":  800,
-                        "create_response":      False,   # STT only, no AI response
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
+                            "turn_detection": {
+                                "type":                "server_vad",
+                                "threshold":           0.5,
+                                "prefix_padding_ms":   300,
+                                "silence_duration_ms": 800,
+                            },
+                        },
                     },
-                    "input_audio_transcription": {"model": "whisper-1"},
                 },
             }))
             log.info("Session active — speak now (routed through Five / OpenClaw)")
@@ -427,7 +470,7 @@ def start_http_server(port: int, on_stop):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main(http_port: int, input_device=None, output_device=None,
+async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT,
                session_key: str = OPENCLAW_SESSION):
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -443,7 +486,15 @@ async def main(http_port: int, input_device=None, output_device=None,
         sys.exit(1)
 
     gw = GatewayClient(gw_token)
-    await gw.connect()
+    while not stop_event.is_set():
+        try:
+            await gw.connect()
+            break
+        except (ConnectionRefusedError, OSError) as e:
+            log.warning("Gateway not ready (%s) — retrying in 5s…", e)
+            await asyncio.sleep(5)
+    if stop_event.is_set():
+        return
     gw_task = asyncio.create_task(gw.listen(stop_event))
 
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set))
@@ -453,7 +504,7 @@ async def main(http_port: int, input_device=None, output_device=None,
         session = RealtimeSession(
             api_key=openai_key, loop=loop, gw=gw,
             stop_event=stop_event,
-            input_device=input_device, output_device=output_device,
+            input_device=input_device, alsa_output=alsa_output,
             session_key=session_key,
         )
         try:
@@ -479,8 +530,8 @@ if __name__ == "__main__":
                    help=f"HTTP toggle port (default {DEFAULT_HTTP_PORT})")
     p.add_argument("--input-device",   type=int, default=None,
                    help="sounddevice input device index (see --list-devices)")
-    p.add_argument("--output-device",  type=int, default=None,
-                   help="sounddevice output device index (see --list-devices)")
+    p.add_argument("--alsa-output",    type=str, default=ALSA_OUTPUT,
+                   help=f"ALSA output device for TTS playback (default: {ALSA_OUTPUT})")
     p.add_argument("--session-key",    type=str, default=OPENCLAW_SESSION,
                    help=f"OpenClaw session key (default: {OPENCLAW_SESSION})")
     p.add_argument("--list-devices",   action="store_true",
@@ -494,6 +545,6 @@ if __name__ == "__main__":
     asyncio.run(main(
         args.http_port,
         args.input_device,
-        args.output_device,
+        args.alsa_output,
         args.session_key,
     ))

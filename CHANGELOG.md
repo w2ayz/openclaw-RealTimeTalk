@@ -1,5 +1,84 @@
 # Changelog
 
+## v1.3 — 2026-05-14
+
+End-to-end voice working on the Pi. Fixes for the OpenAI Realtime API GA changes,
+quiet USB mic, and a Piper TTS truncation bug.
+
+### Fixed
+
+- **OpenAI Realtime API: switched to the GA transcription endpoint.**
+  OpenAI disabled the old beta WebSocket "session shape" — the daemon was getting
+  `beta_api_shape_disabled` on every connect. Replaced the old
+  `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview` URL +
+  `OpenAI-Beta: realtime=v1` header path with the GA transcription endpoint
+  `wss://api.openai.com/v1/realtime?intent=transcription`. The session config now
+  uses the nested schema OpenAI moved to for GA:
+  ```json
+  { "type": "session.update",
+    "session": { "type": "transcription",
+                 "audio": { "input": { "transcription":  { "model": "gpt-4o-transcribe" },
+                                       "turn_detection": { "type": "server_vad", ... } } } } }
+  ```
+  STT model is now `gpt-4o-transcribe` (the prior `whisper-1` is not exposed via this endpoint).
+  Final transcripts arrive as `conversation.item.input_audio_transcription.completed` events.
+
+- **Piper TTS truncation — single-word replies fixed.** Piper silently truncates input
+  read from stdin to ~few words, then exits. The daemon's `speak()` was piping `text → piper.stdin`
+  via `subprocess.PIPE`, which is why long replies played as one word. `speak()` now writes
+  the text to a temp file and invokes `piper -i <file> -f <wav>`, producing the full WAV which
+  is then played via `aplay`. This was the root cause of Victor hearing only one word per reply.
+
+- **USB mic gain + noise gate.** PCM2902-based USB mics (the common "C-Media USB PnP Sound Device"
+  adapter) output ~6× quieter than browsers receive, because browsers apply WebRTC AGC
+  automatically. Server VAD therefore never triggered on speech. Added software gain (`MIC_GAIN=8`)
+  with clip-to-int16, gated by a peak threshold (`MIC_GATE_PEAK=500`): blocks below the threshold
+  are zeroed before send, so OpenAI's VAD sees real silence between words and can detect speech
+  end. Without the gate, amplified noise floor caused infinite `speech_started` with no
+  `speech_stopped`.
+
+- **Boot-order race: gateway retry loop.** With `Restart=no` and the daemon starting before
+  OpenClaw's gateway was listening on 18789, the daemon would die at boot with
+  `ConnectionRefusedError` and never come back. `main()` now retries `gw.connect()` every 5 s
+  until either the gateway is up or the stop event fires.
+
+- **Wrong default mic on installer.** The installer wrote `--input-device 1` into the systemd
+  ExecStart, but on this hardware index 1 is the USB *speaker* (0 input channels). The default is
+  now empty — sounddevice uses the PipeWire default, which correctly routes to the USB mic via
+  ALSA card 2.
+
+### Changed
+
+- `--output-device <index>` flag replaced with `--alsa-output <pcm>` (string ALSA PCM, e.g.
+  `plughw:3,0`). Direct ALSA via `plughw` bypasses PipeWire's idle-suspend which had been
+  silencing the speaker. Installer variable renamed from `AUDIO_OUTPUT` to `ALSA_OUTPUT`.
+- `speak()` now prepends ~500 ms of silence before the speech so the USB speaker has time to
+  wake from low-power state; without it the first word was eaten.
+- `RealtimeSession` no longer requests `modalities` / `input_audio_format` / `create_response` —
+  none are accepted on the transcription endpoint.
+- Logging cleaned up: speech_started/stopped/added/done are silent (known), unknown event types
+  log at DEBUG.
+
+### Constants worth tuning
+
+```python
+OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+MIC_GAIN                = 8.0     # multiply each sample (post-decimation, pre-clip)
+MIC_GATE_PEAK           = 500     # raise if room is noisy, lower if mic is unusually quiet
+```
+
+### Protocol notes (for contributors)
+
+- The GA transcription endpoint accepts `session.update` (not `transcription_session.update`).
+  The session object **must** include `type: "transcription"`; otherwise OpenAI returns
+  `missing_required_parameter session.type`.
+- Flat fields `input_audio_format`, `input_audio_transcription`, `turn_detection` directly on
+  `session` all return `unknown_parameter` here — they must be nested under `audio.input.*`.
+- Transcripts arrive both as streaming `…transcription.delta` chunks and a final
+  `…transcription.completed` with the full text in `transcript`.
+
+---
+
 ## v1.2 — 2026-05-14
 
 Full OpenClaw gateway integration — voice now routes through Five.
