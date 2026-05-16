@@ -277,10 +277,14 @@ def run_speaker_calibration(alsa_output: str = None,
                          snr, pw_pct, sw_vol)
                 break
         else:
-            # Took all steps — use max tested
-            found_pw, found_sw = steps[-1]
-            log.info("Speaker cal: SNR never reached %.1f — using max PW=%d%% SW=%.2f",
-                     snr_target, found_pw, found_sw)
+            # SNR never reached target (non-powered speaker) — use step with best tone energy
+            if measurements:
+                best = max(measurements, key=lambda m: m["tone"])
+                found_pw, found_sw = best["pw"], best["sw"]
+                log.info("Speaker cal: SNR never reached %.1f — best tone energy at PW=%d%% SW=%.2f (SNR=%.1f)",
+                         snr_target, found_pw, found_sw, best["snr"])
+            else:
+                found_pw, found_sw = steps[-1]
 
         # Set PipeWire to the found level for normal use
         if speaker_sink:
@@ -610,7 +614,9 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0):
         _play_done.set()
         _m.join(timeout=0.5)
 
-        # Auto-reduce volume if speaker is bleeding into mic significantly
+        # Auto-reduce volume if speaker is bleeding into mic significantly (skip after calibration)
+        if speak.__globals__.get("_skip_auto_reduce", False):
+            return
         if mic_peaks_during:
             avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
             # If mic sees 5× more signal during playback than ambient → speaker too loud
@@ -1228,17 +1234,23 @@ function runCal(){{
                 )
                 _speaker_cal_result.clear()
                 _speaker_cal_result.update(result)
-                # announce result using calibrated level (both PipeWire and software already set)
+                # announce result — play at calibrated level, skip auto-reduce so we
+                # don't override the level we just found
                 if sess:
                     import threading as _t
                     sw = result.get("safe_sw_vol", _cal_sw_volume)
-                    _t.Thread(
-                        target=speak,
-                        args=(f"Calibration done. Speaker set to {result['safe_vol']} percent "
-                              f"with software level {int(sw*100)} percent.",
-                              sess.alsa_output, sw),
-                        daemon=True
-                    ).start()
+                    pw = result.get("safe_vol", 60)
+                    def _cal_announce(sw=sw, pw=pw, alsa=sess.alsa_output):
+                        msg = (f"Calibration done. "
+                               f"Speaker level: {pw} percent PipeWire, "
+                               f"software {int(sw*100)} percent.")
+                        # Temporarily suppress auto-reduce by patching the flag
+                        speak.__globals__["_skip_auto_reduce"] = True
+                        try:
+                            speak(msg, alsa, volume=sw)
+                        finally:
+                            speak.__globals__["_skip_auto_reduce"] = False
+                    _t.Thread(target=_cal_announce, daemon=True).start()
                 resp = _json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
