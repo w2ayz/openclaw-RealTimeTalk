@@ -73,6 +73,8 @@ AGENT_TIMEOUT_S   = 45
 MIC_GAIN          = 16.0         # software gain — PCM2902 USB mic is very quiet
 MIC_GATE_PEAK     = 500          # pre-gain peak below this is treated as silence
                                  # (lets OpenAI's VAD see real silence between words)
+MIC_GATE_MIN      = 300          # calibration clamp — quietest usable room
+MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
 MAX_LOG_ENTRIES = 40
@@ -459,7 +461,7 @@ class RealtimeSession:
             )
             return
         noise_peak = max(peaks)
-        new_gate = max(int(noise_peak * 2), 200)
+        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
         MIC_GATE_PEAK = new_gate
         log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
         # Persist to service file so it survives restarts
@@ -650,9 +652,15 @@ def start_http_server(port: int, on_stop, session_ref: list):
 
         def do_GET(self):
             sess = session_ref[0]
-            if self.path in ("/stop", "/toggle"):
+            if self.path == "/stop":
                 _html(self, 200, "<h2>OpenClaw RealTimeTalk: stopping…</h2>")
                 on_stop()
+            elif self.path == "/restart":
+                _html(self, 200, "<h2>Restarting…</h2><p>Page will reload in 5 seconds.</p><script>setTimeout(()=>location.href='/log',5000)</script>")
+                threading.Thread(target=lambda: (
+                    __import__('time').sleep(1),
+                    __import__('subprocess').run(['systemctl','--user','restart','openclaw-realtimetalk'])
+                ), daemon=True).start()
             elif self.path == "/wake":
                 if sess and not sess._active:
                     sess._active = True
@@ -698,7 +706,7 @@ h3{{margin:0 0 10px;}}
 a{{color:#7af;margin-right:12px;}}
 </style></head><body>
 <h3>Five — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/stop">Stop</a>
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/restart">Restart</a>
 <hr>{rows if rows else "<div class='sys'>No conversation yet</div>"}
 </body></html>"""
                 _html(self, 200, body)
@@ -789,8 +797,8 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
         import time; time.sleep(duration)
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
-    recommended = max(int(noise_peak * 1.25), 200)
-    print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended}")
+    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+    print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
 
 
