@@ -277,14 +277,21 @@ def run_speaker_calibration(alsa_output: str = None,
                          snr, pw_pct, sw_vol)
                 break
         else:
-            # SNR never reached target (non-powered speaker) — use step with best tone energy
             if measurements:
                 best = max(measurements, key=lambda m: m["tone"])
-                found_pw, found_sw = best["pw"], best["sw"]
-                log.info("Speaker cal: SNR never reached %.1f — best tone energy at PW=%d%% SW=%.2f (SNR=%.1f)",
-                         snr_target, found_pw, found_sw, best["snr"])
+                if best["tone"] < 0.00005:
+                    # No acoustic signal at any volume — mic is probably not connected
+                    log.warning("Speaker cal: no acoustic signal detected — microphone may not be connected")
+                    status = "no_mic"
+                    # Stay at safe minimum — do NOT set high volume on a possibly-powered speaker
+                    found_pw, found_sw = 1, NEW_DEVICE_VOLUME
+                else:
+                    # Non-powered speaker — pick step with highest tone energy
+                    found_pw, found_sw = best["pw"], best["sw"]
+                    log.info("Speaker cal: non-powered speaker, best energy at PW=%d%% SW=%.2f (SNR=%.1f)",
+                             found_pw, found_sw, best["snr"])
             else:
-                found_pw, found_sw = steps[-1]
+                found_pw, found_sw = 1, NEW_DEVICE_VOLUME
 
         # Set PipeWire to the found level for normal use
         if speaker_sink:
@@ -294,8 +301,12 @@ def run_speaker_calibration(alsa_output: str = None,
         # Update global speak() software volume so all subsequent TTS uses calibrated level
         global _cal_sw_volume
         _cal_sw_volume = found_sw
-        log.info("Speaker cal complete: PW=%d%% SW=%.2f — speak() will use this level",
-                 found_pw, found_sw)
+        log.info("Speaker cal complete: PW=%d%% SW=%.2f alsa=%s — speak() will use this level",
+                 found_pw, found_sw, speaker_alsa)
+
+        # Persist the found ALSA output card to the service file so restarts use the right device
+        if status == "ok":
+            _update_service_alsa_output(speaker_alsa)
 
     except Exception as e:
         log.error("Speaker calibration error: %s", e)
@@ -305,6 +316,7 @@ def run_speaker_calibration(alsa_output: str = None,
     return {
         "safe_vol": found_pw,
         "safe_sw_vol": found_sw,
+        "speaker_alsa": speaker_alsa,
         "measurements": measurements,
         "mic_source": mic_source or "unknown",
         "speaker_sink": speaker_sink or "unknown",
@@ -446,6 +458,25 @@ def load_gateway_token() -> str:
 SERVICE_FILE = os.path.expanduser(
     "~/.config/systemd/user/openclaw-realtimetalk.service"
 )
+
+def _update_service_alsa_output(new_alsa: str):
+    """Persist --alsa-output <device> in the systemd service ExecStart line."""
+    try:
+        with open(SERVICE_FILE) as f:
+            content = f.read()
+        import re as _re
+        content = _re.sub(r" --alsa-output \S+", "", content)
+        content = content.replace(
+            "\nRestart=no",
+            f" --alsa-output {new_alsa}\nRestart=no",
+        )
+        with open(SERVICE_FILE, "w") as f:
+            f.write(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        log.info("Service updated: --alsa-output %s", new_alsa)
+    except Exception as e:
+        log.warning("Could not update service alsa-output: %s", e)
+
 
 def _update_service_gate(new_gate: int):
     """Persist --mic-gate <n> in the systemd service ExecStart line."""
@@ -1185,7 +1216,11 @@ function startCal(){{
                                 f'<td style="color:{col}">SNR {snr:.1f}×</td></tr>')
                     rows = "".join(_row(m) for m in prev.get("measurements", []))
                     sw_pct = int(prev.get("safe_sw_vol", 1.0) * 100)
+                    warn = ('<div style="background:#5a1a00;border-radius:6px;padding:8px;'
+                            'margin-bottom:6px;">⚠ No microphone detected — connect mic and recalibrate.</div>'
+                            ) if prev.get("status") == "no_mic" else ""
                     prev_html = (
+                        warn +
                         f'<h4>Last result: PW <b>{prev.get("safe_vol")}%</b> + '
                         f'software <b>{sw_pct}%</b></h4>'
                         f'<table border=1 style="border-collapse:collapse;font-size:12px">'
@@ -1234,16 +1269,29 @@ function runCal(){{
                 )
                 _speaker_cal_result.clear()
                 _speaker_cal_result.update(result)
+                # Update live session's alsa_output immediately (no restart needed)
+                if sess and result.get("status") == "ok":
+                    new_alsa = result.get("speaker_alsa", sess.alsa_output)
+                    if new_alsa != sess.alsa_output:
+                        log.info("Updating live session alsa_output: %s → %s",
+                                 sess.alsa_output, new_alsa)
+                        sess.alsa_output = new_alsa
+
                 # announce result — play at calibrated level, skip auto-reduce so we
                 # don't override the level we just found
                 if sess:
                     import threading as _t
                     sw = result.get("safe_sw_vol", _cal_sw_volume)
                     pw = result.get("safe_vol", 60)
-                    def _cal_announce(sw=sw, pw=pw, alsa=sess.alsa_output):
-                        msg = (f"Calibration done. "
-                               f"Speaker level: {pw} percent PipeWire, "
-                               f"software {int(sw*100)} percent.")
+                    def _cal_announce(sw=sw, pw=pw, alsa=sess.alsa_output, st=result.get("status","ok")):
+                        if st == "no_mic":
+                            msg = ("Warning: no microphone detected during speaker calibration. "
+                                   "Please connect a microphone and run calibration again. "
+                                   "Speaker volume kept at minimum for safety.")
+                        else:
+                            msg = (f"Calibration done. "
+                                   f"Speaker level: {pw} percent PipeWire, "
+                                   f"software {int(sw*100)} percent.")
                         # Temporarily suppress auto-reduce by patching the flag
                         speak.__globals__["_skip_auto_reduce"] = True
                         try:
