@@ -62,21 +62,254 @@ ALSA_OUTPUT       = "plughw:3,0"   # USB speaker; plughw handles rate conversion
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
-DEVICE_RATE       = 48000        # USB hardware rate (mic capture)
-RESAMPLE_RATIO    = DEVICE_RATE // SAMPLE_RATE   # 2
+DEVICE_RATE       = 24000        # capture at 24 kHz — PipeWire resamples from native
+                                 # (BT700 is 16 kHz; one clean 16k→24k hop vs old 16k→48k→24k)
+RESAMPLE_RATIO    = 1            # no decimation needed — DEVICE_RATE == SAMPLE_RATE
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
-DEVICE_BLOCKSIZE  = BLOCKSIZE * RESAMPLE_RATIO   # 4800 hardware frames
+DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 18790
 RECONNECT_DELAY   = 5
 AGENT_TIMEOUT_S   = 45
-MIC_GAIN          = 16.0         # software gain — PCM2902 USB mic is very quiet
-MIC_GATE_PEAK     = 500          # pre-gain peak below this is treated as silence
+MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
+MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
                                  # (lets OpenAI's VAD see real silence between words)
 MIC_GATE_MIN      = 300          # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
+NEW_DEVICE_VOLUME = 0.05         # software attenuation for new-speaker announcement (5% of signal)
+                                 # combined with PipeWire 1% = ~0.05% of full scale
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
+
+import threading as _threading
+_mic_level_lock = _threading.Lock()
+_mic_level_current = [0]   # latest raw pre-gain peak, written by audio thread
+_mic_gate_ref     = [500]  # mutable wrapper for MIC_GATE_PEAK, readable across threads
+
+def _get_audio_fingerprint() -> str:
+    """Return a fingerprint of connected audio devices — names only, no state.
+    Strips SUSPENDED/RUNNING/IDLE so auto-refresh doesn't re-announce on state changes."""
+    try:
+        cards = subprocess.run(["cat", "/proc/asound/cards"],
+                               capture_output=True, text=True).stdout.strip()
+        pw_raw = subprocess.run(["pactl", "list", "short", "sources"],
+                                capture_output=True, text=True).stdout.strip()
+        # Keep only device name — drop state column (SUSPENDED/RUNNING/IDLE)
+        pw = "\n".join(
+            "\t".join(line.split("\t")[:3])   # id, name, driver — drop state
+            for line in pw_raw.splitlines() if line.strip()
+        )
+        return cards + "\n---\n" + pw
+    except Exception:
+        return ""
+
+def _safe_volume_new_sinks(safe_pct: int = 70):
+    """Cap all PipeWire sinks to safe_pct% — protects against newly connected speakers at 100%."""
+    try:
+        sinks = subprocess.run(["pactl", "list", "short", "sinks"],
+                               capture_output=True, text=True).stdout.strip()
+        for line in sinks.splitlines():
+            parts = line.split()
+            if parts:
+                subprocess.run(
+                    ["pactl", "set-sink-volume", parts[0], f"{safe_pct}%"],
+                    capture_output=True,
+                )
+        log.info("Set all sinks to %d%% (device change safety)", safe_pct)
+    except Exception as e:
+        log.warning("Could not set sink volumes: %s", e)
+
+_audio_fingerprint = [_get_audio_fingerprint()]   # [0] = last known state
+_device_change_msg = [""]                          # [0] = pending announcement or ""
+_speaker_cal_result: dict = {}                     # last calibration result
+
+
+def _find_always_on_mic_source() -> str | None:
+    """Return the PipeWire source name of the always-on USB mic (RUNNING state)."""
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sources"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if "RUNNING" in line and "monitor" not in line.lower():
+                return line.split()[1]
+    except Exception:
+        pass
+    return None
+
+
+def _find_usb_speaker_sink() -> str | None:
+    """Return the PipeWire sink index of the first non-HDMI, non-Bluetooth USB sink."""
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sinks"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                name = parts[1]
+                if "hdmi" not in name.lower() and "bluez" not in name.lower():
+                    return parts[0]   # sink index
+    except Exception:
+        pass
+    return None
+
+
+def run_speaker_calibration(alsa_output: str = None,
+                             test_freq: float = 440.0,
+                             duration: float = 0.3,
+                             snr_target: float = 50000.0) -> dict:
+    """
+    Find the MINIMUM usable speaker volume by starting at absolute minimum
+    (PipeWire 1% + software attenuation 1%) and stepping up until the mic
+    detects the tone with adequate SNR.
+
+    Steps: (PW=1%, SW=0.01), (0.02), (0.05), (0.1), (0.2), (0.5), (1.0),
+           then PW=5%,10%,20%,30%,40%,50%,60% at SW=1.0.
+
+    Returns dict with: safe_vol (PipeWire %), safe_sw_vol (software 0-1),
+                       measurements, mic_source, status.
+    """
+    import wave as _wave, tempfile as _tf, time as _t
+
+    mic_source = _find_always_on_mic_source()
+    speaker_sink = _find_usb_speaker_sink()
+
+    # Find working ALSA output
+    def _find_working_alsa_out() -> str:
+        candidates = ([alsa_output] if alsa_output else []) + [f"plughw:{c},0" for c in range(6)]
+        test_path = _tf.mktemp(suffix=".wav")
+        try:
+            with _wave.open(test_path, 'wb') as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(48000)
+                wf.writeframes(b'\x00\x00' * 480)
+            for c in candidates:
+                if subprocess.run(["aplay", "-D", c, "-q", test_path],
+                                  capture_output=True).returncode == 0:
+                    log.info("Speaker cal: using output %s", c)
+                    return c
+        finally:
+            try: os.unlink(test_path)
+            except FileNotFoundError: pass
+        return "default"
+
+    speaker_alsa = _find_working_alsa_out()
+
+    # Absolute minimum first — PipeWire 1%, no extra sound yet
+    _safe_volume_new_sinks(1)
+    _t.sleep(0.3)
+
+    sample_rate = 48000
+    n_samples   = int(sample_rate * duration)
+    freq_idx    = int(np.round(test_freq * n_samples / sample_rate))
+
+    # Steps: (pw_pct, sw_volume)
+    steps = (
+        [(1, sw) for sw in [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]] +
+        [(pw, 1.0) for pw in [5, 10, 20, 30, 40, 50, 60]]
+    )
+
+    # Measure mic noise floor at absolute minimum (silence reference)
+    try:
+        ref_rec = sd.rec(n_samples, samplerate=sample_rate, channels=1,
+                         dtype='int16', device=None, blocking=True)
+        ref_data  = ref_rec[:n_samples, 0].astype(np.float32) / 32768.0
+        ref_fft   = np.abs(np.fft.rfft(ref_data)) / n_samples
+        noise_floor = float(np.median(ref_fft))
+    except Exception:
+        noise_floor = 1e-6
+
+    measurements: list[dict] = []
+    found_pw, found_sw = 1, 0.01
+    status = "ok"
+    cur_pw = 1
+
+    try:
+        for pw_pct, sw_vol in steps:
+            # Update PipeWire only when it changes
+            if pw_pct != cur_pw:
+                if speaker_sink:
+                    subprocess.run(["pactl", "set-sink-volume", speaker_sink, f"{pw_pct}%"],
+                                   capture_output=True)
+                _t.sleep(0.05)
+                cur_pw = pw_pct
+
+            # Generate tone at this software level
+            t_arr   = np.linspace(0, duration, n_samples, endpoint=False)
+            tone_16 = (0.5 * sw_vol * np.sin(2 * np.pi * test_freq * t_arr) * 32767).astype(np.int16)
+            tone_path = _tf.mktemp(suffix=".wav")
+            with _wave.open(tone_path, 'wb') as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sample_rate)
+                wf.writeframes(tone_16.tobytes())
+
+            # Play + record simultaneously
+            recording = np.zeros(n_samples, dtype=np.int16)
+            done_ev   = _threading.Event()
+
+            def _rec(buf=recording, ev=done_ev):
+                try:
+                    r = sd.rec(n_samples, samplerate=sample_rate, channels=1,
+                               dtype='int16', device=None, blocking=True)
+                    buf[:] = r[:n_samples, 0]
+                except Exception as e:
+                    log.warning("Cal mic error: %s", e)
+                finally:
+                    ev.set()
+
+            _threading.Thread(target=_rec, daemon=True).start()
+            subprocess.run(["aplay", "-D", speaker_alsa, "-q", tone_path], capture_output=True)
+            done_ev.wait(timeout=duration + 1.0)
+            try: os.unlink(tone_path)
+            except FileNotFoundError: pass
+
+            # SNR: how much louder is the tone vs noise floor?
+            data    = recording.astype(np.float32) / 32768.0
+            fft_mag = np.abs(np.fft.rfft(data)) / n_samples
+            tone_energy = float(fft_mag[freq_idx])
+            snr = tone_energy / noise_floor if noise_floor > 0 else 0.0
+
+            measurements.append({"pw": pw_pct, "sw": round(sw_vol, 3),
+                                  "tone": round(tone_energy, 7), "snr": round(snr, 2)})
+            log.info("Speaker cal: PW=%d%% SW=%.2f tone=%.6f SNR=%.1f",
+                     pw_pct, sw_vol, tone_energy, snr)
+
+            if snr >= snr_target:
+                found_pw, found_sw = pw_pct, sw_vol
+                log.info("Speaker cal: adequate SNR %.1f at PW=%d%% SW=%.2f → using this level",
+                         snr, pw_pct, sw_vol)
+                break
+        else:
+            # Took all steps — use max tested
+            found_pw, found_sw = steps[-1]
+            log.info("Speaker cal: SNR never reached %.1f — using max PW=%d%% SW=%.2f",
+                     snr_target, found_pw, found_sw)
+
+        # Set PipeWire to the found level for normal use
+        if speaker_sink:
+            subprocess.run(["pactl", "set-sink-volume", speaker_sink, f"{found_pw}%"],
+                           capture_output=True)
+
+        # Update global speak() software volume so all subsequent TTS uses calibrated level
+        global _cal_sw_volume
+        _cal_sw_volume = found_sw
+        log.info("Speaker cal complete: PW=%d%% SW=%.2f — speak() will use this level",
+                 found_pw, found_sw)
+
+    except Exception as e:
+        log.error("Speaker calibration error: %s", e)
+        status = f"error: {e}"
+        found_pw, found_sw = 1, NEW_DEVICE_VOLUME
+
+    return {
+        "safe_vol": found_pw,
+        "safe_sw_vol": found_sw,
+        "measurements": measurements,
+        "mic_source": mic_source or "unknown",
+        "speaker_sink": speaker_sink or "unknown",
+        "test_freq": test_freq,
+        "snr_target": snr_target,
+        "status": status,
+    }
+
+_cal_sw_volume: float = 1.0   # updated after calibration; used by speak() for normal TTS
 MAX_LOG_ENTRIES = 40
 
 def _log_entry(role: str, text: str):
@@ -236,19 +469,58 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
-    # Strip emoji and other non-ASCII — Piper reads them as their Unicode names
-    # e.g. Five's ⚡ signature becomes "high voltage" without this
-    text = re.sub(r'[^\x00-\x7F]+', '', text)
+    # Strip emoji and symbol characters — Piper reads them as their Unicode names
+    # (e.g. Five's ⚡ becomes "high voltage"). Keep CJK for Chinese TTS.
+    text = re.sub(
+        r'[\U0001F000-\U0001FFFF'   # emoji / pictographs
+        r'☀-➿'            # misc symbols, dingbats (includes ⚡ U+26A1)
+        r'⬀-⯿'            # misc symbols & arrows
+        r'︀-️]',          # variation selectors
+        '', text
+    )
     return text.strip()
 
 # ── Piper TTS ─────────────────────────────────────────────────────────────────
 
-def _is_chinese_text(text: str) -> bool:
-    """True if the text contains enough CJK characters to warrant a Chinese voice."""
-    cjk = sum(1 for c in text if '一' <= c <= '鿿')
-    return cjk > len(text) * 0.2
+def _is_cjk(ch: str) -> bool:
+    cp = ord(ch)
+    return (0x4E00 <= cp <= 0x9FFF or
+            0x3400 <= cp <= 0x4DBF or
+            0x20000 <= cp <= 0x2A6DF)
 
-def speak(text: str, alsa_output: str = ALSA_OUTPUT):
+def _is_chinese_text(text: str) -> bool:
+    return any(_is_cjk(c) for c in text)
+
+def _split_by_script(text: str) -> list[tuple[str, str]]:
+    """Split text into [(segment, 'zh'|'en')] so each segment uses its correct Piper voice."""
+    segments: list[tuple[str, str]] = []
+    current_chars: list[str] = []
+    current_lang = None
+    for ch in text:
+        lang = 'zh' if _is_cjk(ch) else 'en'
+        # Chinese punctuation stays with Chinese; spaces/ASCII punct follow current lang
+        if ch in ' \t\n\r，。！？；：、""‘’「」《》':
+            lang = current_lang or 'en'
+        if lang != current_lang and current_chars:
+            seg = ''.join(current_chars).strip()
+            if seg:
+                segments.append((seg, current_lang or 'en'))
+            current_chars = []
+        current_lang = lang
+        current_chars.append(ch)
+    if current_chars:
+        seg = ''.join(current_chars).strip()
+        if seg:
+            segments.append((seg, current_lang or 'en'))
+    return segments
+
+    if current_chars:
+        segments.append((''.join(current_chars).strip(), current_lang or 'en'))
+
+    return [(s, l) for s, l in segments if s]
+
+def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0):
+    # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
     """Synthesise text with Piper and play via aplay.
 
     Writes text to a temp file and runs Piper with `-i <file>` rather than piping
@@ -257,28 +529,121 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT):
     from disk, avoiding any streaming buffer underruns on the USB speaker).
     """
     import tempfile
+    if volume < 0:
+        volume = _cal_sw_volume   # use calibrated level
     clean = strip_markdown(text)
     if not clean:
         return
-    voice = PIPER_VOICE_ZH if _is_chinese_text(clean) else PIPER_VOICE_EN
-    wav_path = tempfile.mktemp(suffix=".wav")
+    segments = _split_by_script(clean)
+    # Prepend 300ms silence — wakes USB speakers from low-power state gradually
+    silence_path = tempfile.mktemp(suffix=".wav")
+    import wave as _wave, struct as _struct
+    with _wave.open(silence_path, 'wb') as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
+        wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * 0.3))
+    wav_parts: list[str] = [silence_path]
     try:
-        # Native piper binary reads from stdin (no -i flag)
-        result = subprocess.run(
-            [PIPER_CMD, "--model", voice, "-f", wav_path, "-q"],
-            input=clean.encode("utf-8"),
-            capture_output=True, env=PIPER_ENV,
-        )
-        if result.returncode != 0 or not os.path.exists(wav_path):
-            log.error("Piper failed (rc=%d): %s", result.returncode,
-                      result.stderr.decode(errors="replace")[:200])
+        for seg_text, lang in segments:
+            voice = PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN
+            part_path = tempfile.mktemp(suffix=".wav")
+            result = subprocess.run(
+                [PIPER_CMD, "--model", voice, "-f", part_path, "-q"],
+                input=seg_text.encode("utf-8"),
+                capture_output=True, env=PIPER_ENV,
+            )
+            if result.returncode != 0 or not os.path.exists(part_path):
+                log.error("Piper failed for %r (rc=%d): %s",
+                          seg_text[:30], result.returncode,
+                          result.stderr.decode(errors="replace")[:120])
+                continue
+            wav_parts.append(part_path)
+
+        if not wav_parts:
             return
-        subprocess.run(["aplay", "-D", alsa_output, "-q", wav_path])
+
+        if len(wav_parts) == 1:
+            final_wav = wav_parts[0]
+            wav_parts = []
+        else:
+            # Concatenate all WAV parts into one
+            import wave as _wave
+            final_wav = tempfile.mktemp(suffix=".wav")
+            with _wave.open(final_wav, 'wb') as out_wf:
+                for i, part in enumerate(wav_parts):
+                    with _wave.open(part, 'rb') as in_wf:
+                        if i == 0:
+                            out_wf.setparams(in_wf.getparams())
+                        out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
+
+        # Software volume attenuation — multiply PCM samples (bypasses PipeWire floor)
+        if volume < 1.0:
+            import wave as _wv2
+            with _wv2.open(final_wav, 'rb') as _wf:
+                _params = _wf.getparams()
+                _data = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
+            _data = np.clip(_data.astype(np.float32) * volume, -32768, 32767).astype(np.int16)
+            with _wv2.open(final_wav, 'wb') as _wf:
+                _wf.setparams(_params)
+                _wf.writeframes(_data.tobytes())
+
+        # Sample mic level before playback (ambient baseline)
+        import time as _spk_time
+        with _mic_level_lock:
+            baseline_peak = _mic_level_current[0]
+
+        # Play — monitor mic level concurrently in a thread
+        mic_peaks_during: list[int] = []
+        _play_done = _threading.Event()
+
+        def _monitor_mic():
+            while not _play_done.is_set():
+                with _mic_level_lock:
+                    mic_peaks_during.append(_mic_level_current[0])
+                _spk_time.sleep(0.05)
+
+        _m = _threading.Thread(target=_monitor_mic, daemon=True)
+        _m.start()
+        r = subprocess.run(["aplay", "-D", alsa_output, "-q", final_wav])
+        if r.returncode != 0 and alsa_output != "pulse":
+            log.warning("aplay failed on %s, retrying via pulse", alsa_output)
+            subprocess.run(["aplay", "-D", "pulse", "-q", final_wav])
+        _play_done.set()
+        _m.join(timeout=0.5)
+
+        # Auto-reduce volume if speaker is bleeding into mic significantly
+        if mic_peaks_during:
+            avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
+            # If mic sees 5× more signal during playback than ambient → speaker too loud
+            if baseline_peak > 0 and avg_during > baseline_peak * 5 and avg_during > 500:
+                try:
+                    sinks = subprocess.run(["pactl", "list", "short", "sinks"],
+                                           capture_output=True, text=True).stdout
+                    for line in sinks.splitlines():
+                        parts = line.split()
+                        if parts and "hdmi" not in line.lower() and "bluez" not in line.lower():
+                            cur = subprocess.run(
+                                ["pactl", "get-sink-volume", parts[0]],
+                                capture_output=True, text=True).stdout
+                            import re as _re
+                            m = _re.search(r'(\d+)%', cur)
+                            if m:
+                                cur_pct = int(m.group(1))
+                                new_pct = max(10, cur_pct - 10)
+                                subprocess.run(["pactl", "set-sink-volume", parts[0], f"{new_pct}%"],
+                                               capture_output=True)
+                                log.info("Auto-reduced speaker %s%%→%d%% (mic bleed %.0f > %.0f×baseline)",
+                                         cur_pct, new_pct, avg_during, baseline_peak * 5)
+                except Exception as e:
+                    log.debug("Auto-volume error: %s", e)
+
     except Exception as e:
         log.error("speak() error: %s", e)
     finally:
-        try: os.unlink(wav_path)
-        except FileNotFoundError: pass
+        for p in wav_parts:
+            try: os.unlink(p)
+            except FileNotFoundError: pass
+        try: os.unlink(final_wav)
+        except (FileNotFoundError, UnboundLocalError): pass
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -425,6 +790,8 @@ class RealtimeSession:
     def _mic_cb(self, indata, frames, time_info, status):
         raw = indata[::RESAMPLE_RATIO, 0]
         raw_peak = int(np.max(np.abs(raw)))
+        with _mic_level_lock:
+            _mic_level_current[0] = raw_peak
         # While calibrating, record raw peaks (no gain/gate applied, mic suppression off)
         if self._calibrating:
             self.loop.call_soon_threadsafe(self._cal_peaks.append, raw_peak)
@@ -533,7 +900,9 @@ class RealtimeSession:
         try:
             log.info("Routing to Five: %s", transcript)
             _log_entry("you", transcript)
-            reply = await self.gw.ask(transcript, session_key=self.session_key)
+            # Prefix tells Five to ignore cron/heartbeat background context
+            voice_msg = f"[voice] {transcript}"
+            reply = await self.gw.ask(voice_msg, session_key=self.session_key)
             log.info("Five: %s", reply)
             _log_entry("five", reply)
             await asyncio.get_running_loop().run_in_executor(
@@ -606,9 +975,9 @@ class RealtimeSession:
                             "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                             "turn_detection": {
                                 "type":                "server_vad",
-                                "threshold":           0.5,
-                                "prefix_padding_ms":   300,
-                                "silence_duration_ms": 800,
+                                "threshold":           0.3,   # lower = more sensitive (headset mic)
+                                "prefix_padding_ms":   200,
+                                "silence_duration_ms": 600,   # faster turn detection for conversation
                             },
                         },
                     },
@@ -676,13 +1045,260 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/log")
                 self.end_headers()
             elif self.path == "/calibrate":
+                gate = _mic_gate_ref[0]
+                body = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mic Calibration</title>
+<style>
+body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
+h3{{margin:0 0 12px;}}
+#wrap{{width:100%;max-width:500px;}}
+canvas{{width:100%;height:44px;border-radius:6px;display:block;}}
+#info{{font-size:13px;color:#aaa;margin:8px 0;min-height:20px;}}
+#result{{margin-top:12px;padding:10px;background:#1a3a1a;border-radius:6px;font-size:15px;color:#7f7;display:none;}}
+#countdown{{font-size:13px;color:#aaa;margin-top:4px;}}
+.btnrow{{margin-top:14px;display:flex;gap:10px;}}
+button{{padding:10px 22px;border:none;color:#fff;border-radius:6px;font-size:15px;cursor:pointer;}}
+#btn{{background:#2a5;}} #btn:disabled{{background:#555;cursor:default;}}
+#backbtn{{background:#335;}}
+</style></head><body>
+<h3>Mic Calibration</h3>
+<div id="wrap">
+  <canvas id="meter" height="44"></canvas>
+  <div id="info">Stay quiet to see noise floor. Yellow line = current gate ({gate}).</div>
+  <div id="result"></div>
+  <div class="btnrow">
+    <button id="btn" onclick="startCal()">Calibrate (3 sec quiet)</button>
+    <button id="backbtn" onclick="location.href='/log'">← Back to log</button>
+  </div>
+</div>
+<script>
+const MAX = 32768, gate0 = {gate};
+let calRunning = false;
+const canvas = document.getElementById('meter');
+const ctx = canvas.getContext('2d');
+const info  = document.getElementById('info');
+const result= document.getElementById('result');
+const btn   = document.getElementById('btn');
+
+const grad = (w) => {{
+  const g = ctx.createLinearGradient(0,0,w,0);
+  g.addColorStop(0,    '#1155cc');
+  g.addColorStop(0.35, '#22bb55');
+  g.addColorStop(0.75, '#cc4411');
+  return g;
+}};
+
+function draw(peak, gateVal){{
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#222'; ctx.fillRect(0,0,W,H);
+  const ratio = Math.min(peak/MAX,1);
+  ctx.fillStyle = grad(W);
+  ctx.fillRect(0,0,W*ratio,H);
+  // gate line
+  const gx = Math.min((gateVal/MAX)*W, W-2);
+  ctx.strokeStyle='#ffee00'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke();
+  ctx.fillStyle='#eee'; ctx.font='11px monospace';
+  ctx.fillText('peak:'+peak+'  gate:'+gateVal, 6, H-6);
+}}
+
+let currentGate = gate0;
+const es = new EventSource('/levels');
+es.onmessage = e => {{
+  const [peak, gate] = e.data.split(',').map(Number);
+  currentGate = gate;
+  draw(peak, gate);
+  if(!calRunning) info.textContent =
+    peak < gate ? '🔵 Below gate (noise floor)' :
+    peak < MAX*0.5 ? '🟢 Speech range' : '🔴 Very loud';
+}};
+
+function startCal(){{
+  calRunning = true;
+  btn.disabled = true;
+  let secs = 3;
+  info.textContent = 'Stay quiet… ' + secs + 's';
+  const t = setInterval(()=>{{ secs--; info.textContent = secs>0 ? 'Stay quiet… '+secs+'s' : 'Measuring…'; }}, 1000);
+  fetch('/calibrate/run').then(r=>r.json()).then(d=>{{
+    clearInterval(t);
+    calRunning = false;
+    result.style.display='block';
+    result.innerHTML = '✅ Done! New gate: <b>' + d.gate + '</b> &nbsp;(noise peak was ' + d.noise_peak + ')<br><small>Returning to log in 3 seconds…</small>';
+    info.textContent = 'Yellow line updated.';
+    btn.disabled = false;
+    setTimeout(()=>{{ es.close(); location.href='/log'; }}, 5000);
+  }}).catch(()=>{{ clearInterval(t); calRunning=false; btn.disabled=false;
+    info.textContent='Calibration failed — try again.'; }});
+}}
+</script></body></html>"""
+                _html(self, 200, body)
+
+            elif self.path == "/calibrate/run":
                 if sess:
-                    import asyncio as _aio
-                    _aio.run_coroutine_threadsafe(sess._run_calibration(), sess.loop)
-                self.send_response(302)
-                self.send_header("Location", "/log")
+                    import asyncio as _aio, json as _json, time as _time
+                    # collect 3s of mic samples (audio thread already fills _mic_level_current)
+                    peaks = []
+                    for _ in range(30):
+                        _time.sleep(0.1)
+                        with _mic_level_lock:
+                            peaks.append(_mic_level_current[0])
+                    peaks = peaks[2:]
+                    noise_peak = max(peaks) if peaks else 0
+                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+                    _mic_gate_ref[0] = new_gate
+                    MIC_GATE_PEAK = new_gate
+                    log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
+                    _update_service_gate(new_gate)
+                    # speak confirmation in background thread (we're already in HTTP thread)
+                    import threading as _t
+                    _t.Thread(target=speak,
+                              args=(f"Noise gate set to {new_gate}.", sess.alsa_output),
+                              daemon=True).start()
+                    resp = _json.dumps({"gate": new_gate, "noise_peak": noise_peak}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers()
+                    self.wfile.write(resp)
+                else:
+                    _html(self, 503, "<h2>No active session</h2>")
+
+            elif self.path == "/speaker-cal":
+                mic_src = _find_always_on_mic_source() or "not found"
+                spk_sink = _find_usb_speaker_sink() or "not found"
+                prev = _speaker_cal_result
+                prev_html = ""
+                if prev:
+                    snr_target = prev.get("snr_target", 5.0)
+                    def _row(m):
+                        snr = m.get("snr", 0)
+                        col = "#5f5" if snr >= snr_target else "#aaa"
+                        return (f'<tr><td>PW {m.get("pw","-")}% SW {int(m.get("sw",1)*100)}%</td>'
+                                f'<td style="color:{col}">SNR {snr:.1f}×</td></tr>')
+                    rows = "".join(_row(m) for m in prev.get("measurements", []))
+                    sw_pct = int(prev.get("safe_sw_vol", 1.0) * 100)
+                    prev_html = (
+                        f'<h4>Last result: PW <b>{prev.get("safe_vol")}%</b> + '
+                        f'software <b>{sw_pct}%</b></h4>'
+                        f'<table border=1 style="border-collapse:collapse;font-size:12px">'
+                        f'<tr><th>Level</th><th>Mic SNR</th></tr>{rows}</table>'
+                    )
+                body = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speaker Calibration</title>
+<style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
+h3{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:6px 0;}}
+#status{{margin:12px 0;font-size:14px;min-height:20px;}}
+button{{padding:10px 22px;background:#2a5;border:none;color:#fff;border-radius:6px;
+        font-size:15px;cursor:pointer;}} button:disabled{{background:#555;}}
+a{{color:#7af;}}</style></head><body>
+<h3>Speaker Calibration</h3>
+<div class="info">Mic: {mic_src}</div>
+<div class="info">Speaker sink: {spk_sink}</div>
+<div class="info">Plays 440 Hz tone at increasing volumes, measures mic leakage via FFT.</div>
+<div id="status">Ready.</div>
+{prev_html}
+<button id="btn" onclick="runCal()">Run calibration</button>
+&nbsp;<a href="/log">← Back</a>
+<script>
+function runCal(){{
+  document.getElementById('btn').disabled=true;
+  document.getElementById('status').textContent='Calibrating… (may take ~60s)';
+  fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
+    document.getElementById('btn').disabled=false;
+    document.getElementById('status').innerHTML=
+      '&#10003; Safe volume set to <b>'+d.safe_vol+'%</b> &nbsp;|&nbsp; '+
+      d.measurements.length+' steps measured.';
+    setTimeout(()=>location.reload(),3000);
+  }}).catch(e=>{{
+    document.getElementById('btn').disabled=false;
+    document.getElementById('status').textContent='Error: '+e;
+  }});
+}}
+</script></body></html>"""
+                _html(self, 200, body)
+
+            elif self.path == "/speaker-cal/run":
+                import json as _json
+                result = run_speaker_calibration(
+                    alsa_output=sess.alsa_output if sess else ALSA_OUTPUT
+                    # calibration will auto-find the working output device
+                )
+                _speaker_cal_result.clear()
+                _speaker_cal_result.update(result)
+                # announce result using calibrated level (both PipeWire and software already set)
+                if sess:
+                    import threading as _t
+                    sw = result.get("safe_sw_vol", _cal_sw_volume)
+                    _t.Thread(
+                        target=speak,
+                        args=(f"Calibration done. Speaker set to {result['safe_vol']} percent "
+                              f"with software level {int(sw*100)} percent.",
+                              sess.alsa_output, sw),
+                        daemon=True
+                    ).start()
+                resp = _json.dumps(result).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
                 self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/levels":
+                import time as _time
+                self.send_response(200)
+                self.send_header("Content-Type",  "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection",    "keep-alive")
+                self.end_headers()
+                try:
+                    while True:
+                        with _mic_level_lock:
+                            peak = _mic_level_current[0]
+                        msg = f"data: {peak},{_mic_gate_ref[0]}\n\n".encode()
+                        self.wfile.write(msg)
+                        self.wfile.flush()
+                        _time.sleep(0.1)
+                except Exception:
+                    pass
             elif self.path in ("/log", "/"):
+                # Check for device changes on every page load
+                new_fp = _get_audio_fingerprint()
+                device_banner = ""
+                if new_fp and new_fp != _audio_fingerprint[0]:
+                    _audio_fingerprint[0] = new_fp
+                    msg = "Audio devices changed. Please recalibrate the mic."
+                    _device_change_msg[0] = msg
+                    log.info("Device change detected on /log refresh")
+                    if sess:
+                        import threading as _t
+                        def _announce_change():
+                            _safe_volume_new_sinks(1)   # PipeWire at 1%
+                            import time as _time; _time.sleep(0.5)
+                            # Extra software attenuation on top: 1% × 5% = 0.05% of full scale
+                            speak(msg, sess.alsa_output, volume=NEW_DEVICE_VOLUME)
+                        _t.Thread(target=_announce_change, daemon=True).start()
+
+                if _device_change_msg[0]:
+                    device_banner = (
+                        f'<div id="dbanner" style="background:#5a2200;border-radius:8px;'
+                        f'padding:10px;margin-bottom:8px;font-weight:bold;">'
+                        f'&#9888; {_device_change_msg[0]}</div>'
+                        f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
+                        f'if(b)b.remove();}},5000);</script>'
+                    )
+                    _device_change_msg[0] = ""
+                else:
+                    device_banner = (
+                        f'<div id="dbanner" style="background:#1a3a1a;border-radius:8px;'
+                        f'padding:8px;margin-bottom:8px;color:#5f5;font-size:13px;">'
+                        f'&#10003; No device change detected.</div>'
+                        f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
+                        f'if(b)b.remove();}},5000);</script>'
+                    )
+
                 active = sess._active if sess else False
                 rows = ""
                 for e in CONVERSATION_LOG:
@@ -706,8 +1322,8 @@ h3{{margin:0 0 10px;}}
 a{{color:#7af;margin-right:12px;}}
 </style></head><body>
 <h3>Five — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/restart">Restart</a>
-<hr>{rows if rows else "<div class='sys'>No conversation yet</div>"}
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/log">Refresh</a>
+<hr>{device_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}
 </body></html>"""
                 _html(self, 200, body)
             elif self.path == "/status":
@@ -722,7 +1338,10 @@ a{{color:#7af;margin-right:12px;}}
             else:
                 _html(self, 404, "<h2>Not found</h2>")
 
-    server = HTTPServer(("0.0.0.0", port), _Handler)
+    from socketserver import ThreadingMixIn
+    class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+    server = _ThreadingHTTPServer(("0.0.0.0", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Toggle: http://<pi-ip>:%d/stop  |  /wake  |  /sleep  |  /status", port)
 
@@ -834,6 +1453,7 @@ if __name__ == "__main__":
 
     MIC_GAIN      = args.mic_gain
     MIC_GATE_PEAK = args.mic_gate
+    _mic_gate_ref[0] = args.mic_gate
 
     asyncio.run(main(
         args.http_port,
