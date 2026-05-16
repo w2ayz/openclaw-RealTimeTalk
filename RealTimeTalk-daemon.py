@@ -1346,20 +1346,55 @@ setInterval(upd, 2000);
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Speaker Calibration</title>
 <style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
-h3{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:6px 0;}}
-#status{{margin:12px 0;font-size:14px;min-height:20px;}}
-button{{padding:10px 22px;background:#2a5;border:none;color:#fff;border-radius:6px;
-        font-size:15px;cursor:pointer;}} button:disabled{{background:#555;}}
+h3,h4{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:4px 0;}}
+#status{{margin:10px 0;font-size:14px;min-height:18px;}}
+.sect{{border-top:1px solid #333;margin-top:16px;padding-top:12px;}}
+#vol{{font-size:1.6em;font-weight:bold;margin:8px 0;}}
+.row{{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;}}
+button{{padding:10px 18px;border:none;color:#fff;border-radius:6px;font-size:14px;cursor:pointer;}}
+#btn{{background:#2a5;}} #btn:disabled{{background:#555;}}
+.bAdj{{background:#335;}} .bPlay{{background:#226;}}
+.bStop{{background:#622;}} .bSet{{background:#a62;}}
 a{{color:#7af;}}</style></head><body>
 <h3>Speaker Calibration</h3>
-<div class="info">Speaker: {ds["speaker_alsa"]}  Vol: {ds["spk_vol"]}</div>
+<div class="info">Speaker: {ds["speaker_alsa"]}</div>
+<h4>Auto calibration (mic leakage)</h4>
 <div class="info">Plays 440 Hz tone at increasing volumes, measures mic leakage via FFT.</div>
 <div id="status">Ready.</div>
 {prev_html}
-<button id="btn" onclick="runCal()">Run calibration</button>
-&nbsp;<a href="/dashboard">← Back</a>
+<div class="row"><button id="btn" onclick="runCal()">Run auto calibration</button></div>
+<div class="sect">
+<h4>Manual adjustment</h4>
+<div class="info">Play test sound and adjust until comfortable.</div>
+<div id="vol">Vol: {ds["spk_vol"]}</div>
+<div class="row">
+  <button class="bAdj" onclick="adj(-10)">− Quieter</button>
+  <button class="bAdj" onclick="adj(+10)">+ Louder</button>
+  <button class="bPlay" onclick="startLoop()">▶ Play test</button>
+  <button class="bStop" onclick="stopLoop()">■ Stop</button>
+  <button class="bSet"  onclick="setLevel()">✓ Set this level</button>
+</div>
+<div id="mstatus" style="color:#aaa;font-size:13px;margin-top:6px;"></div>
+</div>
+<p><a href="/dashboard">← Back</a></p>
 <script>
+function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
+  document.getElementById('vol').textContent='Vol: '+d.spk_vol;
+}});}}
+function adj(d){{fetch('/speaker-cal/adjust?delta='+d).then(()=>upd());}}
+function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
+  document.getElementById('mstatus').textContent='Playing test loop…';
+}});}}
+function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
+  document.getElementById('mstatus').textContent='Stopped.';
+}});}}
+function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
+  document.getElementById('mstatus').textContent='✓ Level saved: '+d.spk_vol;
+  stopLoop();
+  setTimeout(()=>location.href='/dashboard',3000);
+}});}}
 function runCal(){{
+  stopLoop();
   document.getElementById('btn').disabled=true;
   document.getElementById('status').textContent='Calibrating…';
   fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
@@ -1373,6 +1408,7 @@ function runCal(){{
     document.getElementById('status').textContent='Error: '+e;
   }});
 }}
+setInterval(upd, 2000);
 </script></body></html>"""
                 _html(self, 200, body)
 
