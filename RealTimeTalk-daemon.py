@@ -123,22 +123,21 @@ def _get_device_status() -> dict:
         m = _re3.search(r'--alsa-output (\S+)', content)
         if m:
             result["speaker_alsa"] = m.group(1)
-        # Speaker volume from ALSA
-        card = _re3.search(r'plughw:(\d+)', result["speaker_alsa"])
-        if card:
-            amix = subprocess.run(["amixer", "-c", card.group(1), "sget", "PCM"],
-                                   capture_output=True, text=True).stdout
-            vm = _re3.search(r'\[(\d+)%\]', amix)
+        # Speaker volume: PipeWire first (reflects live adjustments), ALSA as fallback
+        sink_id = _find_usb_speaker_sink()
+        if sink_id:
+            vo = subprocess.run(["pactl", "get-sink-volume", sink_id],
+                                 capture_output=True, text=True).stdout
+            vm = _re3.search(r'(\d+)%', vo)
             if vm:
                 result["spk_vol"] = f"{vm.group(1)}%"
-        # PipeWire fallback
         if result["spk_vol"] == "?":
-            ds = subprocess.run(["pactl", "get-default-sink"],
-                                 capture_output=True, text=True).stdout.strip()
-            if ds:
-                vo = subprocess.run(["pactl", "get-sink-volume", ds],
-                                    capture_output=True, text=True).stdout
-                vm = _re3.search(r'(\d+)%', vo)
+            # ALSA fallback
+            card = _re3.search(r'plughw:(\d+)', result["speaker_alsa"])
+            if card:
+                amix = subprocess.run(["amixer", "-c", card.group(1), "sget", "PCM"],
+                                       capture_output=True, text=True).stdout
+                vm = _re3.search(r'\[(\d+)%\]', amix)
                 if vm:
                     result["spk_vol"] = f"{vm.group(1)}%"
         # Mic source
