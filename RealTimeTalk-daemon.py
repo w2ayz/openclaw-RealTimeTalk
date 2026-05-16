@@ -8,7 +8,7 @@ Audio flow:
   Five's reply → Piper TTS → speaker
 
 Stop via:
-  http://<pi-ip>:18790/stop          — phone browser (over Tailscale)
+  http://<pi-ip>:19000/dashboard          — phone browser (over Tailscale)
   systemctl --user stop openclaw-realtimetalk  — SSH
   SIGTERM / Ctrl-C
 
@@ -68,7 +68,7 @@ RESAMPLE_RATIO    = 1            # no decimation needed — DEVICE_RATE == SAMPL
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
-DEFAULT_HTTP_PORT = 18790
+DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
 AGENT_TIMEOUT_S   = 45
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
@@ -85,6 +85,72 @@ import threading as _threading
 _mic_level_lock = _threading.Lock()
 _mic_level_current = [0]   # latest raw pre-gain peak, written by audio thread
 _mic_gate_ref     = [500]  # mutable wrapper for MIC_GATE_PEAK, readable across threads
+
+def _detect_headset() -> bool:
+    """Return True if a single USB device appears as both a sink (output) and source (input).
+    Compares the USB device ID embedded in PipeWire node names."""
+    import re as _re4
+    try:
+        sinks   = subprocess.run(["pactl", "list", "short", "sinks"],
+                                  capture_output=True, text=True).stdout
+        sources = subprocess.run(["pactl", "list", "short", "sources"],
+                                  capture_output=True, text=True).stdout
+        # Extract USB serial/ID: the part between 'usb-' and the last '-NN.' in the name
+        def _usb_ids(text):
+            ids = set()
+            for line in text.splitlines():
+                m = _re4.search(r'usb-([^.]+)-\d{2}\.', line)
+                if m and "hdmi" not in line.lower() and "monitor" not in line.lower():
+                    ids.add(m.group(1))
+            return ids
+        common = _usb_ids(sinks) & _usb_ids(sources)
+        return len(common) > 0
+    except Exception:
+        return False
+
+
+_headset_cal_loop = [False]    # flag to stop the looping playback
+
+
+def _get_device_status() -> dict:
+    """Return current audio device info for the portal status panel."""
+    import re as _re3
+    result = {"mic": "?", "speaker_alsa": ALSA_OUTPUT, "spk_vol": "?",
+              "sw_pct": 100, "gate": 500, "gain": 3.0}
+    try:
+        # Speaker ALSA from service file
+        content = open(SERVICE_FILE).read()
+        m = _re3.search(r'--alsa-output (\S+)', content)
+        if m:
+            result["speaker_alsa"] = m.group(1)
+        # Speaker volume from ALSA
+        card = _re3.search(r'plughw:(\d+)', result["speaker_alsa"])
+        if card:
+            amix = subprocess.run(["amixer", "-c", card.group(1), "sget", "PCM"],
+                                   capture_output=True, text=True).stdout
+            vm = _re3.search(r'\[(\d+)%\]', amix)
+            if vm:
+                result["spk_vol"] = f"{vm.group(1)}%"
+        # PipeWire fallback
+        if result["spk_vol"] == "?":
+            ds = subprocess.run(["pactl", "get-default-sink"],
+                                 capture_output=True, text=True).stdout.strip()
+            if ds:
+                vo = subprocess.run(["pactl", "get-sink-volume", ds],
+                                    capture_output=True, text=True).stdout
+                vm = _re3.search(r'(\d+)%', vo)
+                if vm:
+                    result["spk_vol"] = f"{vm.group(1)}%"
+        # Mic source
+        src = _find_always_on_mic_source() or ""
+        result["mic"] = src.rsplit(".", 1)[-1][:35] if src else "?"
+    except Exception:
+        pass
+    result["sw_pct"] = int(_cal_sw_volume * 100)
+    result["gate"]   = _mic_gate_ref[0]
+    result["gain"]   = MIC_GAIN
+    return result
+
 
 def _get_audio_fingerprint() -> str:
     """Return a fingerprint of connected audio devices — names only, no state.
@@ -1062,7 +1128,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 _html(self, 200, "<h2>OpenClaw RealTimeTalk: stopping…</h2>")
                 on_stop()
             elif self.path == "/restart":
-                _html(self, 200, "<h2>Restarting…</h2><p>Page will reload in 5 seconds.</p><script>setTimeout(()=>location.href='/log',5000)</script>")
+                _html(self, 200, "<h2>Restarting…</h2><p>Page will reload in 5 seconds.</p><script>setTimeout(()=>location.href='/dashboard',5000)</script>")
                 threading.Thread(target=lambda: (
                     __import__('time').sleep(1),
                     __import__('subprocess').run(['systemctl','--user','restart','openclaw-realtimetalk'])
@@ -1106,7 +1172,7 @@ button{{padding:10px 22px;border:none;color:#fff;border-radius:6px;font-size:15p
   <div id="result"></div>
   <div class="btnrow">
     <button id="btn" onclick="startCal()">Calibrate (3 sec quiet)</button>
-    <button id="backbtn" onclick="location.href='/log'">← Back to log</button>
+    <button id="backbtn" onclick="location.href='/dashboard'">← Back to log</button>
   </div>
 </div>
 <script>
@@ -1165,7 +1231,7 @@ function startCal(){{
     result.innerHTML = '✅ Done! New gate: <b>' + d.gate + '</b> &nbsp;(noise peak was ' + d.noise_peak + ')<br><small>Returning to log in 3 seconds…</small>';
     info.textContent = 'Yellow line updated.';
     btn.disabled = false;
-    setTimeout(()=>{{ es.close(); location.href='/log'; }}, 5000);
+    setTimeout(()=>{{ es.close(); location.href='/dashboard'; }}, 5000);
   }}).catch(()=>{{ clearInterval(t); calRunning=false; btn.disabled=false;
     info.textContent='Calibration failed — try again.'; }});
 }}
@@ -1203,30 +1269,81 @@ function startCal(){{
                     _html(self, 503, "<h2>No active session</h2>")
 
             elif self.path == "/speaker-cal":
-                mic_src = _find_always_on_mic_source() or "not found"
-                spk_sink = _find_usb_speaker_sink() or "not found"
-                prev = _speaker_cal_result
-                prev_html = ""
-                if prev:
-                    snr_target = prev.get("snr_target", 5.0)
-                    def _row(m):
-                        snr = m.get("snr", 0)
-                        col = "#5f5" if snr >= snr_target else "#aaa"
-                        return (f'<tr><td>PW {m.get("pw","-")}% SW {int(m.get("sw",1)*100)}%</td>'
-                                f'<td style="color:{col}">SNR {snr:.1f}×</td></tr>')
-                    rows = "".join(_row(m) for m in prev.get("measurements", []))
-                    sw_pct = int(prev.get("safe_sw_vol", 1.0) * 100)
-                    warn = ('<div style="background:#5a1a00;border-radius:6px;padding:8px;'
-                            'margin-bottom:6px;">⚠ No microphone detected — connect mic and recalibrate.</div>'
-                            ) if prev.get("status") == "no_mic" else ""
-                    prev_html = (
-                        warn +
-                        f'<h4>Last result: PW <b>{prev.get("safe_vol")}%</b> + '
-                        f'software <b>{sw_pct}%</b></h4>'
-                        f'<table border=1 style="border-collapse:collapse;font-size:12px">'
-                        f'<tr><th>Level</th><th>Mic SNR</th></tr>{rows}</table>'
-                    )
-                body = f"""<!DOCTYPE html><html><head>
+                is_headset = _detect_headset()
+                ds = _get_device_status()
+                if is_headset:
+                    # Headset mode: interactive play+adjust (can't use mic leakage measurement)
+                    body = f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speaker Calibration — Headset</title>
+<style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
+h3{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:6px 0;}}
+#vol{{font-size:2em;font-weight:bold;margin:16px 0;text-align:center;}}
+.row{{display:flex;gap:10px;justify-content:center;margin:8px 0;}}
+button{{padding:12px 24px;border:none;color:#fff;border-radius:6px;font-size:16px;cursor:pointer;}}
+#btnLouder{{background:#2a5;}} #btnQuieter{{background:#555;}}
+#btnPlay{{background:#226;}} #btnStop{{background:#622;}} #btnSet{{background:#a62;}}
+a{{color:#7af;}}</style></head><body>
+<h3>Speaker Calibration — Headset</h3>
+<div class="info">Headset detected: mic + speaker on same device.</div>
+<div class="info">Acoustic leakage measurement is not suitable for headphones.<br>
+Play the test sentence and adjust until comfortable.</div>
+<div id="vol">Vol: {ds["spk_vol"]}  SW: {ds["sw_pct"]}%</div>
+<div class="row">
+  <button id="btnQuieter" onclick="adj(-10)">− Quieter</button>
+  <button id="btnLouder"  onclick="adj(+10)">+ Louder</button>
+</div>
+<div class="row">
+  <button id="btnPlay" onclick="startLoop()">▶ Play test</button>
+  <button id="btnStop" onclick="stopLoop()">■ Stop</button>
+</div>
+<div class="row">
+  <button id="btnSet" onclick="setLevel()">✓ Set this level</button>
+</div>
+<div id="status" style="margin-top:12px;color:#aaa;font-size:13px;"></div>
+<p><a href="/dashboard">← Dashboard</a></p>
+<script>
+function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
+  document.getElementById('vol').textContent='Vol: '+d.spk_vol+'  SW: '+d.sw_pct+'%';
+}});}}
+function adj(d){{fetch('/speaker-cal/adjust?delta='+d).then(()=>upd());}}
+function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
+  document.getElementById('status').textContent='Playing test sentence in loop…';
+}});}}
+function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
+  document.getElementById('status').textContent='Stopped.';
+}});}}
+function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
+  document.getElementById('status').textContent='✓ Level saved: '+d.spk_vol+' PW, '+d.sw_pct+'% SW';
+  stopLoop();
+  setTimeout(()=>location.href='/dashboard',3000);
+}});}}
+setInterval(upd, 2000);
+</script></body></html>"""
+                else:
+                    # Speaker mode: acoustic calibration via mic leakage
+                    prev = _speaker_cal_result
+                    prev_html = ""
+                    if prev:
+                        snr_target = prev.get("snr_target", 5.0)
+                        def _row(m):
+                            snr = m.get("snr", 0)
+                            col = "#5f5" if snr >= snr_target else "#aaa"
+                            return (f'<tr><td>PW {m.get("pw","-")}% SW {int(m.get("sw",1)*100)}%</td>'
+                                    f'<td style="color:{col}">SNR {snr:.1f}×</td></tr>')
+                        rows = "".join(_row(m) for m in prev.get("measurements", []))
+                        sw_pct = int(prev.get("safe_sw_vol", 1.0) * 100)
+                        warn = ('<div style="background:#5a1a00;border-radius:6px;padding:8px;'
+                                'margin-bottom:6px;">⚠ No microphone detected — connect mic and recalibrate.</div>'
+                                ) if prev.get("status") == "no_mic" else ""
+                        prev_html = (
+                            warn +
+                            f'<h4>Last result: PW <b>{prev.get("safe_vol")}%</b> + '
+                            f'software <b>{sw_pct}%</b></h4>'
+                            f'<table border=1 style="border-collapse:collapse;font-size:12px">'
+                            f'<tr><th>Level</th><th>Mic SNR</th></tr>{rows}</table>'
+                        )
+                    body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Speaker Calibration</title>
 <style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
@@ -1236,23 +1353,22 @@ button{{padding:10px 22px;background:#2a5;border:none;color:#fff;border-radius:6
         font-size:15px;cursor:pointer;}} button:disabled{{background:#555;}}
 a{{color:#7af;}}</style></head><body>
 <h3>Speaker Calibration</h3>
-<div class="info">Mic: {mic_src}</div>
-<div class="info">Speaker sink: {spk_sink}</div>
+<div class="info">Speaker: {ds["speaker_alsa"]}  Vol: {ds["spk_vol"]}</div>
 <div class="info">Plays 440 Hz tone at increasing volumes, measures mic leakage via FFT.</div>
 <div id="status">Ready.</div>
 {prev_html}
 <button id="btn" onclick="runCal()">Run calibration</button>
-&nbsp;<a href="/log">← Back</a>
+&nbsp;<a href="/dashboard">← Back</a>
 <script>
 function runCal(){{
   document.getElementById('btn').disabled=true;
-  document.getElementById('status').textContent='Calibrating… (may take ~60s)';
+  document.getElementById('status').textContent='Calibrating…';
   fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
     document.getElementById('btn').disabled=false;
     document.getElementById('status').innerHTML=
-      '&#10003; Safe volume set to <b>'+d.safe_vol+'%</b> &nbsp;|&nbsp; '+
-      d.measurements.length+' steps measured.';
-    setTimeout(()=>location.reload(),3000);
+      (d.status=='no_mic' ? '⚠ No mic detected — connect microphone first.' :
+      '&#10003; Set to PW <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>');
+    setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{
     document.getElementById('btn').disabled=false;
     document.getElementById('status').textContent='Error: '+e;
@@ -1306,6 +1422,74 @@ function runCal(){{
                 self.end_headers()
                 self.wfile.write(resp)
 
+            elif self.path == "/speaker-cal/loop-start":
+                # Headset mode: start looping test speech
+                _headset_cal_loop[0] = True
+                alsa = sess.alsa_output if sess else ALSA_OUTPUT
+                def _loop(alsa=alsa):
+                    while _headset_cal_loop[0]:
+                        speak("This is a headset volume test. Adjust until comfortable.", alsa)
+                        import time as _tl; _tl.sleep(0.5)
+                import threading as _t2
+                _t2.Thread(target=_loop, daemon=True).start()
+                _html(self, 200, "<p>Loop started.</p>")
+
+            elif self.path == "/speaker-cal/loop-stop":
+                _headset_cal_loop[0] = False
+                _html(self, 200, "<p>Loop stopped.</p>")
+
+            elif self.path.startswith("/speaker-cal/adjust"):
+                import json as _json, re as _re5, urllib.parse as _up
+                qs = _up.parse_qs(_up.urlparse(self.path).query)
+                delta = int(qs.get("delta", ["0"])[0])
+                sink = _find_usb_speaker_sink()
+                if sink:
+                    # Get current volume
+                    cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
+                                             capture_output=True, text=True).stdout
+                    m = _re5.search(r'(\d+)%', cur_out)
+                    cur = int(m.group(1)) if m else 50
+                    new_vol = max(1, min(100, cur + delta))
+                    subprocess.run(["pactl", "set-sink-volume", sink, f"{new_vol}%"],
+                                   capture_output=True)
+                resp = _json.dumps(_get_device_status()).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length", str(len(resp))); self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/speaker-cal/vol":
+                import json as _json
+                resp = _json.dumps(_get_device_status()).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length", str(len(resp))); self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/speaker-cal/set":
+                # Headset mode: save current PipeWire level as calibrated
+                import json as _json, re as _re6
+                _headset_cal_loop[0] = False
+                ds = _get_device_status()
+                # Persist to service file
+                _update_service_alsa_output(ds["speaker_alsa"])
+                sink = _find_usb_speaker_sink()
+                if sink:
+                    cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
+                                             capture_output=True, text=True).stdout
+                    m = _re6.search(r'(\d+)%', cur_out)
+                    pw = int(m.group(1)) if m else 50
+                    _update_service_gate(pw)   # reuse gate update pattern for mic-gate; actually store vol
+                log.info("Headset cal: saved level PW=%s SW=%d%%", ds["spk_vol"], ds["sw_pct"])
+                # Announce
+                if sess:
+                    import threading as _t3
+                    _t3.Thread(target=speak,
+                               args=("Headset volume saved.", sess.alsa_output),
+                               daemon=True).start()
+                resp = _json.dumps(ds).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json")
+                self.send_header("Content-Length", str(len(resp))); self.end_headers()
+                self.wfile.write(resp)
+
             elif self.path == "/levels":
                 import time as _time
                 self.send_response(200)
@@ -1323,7 +1507,12 @@ function runCal(){{
                         _time.sleep(0.1)
                 except Exception:
                     pass
-            elif self.path in ("/log", "/"):
+            elif self.path == "/log":
+                # Legacy redirect
+                self.send_response(301)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+            elif self.path in ("/dashboard", "/"):
                 # Check for device changes on every page load
                 new_fp = _get_audio_fingerprint()
                 device_banner = ""
@@ -1368,11 +1557,24 @@ function runCal(){{
                         rows += f'<div class="five"><b>Five:</b> {e["text"]}</div>'
                     else:
                         rows += f'<div class="sys">{e["text"]}</div>'
+                # All device info gathered outside do_GET to avoid UnboundLocalError scoping
+                _ds = _get_device_status()
+                device_panel = (
+                    f'<div style="background:#1a1a2a;border-radius:8px;padding:8px 12px;'
+                    f'margin-bottom:8px;font-size:12px;color:#aaa;line-height:1.8;">'
+                    f'<b style="color:#eee">Audio devices</b><br>'
+                    f'🎤 Mic: {_ds["mic"]}<br>'
+                    f'🔊 Speaker: {_ds["speaker_alsa"]} &nbsp;|&nbsp; '
+                    f'Vol {_ds["spk_vol"]} &nbsp;|&nbsp; SW {_ds["sw_pct"]}%<br>'
+                    f'🔧 Mic gate: {_ds["gate"]} &nbsp;|&nbsp; Gain: {_ds["gain"]}×'
+                    f'</div>'
+                )
+
                 state = "ACTIVE 🎙" if active else "SILENT 🔇"
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="3">
-<title>RealTimeTalk</title>
+<title>RealTimeTalk Dashboard</title>
 <style>
 body{{font-family:sans-serif;padding:10px;background:#111;color:#eee;}}
 .you{{background:#1a3a1a;border-radius:8px;padding:8px;margin:6px 0;}}
@@ -1381,9 +1583,9 @@ body{{font-family:sans-serif;padding:10px;background:#111;color:#eee;}}
 h3{{margin:0 0 10px;}}
 a{{color:#7af;margin-right:12px;}}
 </style></head><body>
-<h3>Five — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/log">Refresh</a>
-<hr>{device_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}
+<h3>RealTimeTalk Dashboard — {state}</h3>
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/dashboard">Dashboard</a>
+<hr>{device_panel}{device_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}
 </body></html>"""
                 _html(self, 200, body)
             elif self.path == "/status":
