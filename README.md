@@ -1,12 +1,12 @@
 # OpenClaw RealTimeTalk
 
-Headless RealTime Talk daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it
-via the OpenAI Realtime Transcription API (GA `?intent=transcription`), routes the transcript
-through the local OpenClaw gateway so Five answers with full memory + tools, then synthesises
-the reply with Piper TTS and plays it through a USB speaker. No browser, no display required —
-designed for battery-powered, always-on deployments.
+Headless voice daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it via the
+OpenAI Realtime Transcription API, routes the transcript through the local OpenClaw gateway so
+Five answers with full memory + tools, then synthesises the reply with Piper TTS and plays it
+through a USB speaker or headset. No browser, no display required — designed for always-on deployments.
 
-Runs as a `systemd` user service that starts automatically on boot and stays active until manually stopped via HTTP (phone browser over Tailscale) or SSH.
+Runs as a `systemd` user service that starts automatically on boot. Controlled via a web
+dashboard (port 19000) accessible from any phone browser on the local network or over Tailscale.
 
 ---
 
@@ -14,44 +14,62 @@ Runs as a `systemd` user service that starts automatically on boot and stays act
 
 - Voice conversation routed through Five's main OpenClaw session (memory, tools, identity)
 - OpenAI Realtime **Transcription** API (`gpt-4o-transcribe`) with server-side VAD
-- Software mic gain + noise gate compensates for quiet USB mics (PCM2902 etc.)
-- Direct ALSA playback via `aplay -D plughw:3,0` — bypasses PipeWire idle-suspend
-- HTTP toggle on port 18790 — `/stop` from any phone browser
-- Boot-order safe — daemon retries gateway connection until OpenClaw is up
-- Single `install-pi.sh` deployment — runs on fresh Raspberry Pi OS Bookworm
+- **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
+- **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
+- Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
+- **Language filter** — by default only English and Chinese are shown/processed; other languages (noise hallucinations) silently dropped; toggleable Multi-lang mode
+- **Speaker calibration** — acoustic sweep from minimum volume; finds the quietest clearly-audible level; works through PipeWire (no direct-ALSA conflict)
+- **Headset detection** — auto-detects combined USB headset; switches to manual volume adjustment UI
+- Web dashboard on port **19000** — conversation log, wake/sleep/calibrate/monitor controls
+- **Monitoring Only mode** — listen and display transcribed speech without routing to Five (for diagnosing capture quality)
+- Boot-order safe — retries gateway connection until OpenClaw is up
+- Gateway protocol v4 compatible (OpenClaw 2026.5+)
 
 ---
 
 ## Architecture
 
 ```
-Raspberry Pi (headless, battery-powered)
+Raspberry Pi (headless)
+│
+├── PipeWire
+│       └── rtt_agc_source  (WebRTC AGC virtual mic, loaded from ~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf)
+│               captures C-Media USB mic → applies AGC + noise suppression
 │
 ├── systemd user service: openclaw-realtimetalk
 │       starts on boot, retries gateway every 5s until ready
 │
 └── RealTimeTalk-daemon.py
         │
-        ├── OpenClaw gateway ─► ws://127.0.0.1:18789 (GatewayClient)
-        │   (persistent WS)       chat.send + agent.wait
-        │                         ↕ Five's session: memory, tools, identity
+        ├── OpenClaw gateway ─► ws://127.0.0.1:18789  (protocol v4)
+        │   (persistent WS)       chat.send + agent.wait + chat.history
+        │                         Five's session: memory, tools, identity
+        │                         Model: openai/gpt-5.5 (OAuth, codex harness)
         │
         ├── OpenAI Realtime ──► wss://api.openai.com/v1/realtime?intent=transcription
-        │   (transcription only)   server VAD + gpt-4o-transcribe
+        │   (transcription)        server VAD + gpt-4o-transcribe
         │                          session.type: "transcription"
         │
-        ├── Audio IN ─────────► USB microphone (48 kHz → 8× gain → noise gate → 24 kHz)
+        ├── Audio IN ─────────► PipeWire AGC source (rtt_agc_source)
+        │                        → static fallback: raw USB mic + 16x gain + gate
         │
-        ├── Piper TTS ────────► ~/.local/bin/piper  (text file → 22 kHz mono WAV)
+        ├── Piper TTS ────────► ~/.local/bin/piper-native/piper
+        │                        EN: en_US-lessac-medium  |  ZH: zh_CN-huayan-medium
+        │                        mixed-language: split by script, concatenate WAVs
         │
-        ├── Audio OUT ────────► USB speaker via aplay -D plughw:3,0 (direct ALSA)
+        ├── Audio OUT ────────► paplay to USB sink (PipeWire) or aplay fallback
         │
-        └── HTTP :18790 ──────► GET /stop    → graceful shutdown
-                                 GET /status  → {"status":"running"}
+        └── HTTP :19000 ──────► /dashboard  — conversation log + controls
+                                 /wake       — activate voice
+                                 /sleep      — silence
+                                 /monitor/start  — passive capture display
+                                 /monitor/stop
+                                 /reset      — clear screen
+                                 /multilang  — toggle language filter
+                                 /calibrate  — mic calibration
+                                 /speaker-cal — speaker calibration
+                                 /restart    — restart daemon
 ```
-
-Voice conversations are part of Five's main session — the same context, memory,
-and tool access as Telegram messages.
 
 ---
 
@@ -61,65 +79,86 @@ and tool access as Telegram messages.
 You speak
    │
    ▼
-USB mic (PCM2902) ─► ALSA card 2 ─► PipeWire ─► PortAudio (sounddevice)
+USB mic (C-Media PCM2902) ─► PipeWire rtt_agc_source
+   │   WebRTC AGC: auto-gain to target level
+   │   Noise suppression: ambient noise filtered
+   │   High-pass filter + Voice detection
    │
-   ▼  sd.InputStream  48 kHz mono int16, 100 ms blocks
+   ▼  sd.InputStream  24 kHz mono int16
 ┌─────────────── daemon mic callback ─────────────────┐
-│  • decimate 48k → 24k (every-other sample)          │
-│  • noise gate:  if peak < 500 → output zeros        │
-│  • else gain 8× (clip to int16)                     │
-│  • asyncio.Queue (drops on overflow)                │
+│  • noise gate: if peak < 60 (AGC mode) → zeros      │
+│  • gain 2x trim (AGC already normalised)             │
+│  • skip if _busy (Five is speaking)                  │
+│  • asyncio.Queue → send to OpenAI                    │
 └─────────────────────────────────────────────────────┘
    │
    ▼  ws.send {input_audio_buffer.append, base64 PCM}
 wss://api.openai.com/v1/realtime?intent=transcription
    │
-   ▼  server-side VAD (0.5 threshold, 800 ms silence to end)
-gpt-4o-transcribe  →  transcription.delta…  →  transcription.completed
+   ▼  server-side VAD (threshold 0.3, 1100ms silence to end turn)
+gpt-4o-transcribe  →  transcription.completed
    │
-   ▼  daemon._handle_transcript()
-GatewayClient.ask()  →  ws://127.0.0.1:18789
-   │  chat.send  { sessionKey: agent:main:main, idempotencyKey, message }
-   │             → {ok: true, runId}
-   │  agent.wait { runId, timeoutMs: 45000 }
-   ▼
-OpenClaw gateway (Node) routes to Five's main session
+   ▼  _handle_transcript()
+       zhconv: Traditional Chinese → Simplified
+       language gate: drop non-EN/ZH unless multilang mode on
+       monitoring mode: log to dashboard, return (no Five)
+       wake/sleep/calibrate phrases: handle locally
    │
-   ▼  Five thinks with memory + tools + OpenClaw agent  (model: openai-codex/gpt-5.5)
-chat event { state: "final", message.content[].text }
+   ▼  GatewayClient.ask()  →  ws://127.0.0.1:18789  (protocol v4)
+       chat.send  →  {ok, runId}
+       agent.wait  →  codex harness runs (gpt-5.5, message tool)
+       chat final empty (codex delivers via message tool)
+       chat.history fallback  →  extract message-tool arguments.message
    │
-   ▼  daemon receives reply, _busy event blocks mic during playback
-strip_markdown()  →  piper -i text.txt -f reply.wav  (22050 Hz mono)
+   ▼  Five's reply text
+       zhconv normalise  →  split_by_script (EN/ZH segments)
+       strip_markdown()  →  remove bold/links/etc.
+       Piper TTS per segment  →  concatenate WAVs
    │
-   ▼  aplay -D plughw:3,0 reply.wav   (plughw upsamples 22k→48k, mono→stereo)
-USB speaker (UACDemoV1.0, card 3)
+   ▼  paplay --device=<usb-sink>  (PipeWire; no ALSA-busy conflict)
+USB speaker / headset
    │
    ▼
 You hear Five
 ```
 
-**Step-by-step:**
+**Key timing:** ~4–12 s end-to-end — 1100 ms VAD silence window + ~0.5 s transcription + Five thinking + TTS render.
 
-1. **Mic capture.** USB mic ADC samples at 48 kHz mono. ALSA card 2 → PipeWire → PortAudio. The daemon's `sd.InputStream` calls `_mic_cb` every 100 ms with a 4800-frame block.
-2. **Block processing.** Decimate 2:1 to 24 kHz (OpenAI's required rate). Peak below 500 (~1.5 % full-scale) is treated as silence and zeroed — this lets the server's VAD see real silence between words. Otherwise multiply by 8× and clip — counters the PCM2902's low output (browsers' WebRTC AGC normally compensates).
-3. **Send to OpenAI.** Persistent WebSocket to `wss://api.openai.com/v1/realtime?intent=transcription`. Bearer token only — no beta header. Initial `session.update` sets `session.type: "transcription"` with `audio.input.transcription.model: "gpt-4o-transcribe"` and `audio.input.turn_detection: server_vad`. Each block is sent as `input_audio_buffer.append` with base64 PCM.
-4. **Server transcription.** Events arrive in order: `speech_started` → `speech_stopped` → `input_audio_buffer.committed` → `conversation.item.added/done` → streaming `…transcription.delta` chunks → `…transcription.completed` carrying the full transcript.
-5. **Daemon routing.** `_handle_transcript` sets `_busy` (mute mic to prevent feedback). `GatewayClient.ask()` sends `chat.send` over the loopback gateway WebSocket (`ws://127.0.0.1:18789`) with an `idempotencyKey`; gateway returns `runId`. Daemon registers a Future in `_reply_futs[runId]` and fires `agent.wait`.
-6. **OpenClaw → Five.** Gateway routes the message into Five's main session. Five loads the workspace context (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`) and any active plugin tools. The configured model (`openai-codex/gpt-5.5`) generates the reply. On turn end the gateway emits a `chat` event with `state: "final"` and the reply text.
-7. **Daemon receives reply.** `GatewayClient.listen` matches the `runId`, resolves the Future. `gw.ask` returns the text.
-8. **TTS synthesis.** `strip_markdown()` removes `**bold**`, code fences, list markers, headings, link syntax. `speak()` writes the cleaned text to a temp `.txt` file, runs `piper -i <text> -f <wav>` to produce a 22 kHz mono WAV. **(File-based input is required — Piper silently truncates stdin input after a few words.)**
-9. **Playback.** `aplay -D plughw:3,0 <wav>` plays the file. `plughw` handles the 22050 → 48000 Hz upsampling and mono → stereo expansion in the ALSA plug layer, bypassing PipeWire entirely (so the speaker doesn't go silent when PipeWire idle-suspends its sink).
-10. **Cleanup.** `aplay` exits, `_busy` clears, mic samples flow again.
+---
 
-**Typical end-to-end latency** is 4–13 s — about 1 s for capture + 800 ms VAD silence + 0.3–0.7 s transcription + a few seconds for Five to think, then near-real-time TTS.
+## Web Dashboard
 
-**Toggle options (no keyboard/screen):**
+Open `http://<pi-ip>:19000/dashboard` from any browser on the local network or over Tailscale.
 
-| Method | How |
-|--------|-----|
-| Phone browser | `http://<pi-tailscale-ip>:18790/stop` |
-| SSH | `ssh pi "systemctl --user stop openclaw-realtimetalk"` |
-| Toggle script | `bash RealTimeTalk-toggle.sh stop` |
+The dashboard auto-refreshes every 3 s and shows:
+
+- **Status** — ACTIVE / SILENT / MONITORING
+- **Audio devices** — current mic, speaker, volume, mic gate, gain
+- **Conversation log** — newest entries at top, timestamped, colour-coded (You / Five / Monitor / System)
+
+### Controls
+
+| Link | Action |
+|------|--------|
+| Wake | Activate voice (same as saying "Five wake up") |
+| Sleep | Silence (same as "Five go to sleep") |
+| Start Monitor | Enter passive capture-display mode — listens and shows transcribed words, no Five routing |
+| Stop Monitor | Exit monitoring mode |
+| Reset | Clear the on-screen log |
+| Multi-lang: ON/OFF | Toggle language filter (OFF = EN/ZH only, drop noise hallucinations) |
+| Calibrate mic | Measure ambient noise and set optimal noise gate |
+| Speaker cal | Acoustic sweep to find minimum comfortable speaker volume |
+| Restart | Restart the daemon |
+
+### Voice commands
+
+| Say | Effect |
+|-----|--------|
+| "Five wake up" | Activate |
+| "Real Time Talk on" | Activate |
+| "Five go to sleep" | Silence |
+| "Real Time Talk off" | Silence |
+| "Calibrate mic" / "Calibrate microphone" | Run mic noise calibration |
 
 ---
 
@@ -129,62 +168,31 @@ You hear Five
 |-------------|-------|
 | Raspberry Pi OS Bookworm | Pi 5 or Pi 4 |
 | Python 3.9+ | Pre-installed on Bookworm |
+| PipeWire | Default on Bookworm; used for AGC virtual source |
 | **OpenClaw gateway running locally** | Required — daemon routes all AI through it |
-| OpenAI API key configured in OpenClaw | At `talk.providers.openai.apiKey` — used only for STT (Realtime API) |
-| Piper TTS installed | `~/.local/bin/piper` with a voice model in `~/.local/share/piper/voices/` |
-| USB microphone | Any USB mic; 44100 / 48 kHz hardware fine — resampling is automatic |
-| Speaker | 3.5mm or USB; 48 kHz hardware fine |
-| Tailscale (recommended) | For remote stop without keyboard |
+| OpenClaw 2026.5+ | Gateway protocol v4 required |
+| OpenAI API key or OAuth | For STT (Realtime API). OAuth via OpenClaw `openai-codex` provider supported |
+| Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
+| espeak-ng | Required for Chinese TTS phonemisation (`apt install espeak-ng`) |
+| zhconv | Python package — installed automatically by installer (`pip install zhconv`) |
+| USB microphone | C-Media PCM2902 or similar; AGC compensates for quiet hardware |
+| Speaker or headset | USB or 3.5mm; headset auto-detected |
 
-### OpenAI API key formats
+### Piper voices
 
-The daemon accepts either format in `~/.openclaw/openclaw.json`:
-
-**Plain string:**
-```json
-"talk": {
-  "providers": {
-    "openai": { "apiKey": "sk-proj-..." }
-  }
-}
-```
-
-**OpenClaw SecretRef** (recommended — keeps the key out of the main config):
-```json
-"talk": {
-  "providers": {
-    "openai": {
-      "apiKey": { "source": "file", "provider": "filemain", "id": "/providers/openai/apiKey" }
-    }
-  }
-},
-"secrets": {
-  "providers": {
-    "filemain": { "source": "file", "path": "~/.openclaw/secrets.json", "mode": "json" }
-  }
-}
-```
-
-With the corresponding `~/.openclaw/secrets.json` (chmod 600):
-```json
-{ "providers": { "openai": { "apiKey": "sk-proj-..." } } }
-```
+| Language | Model path |
+|----------|------------|
+| English | `~/.local/share/piper/voices/en_US-lessac-medium/en_US-lessac-medium.onnx` |
+| Chinese | `~/.local/share/piper/voices/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx` |
 
 ---
 
 ## Installation
 
-### 1. Clone the repo on the Pi
+### 1. Clone
 
 ```bash
 git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git ~/openclaw-RealTimeTalk
-```
-
-Or to install as an OpenClaw skill:
-
-```bash
-git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git \
-    ~/.openclaw/workspace/skills/RealTimeTalk
 ```
 
 ### 2. Run the installer
@@ -193,69 +201,18 @@ git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git \
 bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 ```
 
-The installer will:
-1. Create a Python venv at `~/.local/realtimetalk-venv` and install deps (`sounddevice`, `websockets>=12`, `numpy`)
-2. Install `libportaudio2` via apt
-3. Print all available audio devices
-4. Write `~/.config/systemd/user/openclaw-realtimetalk.service`
-5. Enable linger (service survives without a login session)
-6. Start the service immediately
+The installer:
+1. Creates a Python venv at `~/.local/realtimetalk-venv` and installs deps
+2. Installs `libportaudio2` and `espeak-ng` via apt
+3. Installs `zhconv` for Simplified Chinese normalisation
+4. Writes the PipeWire AGC config to `~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf`
+5. Reloads PipeWire so the AGC source is available immediately
+6. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
+7. Enables linger and starts the service
 
-> **Note:** The installer uses a virtualenv because Raspberry Pi OS Bookworm (PEP 668) blocks
-> system-wide `pip install`. The systemd service points at `~/.local/realtimetalk-venv/bin/python`.
+### 3. Check the dashboard
 
-### 3. Set audio devices (if defaults don't work)
-
-List devices:
-```bash
-bash ~/openclaw-RealTimeTalk/RealTimeTalk-toggle.sh devices
-```
-
-Edit the two lines near the top of `RealTimeTalk-install-pi.sh`:
-```bash
-AUDIO_INPUT="none"        # sounddevice index of USB mic — "none" uses PipeWire default
-ALSA_OUTPUT="plughw:3,0"  # ALSA PCM for the USB speaker (find your card with `aplay -l`)
-```
-
-Re-run the installer:
-```bash
-bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
-```
-
----
-
-## Usage
-
-The daemon starts automatically on boot. No interaction needed.
-
-**Check status:**
-```bash
-bash RealTimeTalk-toggle.sh status
-# or
-systemctl --user status openclaw-realtimetalk
-```
-
-**Watch live transcript (SSH):**
-```bash
-bash RealTimeTalk-toggle.sh log
-# or
-journalctl --user -u openclaw-realtimetalk -f
-```
-
-**Stop (phone browser over Tailscale):**
-```
-http://<pi-tailscale-ip>:18790/stop
-```
-
-**Stop (SSH):**
-```bash
-bash RealTimeTalk-toggle.sh stop
-```
-
-**Start again after manual stop:**
-```bash
-bash RealTimeTalk-toggle.sh start
-```
+Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SILENT**. Say "Five wake up" to activate, then speak normally.
 
 ---
 
@@ -263,111 +220,119 @@ bash RealTimeTalk-toggle.sh start
 
 ### Audio devices
 
-The installer defaults to `AUDIO_INPUT="none"` (PipeWire default → USB mic) and `ALSA_OUTPUT="plughw:3,0"`
-(USB speaker is typically card 3). List devices to verify:
+By default the daemon uses:
+- **Mic** — PipeWire default source (the WebRTC AGC virtual source `rtt_agc_source` is set as default on startup)
+- **Speaker** — found automatically by scanning PipeWire sinks (non-HDMI, non-Bluetooth)
 
+To override the ALSA speaker output:
 ```bash
-~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --list-devices  # sounddevice indices
-aplay -l                                                                     # ALSA cards
+# Edit the service ExecStart line:
+~/.config/systemd/user/openclaw-realtimetalk.service
+# Add: --alsa-output plughw:3,0
+systemctl --user daemon-reload && systemctl --user restart openclaw-realtimetalk
 ```
 
-Then edit `AUDIO_INPUT` / `ALSA_OUTPUT` in `RealTimeTalk-install-pi.sh` and re-run it.
-
-You can also pass flags directly for testing:
+List ALSA cards:
 ```bash
-~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py \
-    --input-device 1 --alsa-output plughw:3,0
+aplay -l
 ```
 
-`--alsa-output` is an ALSA PCM string (e.g. `plughw:3,0`, `default`, `pulse`). `plughw:<card>,<device>`
-is recommended — it gives direct ALSA access with automatic rate/channel conversion in the
-plug layer, and bypasses PipeWire's idle-suspend behaviour that can silence output on Pi OS Bookworm.
+### WebRTC AGC (adaptive mic)
 
-### Audio sample rates
+The daemon loads a PipeWire WebRTC module that creates a virtual mic source (`rtt_agc_source`) with:
+- **Automatic Gain Control** — speech normalised to a consistent level regardless of distance or hardware
+- **Noise suppression** — ambient noise filtered before transcription
+- **High-pass filter + VAD**
 
-| Stage | Rate | Why |
-|-------|------|-----|
-| Mic capture (sounddevice) | 48 kHz mono | USB mics on Pi OS Bookworm only support 44100/48000 |
-| Sent to OpenAI | 24 kHz mono PCM16 | Realtime API requirement — daemon decimates 2:1 |
-| Piper TTS output | 22050 Hz mono | Lessac medium voice native rate |
-| Played to speaker | 48 kHz stereo | `aplay -D plughw:3,0` resamples/expands automatically |
+This replaces the manual `--mic-gain` / `--mic-gate` values for normal use.
 
-No manual configuration needed unless your hardware is unusual.
+**Fallback:** If `rtt_agc_source` is unavailable at startup, the daemon logs `AGC source unavailable — fallback to static` and uses the raw mic with `--mic-gain 16 --mic-gate 300` (suitable for quiet C-Media adapters).
 
-### Mic gain / noise gate
-
-USB mics that lack onboard AGC (e.g. C-Media PCM2902 adapters) produce signal so quiet that
-OpenAI's VAD never triggers. Browsers normally compensate with WebRTC AGC; this daemon does it
-in software:
-
-```python
-MIC_GAIN      = 8.0    # multiply each sample after decimation
-MIC_GATE_PEAK = 500    # blocks with pre-gain peak below this → silence (true zero)
+To force the fallback (e.g. for testing), unload the PipeWire module:
+```bash
+pactl list short modules | grep echo-cancel   # find module ID
+pactl unload-module <id>
+systemctl --user restart openclaw-realtimetalk
 ```
 
-The gate is essential — without it, amplified noise floor fools VAD into thinking speech never
-ends, and you'll see endless `speech_started` events with no `speech_stopped`. Tune `MIC_GATE_PEAK`
-upward if your room is noisy, downward if the mic is unusually quiet.
+### Mic calibration
+
+If voice capture is choppy or you get noise hallucinations, run mic calibration:
+1. Open the dashboard → **Calibrate mic**
+2. Keep quiet for 3 seconds while it measures the noise floor
+3. The daemon updates the gate and saves it to the service file
+
+Or use Monitoring Only mode to see exactly what the transcriber captures before routing to Five.
+
+### Speaker calibration
+
+The speaker calibration finds the minimum comfortable volume by playing a 440 Hz tone and measuring mic pickup. It starts at PipeWire 1% + software 0.2% and steps up until the mic hears it clearly, then announces the result at a guaranteed-audible level.
+
+- Works through PipeWire (not direct ALSA) — no "device busy" errors
+- Detects headsets automatically — switches to manual volume adjustment
+- After calibration, all TTS plays at the calibrated level via software attenuation
+
+### Language filter
+
+By default only **English and Chinese** are shown and routed to Five. Other languages (Japanese, Korean, Cyrillic, Arabic, etc. that `gpt-4o-transcribe` hallucinates from noise) are silently dropped.
+
+Toggle from the dashboard: **Multi-lang: OFF → ON** to see all languages (useful for diagnosing capture).
+
+### Chinese (Simplified)
+
+All captured Chinese is automatically normalised from Traditional to Simplified using `zhconv`. TTS automatically selects the Chinese Piper voice for CJK segments and English voice for the rest — you can speak mixed sentences naturally.
+
+### VAD / STT settings
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Model | `gpt-4o-transcribe` | Set by `OPENAI_TRANSCRIBE_MODEL` |
+| VAD type | `server_vad` | OpenAI server-side |
+| VAD threshold | 0.3 | Lower = more sensitive |
+| Silence window | 1100 ms | Long enough for natural sentence pauses; shorter values cut sentences mid-phrase with AGC gaps |
+| Prefix padding | 300 ms | Lead-in captured before speech detected |
 
 ### HTTP port
 
-Default is `18790`. Override:
+Default is `19000`. Override:
 
 ```bash
 ~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --http-port 8080
 ```
 
-Update `ExecStart` in the service file accordingly, then:
-```bash
-systemctl --user daemon-reload && systemctl --user restart openclaw-realtimetalk
-```
+Update `ExecStart` in the service file accordingly, then reload.
 
 ### OpenClaw session
 
-By default the daemon talks to `agent:main:main` (Five's primary session). Override:
+Default: `agent:main:main` (Five's primary session). Override with `--session-key`.
 
-```bash
-~/.local/realtimetalk-venv/bin/python RealTimeTalk-daemon.py --session-key agent:main:main
-```
+### OpenClaw model
 
-Update `ExecStart` in the service file and reload if you want a different session permanently.
-
-### Voice / TTS
-
-Piper voice model is set by `PIPER_VOICE` near the top of `RealTimeTalk-daemon.py`.
-Default: `en_US-lessac-medium`. Change the path to any installed Piper model and restart.
-
-### STT / VAD settings
-
-STT model and VAD parameters are in the `session.update` call in `RealtimeSession.run()`:
-
-- **STT model:** `gpt-4o-transcribe` (set by `OPENAI_TRANSCRIBE_MODEL` near the top)
-- **VAD threshold:** 0.5
-- **Silence window:** 800 ms
-- **Endpoint:** `wss://api.openai.com/v1/realtime?intent=transcription` (GA transcription session, no beta header)
-
-The session payload uses the GA nested schema:
+The daemon connects to OpenClaw gateway at `ws://127.0.0.1:18789` (protocol v4). Five's model is configured in `~/.openclaw/openclaw.json`:
 
 ```json
-{ "type": "session.update",
-  "session": { "type": "transcription",
-               "audio": { "input": { "transcription":   { "model": "gpt-4o-transcribe" },
-                                     "turn_detection":  { "type": "server_vad", ... } } } } }
+"agents": {
+  "defaults": {
+    "model": { "primary": "openai/gpt-5.5" }
+  }
+}
 ```
+
+The `openai-codex` OAuth provider (ChatGPT consumer API) is also supported — the daemon extracts replies via `chat.history` since the codex harness delivers via a message tool rather than the chat event content.
 
 ---
 
-## File Structure
+## File structure
 
 ```
 RealTimeTalk/
-├── README.md                       # this file
-├── SKILL.md                        # OpenClaw skill descriptor + implementation notes
-├── CHANGELOG.md                    # version history
-├── requirements.txt                # Python dependencies
-├── RealTimeTalk-daemon.py          # main daemon: OpenAI WS + audio I/O + HTTP toggle
-├── RealTimeTalk-install-pi.sh      # one-command Pi deploy (systemd user service)
-└── RealTimeTalk-toggle.sh          # start / stop / status / log / devices
+├── README.md                        this file
+├── CHANGELOG.md                     version history
+├── SKILL.md                         OpenClaw skill descriptor
+├── requirements.txt                 Python dependencies
+├── RealTimeTalk-daemon.py           main daemon
+├── RealTimeTalk-install-pi.sh       one-command Pi deploy
+└── RealTimeTalk-toggle.sh           start / stop / status / log / devices
 ```
 
 ---
@@ -376,20 +341,20 @@ RealTimeTalk/
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `beta_api_shape_disabled` from OpenAI | Old beta endpoint / `OpenAI-Beta: realtime=v1` header | Daemon now uses `?intent=transcription` (GA) — no beta header. Update from v1.2 → v1.3 |
-| `speech_started` fires but never `speech_stopped`; no transcript | Mic noise floor with gain applied looks like speech to VAD | Confirm `MIC_GATE_PEAK` is set (default 500); raise if noisy room |
-| Transcript captured but Five's reply is cut to one word | Piper truncates **stdin** input silently | v1.3 writes text to a temp file and runs `piper -i <file>` — fixed |
-| Speaker silent even after Piper reports success | PipeWire idle-suspended the sink | Use `aplay -D plughw:<card>,<dev>` — bypasses PipeWire entirely |
-| First word of speech inaudible | USB speaker still waking from low-power state | `speak()` prepends a half-second of silence before audio |
-| Daemon dies at boot with `ConnectionRefusedError 18789` | OpenClaw gateway not yet listening | v1.3 retries connection every 5s instead of crashing |
-| `transcript: null` on `conversation.item.done` | Session config not enabling transcription | Use GA nested schema `audio.input.transcription.model` (not flat `input_audio_transcription`) |
-| No audio input | Wrong device index (or device 1 is your speaker, not mic) | Leave `--input-device` unset to use the PipeWire default (the real mic) |
-| "No OpenAI API key" error | `talk.providers.openai.apiKey` missing or empty | Add a plain string or SecretRef — see API key formats above |
-| "invalid_api_key" from OpenAI | Wrong key, or SecretRef path is incorrect | Check `secrets.json` exists and the `id` path resolves correctly |
+| Gateway connect fails: `protocol mismatch` | OpenClaw updated to v4 protocol | Daemon now negotiates `minProtocol: 4, maxProtocol: 4` — update from v1.6 |
+| Five not responding / empty reply | Codex harness delivers reply via message tool, not chat content | v1.7 fetches from `chat.history` as fallback — update daemon |
+| Speech cut off after 2–3 words | VAD silence window too short + AGC inter-word gaps look like silence | `silence_duration_ms` raised to 1100 ms in v1.7 |
+| Voice activated but transcription is garbage / wrong language | Noise hallucinations | Language filter drops non-EN/ZH by default; check mic gate in dashboard |
+| Chinese shows as Traditional characters | Transcriber outputs Traditional | v1.7 normalises to Simplified via zhconv automatically |
+| Speaker calibration hangs or takes 30+ seconds | Old per-step parec capture (v1.6) | v1.7 uses fast sd.rec (~6 s total) |
+| Speaker calibration sets max volume (PW 60%) | Old "max tone energy" logic always picked loudest step | v1.7 picks minimum clearly-audible step (SNR knee) |
+| No audio from speaker after calibration | Calibrated level too low, or wrong sink | Check dashboard device panel; use Manual adjustment on speaker-cal page |
+| Dashboard squares/boxes in text | Browser font has no emoji | v1.7 uses plain ASCII throughout |
+| `aplay: audio open error: Device or resource busy` | PipeWire holds USB device exclusively | v1.7 plays TTS via paplay through PipeWire; speaker-cal also PipeWire-native |
+| AGC source not appearing after reboot | PipeWire config not loaded | Check `~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf` exists; run `systemctl --user restart pipewire` |
+| `speech_started` fires but never `speech_stopped` | Noise floor with gain applied looks like speech | Run Calibrate mic from dashboard |
+| Piper produces silence / wrong language | espeak-ng missing for Chinese | `apt install espeak-ng` |
 | Service not starting after reboot | Linger not enabled | `loginctl enable-linger $USER` |
-| Connection keeps dropping | Network instability | Daemon auto-reconnects every 5s; check `toggle.sh log` |
-| `/stop` endpoint unreachable | Tailscale not connected | Verify `tailscale status` on Pi |
-| Five replies in non-English / with emojis → garbled TTS | Piper voice model is English-only | Tell Five to reply in plain English for voice, or change `PIPER_VOICE` |
 
 ---
 
