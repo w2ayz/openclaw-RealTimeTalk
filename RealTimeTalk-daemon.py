@@ -26,6 +26,7 @@ Requires:
 import argparse
 import asyncio
 import base64
+import datetime
 import json
 import logging
 import os
@@ -40,6 +41,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 import sounddevice as sd
 import websockets
+
+try:
+    from zhconv import convert as _zh_convert   # traditional → simplified
+except Exception:                                # pragma: no cover
+    _zh_convert = None
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -76,8 +82,34 @@ MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate t
                                  # (lets OpenAI's VAD see real silence between words)
 MIC_GATE_MIN      = 300          # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
+# WebRTC AGC virtual source (PipeWire module-echo-cancel). When present it
+# normalizes speech level + suppresses noise upstream, so the daemon needs
+# only a light trim and a minimal gate. Falls back to the static --mic-gain
+# / --mic-gate values when the AGC source is unavailable.
+AGC_SOURCE_NAME   = "rtt_agc_source"
+AGC_MIC_GAIN      = 2.0          # AGC already normalizes; light trim only
+AGC_MIC_GATE      = 60           # AGC+NS clean the signal; gate only residual
+# Raw C-Media mic — speaker calibration must measure through this directly,
+# NOT the AGC source (WebRTC noise-suppression kills the steady 440 Hz test
+# tone and AGC distorts level → calibration impossible through AGC).
+RAW_MIC_SOURCE    = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
 NEW_DEVICE_VOLUME = 0.05         # software attenuation for new-speaker announcement (5% of signal)
                                  # combined with PipeWire 1% = ~0.05% of full scale
+# When mic-leakage calibration can't measure a level (mic can't hear the
+# speaker — e.g. headphones, or separate non-coupled mic+speaker), fall back
+# to a moderate USABLE level instead of an inaudible minimum, so the system
+# is immediately usable and the user can fine-tune via Manual adjustment.
+CAL_FALLBACK_PW   = 25           # PipeWire % — audible but not deafening
+CAL_FALLBACK_SW   = 0.70         # software gain
+# Result announcement always plays at this guaranteed-audible level,
+# regardless of the calibration outcome, so the user always hears it.
+CAL_ANNOUNCE_PW   = 45
+CAL_ANNOUNCE_SW   = 0.75
+# Weak-coupling speakers never reach the strict SNR target. Pick the FIRST
+# step whose SNR clears this modest "clearly audible above noise" threshold —
+# that's the MINIMUM comfortable volume (the function's stated goal), instead
+# of the loudest step. Tuned to the knee where the tone becomes unambiguous.
+CAL_AUDIBLE_SNR   = 80.0
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
 
@@ -99,7 +131,7 @@ def _detect_headset() -> bool:
         def _usb_ids(text):
             ids = set()
             for line in text.splitlines():
-                m = _re4.search(r'usb-([^.]+)-\d{2}\.', line)
+                m = _re4.search(r'usb-(.+)-\d{2}\.', line)
                 if m and "hdmi" not in line.lower() and "monitor" not in line.lower():
                     ids.add(m.group(1))
             return ids
@@ -211,16 +243,56 @@ def _find_usb_speaker_sink() -> str | None:
             parts = line.split()
             if len(parts) >= 2:
                 name = parts[1]
-                if "hdmi" not in name.lower() and "bluez" not in name.lower():
+                if ("hdmi" not in name.lower() and "bluez" not in name.lower()
+                        and not name.startswith("rtt_agc")):
                     return parts[0]   # sink index
     except Exception:
         pass
     return None
 
 
+def _find_usb_speaker_sink_name() -> str | None:
+    """Return the PipeWire sink NAME of the USB speaker (for paplay --device).
+
+    PipeWire holds USB devices exclusively, so direct-ALSA `aplay -D plughw`
+    fails with 'device busy'. Speaker calibration must play through PipeWire.
+    """
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sinks"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                name = parts[1]
+                if ("hdmi" not in name.lower() and "bluez" not in name.lower()
+                        and "monitor" not in name.lower()
+                        and not name.startswith("rtt_agc")):
+                    return name
+    except Exception:
+        pass
+    return None
+
+
+def _cal_capture(n_samples: int, sample_rate: int) -> "np.ndarray":
+    """Capture mono int16 for speaker calibration — FAST path via sd.rec.
+
+    run_speaker_calibration temporarily makes the RAW C-Media mic the
+    PipeWire default (bypassing the WebRTC AGC source, which suppresses the
+    steady test tone), so sd.rec(device=None) reads the raw mic. This is
+    ~4× faster than spawning a parec client per step.
+    """
+    try:
+        rec = sd.rec(n_samples, samplerate=sample_rate, channels=1,
+                     dtype="int16", device=None, blocking=True)
+        return rec[:n_samples, 0].copy()
+    except Exception as e:
+        log.warning("Cal capture error: %s", e)
+        return np.zeros(n_samples, dtype=np.int16)
+
+
 def run_speaker_calibration(alsa_output: str = None,
                              test_freq: float = 440.0,
-                             duration: float = 0.3,
+                             duration: float = 0.2,
                              snr_target: float = 50000.0) -> dict:
     """
     Find the MINIMUM usable speaker volume by starting at absolute minimum
@@ -258,7 +330,23 @@ def run_speaker_calibration(alsa_output: str = None,
 
     speaker_alsa = _find_working_alsa_out()
 
-    # Absolute minimum first — PipeWire 1%, no extra sound yet
+    # PipeWire holds USB devices exclusively, so play the tone THROUGH
+    # PipeWire (paplay → USB sink) rather than direct-ALSA aplay (which
+    # fails 'device busy' and silently falls back to inaudible default).
+    cal_sink = _find_usb_speaker_sink_name()
+    # FAST capture: make the raw C-Media mic the default for the duration of
+    # calibration so sd.rec reads it directly (bypassing the AGC source that
+    # would suppress the test tone). Restored in finally. ~4× faster than
+    # spawning a parec client per step.
+    _cal_prev_src = _get_default_source()
+    if _agc_source_available() or _cal_prev_src == AGC_SOURCE_NAME:
+        _set_default_source(RAW_MIC_SOURCE)
+    log.info("Speaker cal: tone via PipeWire sink=%s, capture raw mic=%s",
+             cal_sink or "(none)", RAW_MIC_SOURCE)
+
+    # Absolute minimum first — force EVERY sink to PipeWire 1% (the practical
+    # floor) before any sound plays, so a powered speaker can't blast at full
+    # volume the instant calibration starts.
     _safe_volume_new_sinks(1)
     _t.sleep(0.3)
 
@@ -266,24 +354,26 @@ def run_speaker_calibration(alsa_output: str = None,
     n_samples   = int(sample_rate * duration)
     freq_idx    = int(np.round(test_freq * n_samples / sample_rate))
 
-    # Steps: (pw_pct, sw_volume)
+    # Steps: (pw_pct, sw_volume). Start as quiet as audibly possible — PW 1%
+    # plus tiny software gain (0.002 ≈ 0.001% of full scale) — then ramp up.
+    # This protects loud powered speakers: the very first tone is barely
+    # audible, and it only gets louder if the mic genuinely can't hear it.
     steps = (
-        [(1, sw) for sw in [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]] +
+        [(1, sw) for sw in [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0]] +
         [(pw, 1.0) for pw in [5, 10, 20, 30, 40, 50, 60]]
     )
 
     # Measure mic noise floor at absolute minimum (silence reference)
     try:
-        ref_rec = sd.rec(n_samples, samplerate=sample_rate, channels=1,
-                         dtype='int16', device=None, blocking=True)
-        ref_data  = ref_rec[:n_samples, 0].astype(np.float32) / 32768.0
+        ref_rec   = _cal_capture(n_samples, sample_rate)
+        ref_data  = ref_rec.astype(np.float32) / 32768.0
         ref_fft   = np.abs(np.fft.rfft(ref_data)) / n_samples
         noise_floor = float(np.median(ref_fft))
     except Exception:
         noise_floor = 1e-6
 
     measurements: list[dict] = []
-    found_pw, found_sw = 1, 0.01
+    found_pw, found_sw = 1, 0.002   # safest fallback = quietest step
     status = "ok"
     cur_pw = 1
 
@@ -305,23 +395,27 @@ def run_speaker_calibration(alsa_output: str = None,
                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sample_rate)
                 wf.writeframes(tone_16.tobytes())
 
-            # Play + record simultaneously
+            # Play (PipeWire) + record (raw mic) simultaneously
             recording = np.zeros(n_samples, dtype=np.int16)
             done_ev   = _threading.Event()
 
             def _rec(buf=recording, ev=done_ev):
                 try:
-                    r = sd.rec(n_samples, samplerate=sample_rate, channels=1,
-                               dtype='int16', device=None, blocking=True)
-                    buf[:] = r[:n_samples, 0]
+                    buf[:] = _cal_capture(n_samples, sample_rate)
                 except Exception as e:
                     log.warning("Cal mic error: %s", e)
                 finally:
                     ev.set()
 
             _threading.Thread(target=_rec, daemon=True).start()
-            subprocess.run(["aplay", "-D", speaker_alsa, "-q", tone_path], capture_output=True)
-            done_ev.wait(timeout=duration + 1.0)
+            _t.sleep(0.05)  # let capture spin up before the tone
+            if cal_sink:
+                subprocess.run(["paplay", f"--device={cal_sink}", tone_path],
+                               capture_output=True)
+            else:
+                subprocess.run(["aplay", "-D", speaker_alsa, "-q", tone_path],
+                               capture_output=True)
+            done_ev.wait(timeout=duration + 2.0)
             try: os.unlink(tone_path)
             except FileNotFoundError: pass
 
@@ -344,19 +438,34 @@ def run_speaker_calibration(alsa_output: str = None,
         else:
             if measurements:
                 best = max(measurements, key=lambda m: m["tone"])
-                if best["tone"] < 0.00005:
-                    # No acoustic signal at any volume — mic is probably not connected
-                    log.warning("Speaker cal: no acoustic signal detected — microphone may not be connected")
+                # First step that is clearly audible above noise = the
+                # MINIMUM comfortable volume (matches the docstring goal).
+                audible = next(
+                    (m for m in measurements if m["snr"] >= CAL_AUDIBLE_SNR),
+                    None,
+                )
+                if audible:
+                    found_pw, found_sw = audible["pw"], audible["sw"]
+                    log.info("Speaker cal: minimum clearly-audible level "
+                             "PW=%d%% SW=%.2f (SNR=%.1f, knee≥%.0f)",
+                             found_pw, found_sw, audible["snr"], CAL_AUDIBLE_SNR)
+                elif best["tone"] < 0.00005:
+                    # Mic genuinely can't hear the speaker (headphones /
+                    # non-coupled). Use a moderate USABLE default so the
+                    # system still works; user fine-tunes via Manual.
+                    log.warning("Speaker cal: no acoustic signal — mic can't hear "
+                                "speaker; using usable default PW=%d%% SW=%.2f",
+                                CAL_FALLBACK_PW, CAL_FALLBACK_SW)
                     status = "no_mic"
-                    # Stay at safe minimum — do NOT set high volume on a possibly-powered speaker
-                    found_pw, found_sw = 1, NEW_DEVICE_VOLUME
+                    found_pw, found_sw = CAL_FALLBACK_PW, CAL_FALLBACK_SW
                 else:
-                    # Non-powered speaker — pick step with highest tone energy
+                    # Faint coupling that never gets clearly audible — best
+                    # we can do is the strongest step.
                     found_pw, found_sw = best["pw"], best["sw"]
-                    log.info("Speaker cal: non-powered speaker, best energy at PW=%d%% SW=%.2f (SNR=%.1f)",
-                             found_pw, found_sw, best["snr"])
+                    log.info("Speaker cal: weak coupling, best energy PW=%d%% "
+                             "SW=%.2f (SNR=%.1f)", found_pw, found_sw, best["snr"])
             else:
-                found_pw, found_sw = 1, NEW_DEVICE_VOLUME
+                found_pw, found_sw = CAL_FALLBACK_PW, CAL_FALLBACK_SW
 
         # Set PipeWire to the found level for normal use
         if speaker_sink:
@@ -376,7 +485,12 @@ def run_speaker_calibration(alsa_output: str = None,
     except Exception as e:
         log.error("Speaker calibration error: %s", e)
         status = f"error: {e}"
-        found_pw, found_sw = 1, NEW_DEVICE_VOLUME
+        found_pw, found_sw = CAL_FALLBACK_PW, CAL_FALLBACK_SW
+    finally:
+        # Restore the AGC source as default for normal speech capture
+        if _cal_prev_src and _get_default_source() != _cal_prev_src:
+            _set_default_source(_cal_prev_src)
+            log.info("Speaker cal: restored default source %s", _cal_prev_src)
 
     return {
         "safe_vol": found_pw,
@@ -394,7 +508,8 @@ _cal_sw_volume: float = 1.0   # updated after calibration; used by speak() for n
 MAX_LOG_ENTRIES = 40
 
 def _log_entry(role: str, text: str):
-    CONVERSATION_LOG.append({"role": role, "text": text})
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    CONVERSATION_LOG.append({"role": role, "text": text, "ts": ts})
     if len(CONVERSATION_LOG) > MAX_LOG_ENTRIES:
         CONVERSATION_LOG.pop(0)
 
@@ -518,6 +633,59 @@ def load_gateway_token() -> str:
         raise RuntimeError("No gateway.auth.token in openclaw.json")
     return token
 
+def _agc_source_available() -> bool:
+    """True if the WebRTC AGC virtual source is loaded in PipeWire."""
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        return AGC_SOURCE_NAME in out
+    except Exception:
+        return False
+
+
+def _activate_agc_source() -> bool:
+    """Make the WebRTC AGC source the PipeWire default if it exists.
+
+    Returns True when AGC is active (daemon should use AGC-tuned gain/gate),
+    False when it should fall back to the static --mic-gain / --mic-gate.
+    """
+    if not _agc_source_available():
+        return False
+    try:
+        subprocess.run(
+            ["pactl", "set-default-source", AGC_SOURCE_NAME],
+            check=False, timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _get_default_source() -> str:
+    """Current PipeWire default source name (empty string on failure)."""
+    try:
+        return subprocess.run(
+            ["pactl", "get-default-source"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _set_default_source(name: str) -> bool:
+    """Set the PipeWire default source. Returns True on success."""
+    if not name:
+        return False
+    try:
+        return subprocess.run(
+            ["pactl", "set-default-source", name],
+            capture_output=True, timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
 # ── Service file helpers ──────────────────────────────────────────────────────
 
 SERVICE_FILE = os.path.expanduser(
@@ -590,6 +758,17 @@ def _is_cjk(ch: str) -> bool:
 
 def _is_chinese_text(text: str) -> bool:
     return any(_is_cjk(c) for c in text)
+
+def _to_simplified(text: str) -> str:
+    """Normalize captured Chinese to Simplified. gpt-4o-transcribe often
+    returns Traditional; convert deterministically (zhconv, pure-Python).
+    Non-Chinese text passes through unchanged."""
+    if not text or _zh_convert is None or not _is_chinese_text(text):
+        return text
+    try:
+        return _zh_convert(text, "zh-cn")
+    except Exception:
+        return text
 
 def _split_by_script(text: str) -> list[tuple[str, str]]:
     """Split text into [(segment, 'zh'|'en')] so each segment uses its correct Piper voice."""
@@ -765,6 +944,8 @@ class GatewayClient:
         self._send_acks: dict[str, asyncio.Future] = {}
         # Maps runId → Future[str] for final chat replies
         self._reply_futs: dict[str, asyncio.Future] = {}
+        # Maps runId → latest assistant-stream text (fallback if chat final empty)
+        self._assistant_text: dict[str, str] = {}
 
     async def connect(self):
         self._ws = await websockets.connect(OPENCLAW_GW_URL)
@@ -772,7 +953,7 @@ class GatewayClient:
         await self._ws.send(json.dumps({
             "type": "req", "id": "gw-connect", "method": "connect",
             "params": {
-                "minProtocol": 3, "maxProtocol": 3,
+                "minProtocol": 4, "maxProtocol": 4,
                 "client": {
                     "id": "gateway-client", "version": "1.2.0",
                     "platform": "linux", "mode": "backend",
@@ -809,13 +990,38 @@ class GatewayClient:
                     if not fut.done():
                         fut.set_result(msg)
 
+                # Track assistant-stream text as a reliable reply source
+                elif event == "agent" and payload.get("stream") == "assistant":
+                    rid = payload.get("runId")
+                    atext = (payload.get("data") or {}).get("text", "")
+                    if rid and atext:
+                        self._assistant_text[rid] = atext
+
                 # Resolve agent replies on final chat event
                 elif event == "chat" and payload.get("state") == "final":
                     run_id = payload.get("runId")
-                    content = payload.get("message", {}).get("content", [])
+                    cmsg = payload.get("message", {}) or {}
+                    content = cmsg.get("content", []) or []
+                    # Standard content array (type=text)
                     text = " ".join(
                         c.get("text", "") for c in content if c.get("type") == "text"
                     ).strip()
+                    # Fallback: Responses API output_text items
+                    if not text:
+                        text = " ".join(
+                            c.get("text", "") for c in content
+                            if c.get("type") in ("output_text", "text_delta")
+                        ).strip()
+                    # Fallback: top-level text / deltaText
+                    if not text:
+                        text = (cmsg.get("text") or payload.get("deltaText") or "").strip()
+                    # Fallback: assistant-stream text captured during the run
+                    if not text:
+                        text = self._assistant_text.get(run_id, "").strip()
+                    if not text:
+                        log.warning("chat final empty: payload=%s",
+                                    json.dumps(payload)[:600])
+                    self._assistant_text.pop(run_id, None)
                     fut = self._reply_futs.pop(run_id, None)
                     if fut and not fut.done():
                         fut.set_result(text)
@@ -858,7 +1064,62 @@ class GatewayClient:
             "params": {"runId": run_id, "timeoutMs": AGENT_TIMEOUT_S * 1000},
         }))
 
-        return await asyncio.wait_for(reply_fut, timeout=AGENT_TIMEOUT_S + 5)
+        text = await asyncio.wait_for(reply_fut, timeout=AGENT_TIMEOUT_S + 5)
+        # Codex harness delivers replies via the `message` tool, not chat
+        # content — the chat-final event is empty. Pull the reply from
+        # chat.history where the message-tool call arguments are persisted.
+        if not text:
+            await asyncio.sleep(0.6)  # let message-tool result persist
+            text = await self._reply_from_history(session_key)
+        return text
+
+    async def _reply_from_history(self, session_key: str) -> str:
+        """Fetch the latest assistant reply from chat.history.
+
+        Handles the codex harness `message`-tool delivery as well as plain
+        assistant text (automatic mode).
+        """
+        loop = asyncio.get_running_loop()
+        hid = f"hist:{uuid.uuid4()}"
+        hfut: asyncio.Future = loop.create_future()
+        self._send_acks[hid] = hfut
+        try:
+            await self._ws.send(json.dumps({
+                "type": "req", "id": hid, "method": "chat.history",
+                "params": {"sessionKey": session_key, "limit": 8},
+            }))
+            resp = await asyncio.wait_for(hfut, timeout=10)
+        except (asyncio.TimeoutError, Exception) as e:
+            self._send_acks.pop(hid, None)
+            log.warning("chat.history fetch failed: %s", e)
+            return ""
+        msgs = resp.get("payload", {}).get("messages", []) or []
+        for m in reversed(msgs):
+            if m.get("role") != "assistant":
+                continue
+            content = m.get("content", [])
+            if isinstance(content, str):
+                if content.strip():
+                    return content.strip()
+                continue
+            if not isinstance(content, list):
+                continue
+            # Codex message-tool call
+            for c in content:
+                if c.get("type") == "toolCall" and c.get("name") == "message":
+                    args = c.get("arguments") or c.get("input") or {}
+                    txt = (args.get("message") or "").strip()
+                    if txt:
+                        return txt
+            # Plain assistant text (automatic / non-codex)
+            txt = " ".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            ).strip()
+            if txt:
+                return txt
+        log.warning("chat.history: no assistant reply found in %d msgs", len(msgs))
+        return ""
 
     async def close(self):
         if self._ws:
@@ -888,6 +1149,8 @@ class RealtimeSession:
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
         self._active      = False             # start silent; wake phrase enables voice
+        self._monitoring  = False             # passive capture-only mode (no Five, no TTS)
+        self._multilang   = False             # False = only show/process EN/ZH
 
     def _mic_cb(self, indata, frames, time_info, status):
         raw = indata[::RESAMPLE_RATIO, 0]
@@ -955,25 +1218,44 @@ class RealtimeSession:
             }))
 
     async def _handle_transcript(self, transcript: str):
-        if not _is_english_or_chinese(transcript):
-            log.debug("Discarded non-EN/ZH: %r", transcript)
+        # Default to Simplified Chinese (transcriber often returns Traditional)
+        transcript = _to_simplified(transcript)
+
+        # Language gate: by default only English/Chinese are shown/processed.
+        # Other languages (often noise hallucinations) are dropped unless the
+        # user enables multi-language mode.
+        if not self._multilang and not _is_english_or_chinese(transcript):
+            log.debug("Dropped non-EN/ZH (multilang off): %r", transcript)
             return
+
+        # Monitoring-only mode: passively log captured segments (no Five/TTS).
+        if self._monitoring:
+            t = transcript.strip()
+            if t:
+                log.info("Monitor: %s", t)
+                _log_entry("monitor", t)
+            return
+
         normalized = transcript.strip().rstrip(".!?,").lower()
 
         # Wake phrase — always checked regardless of active state
         if _matches_phrase(normalized, WAKE_PHRASES):
-            if not self._active:
-                self._active = True
-                log.info("Wake phrase detected — voice active")
-                _log_entry("system", "▶ Voice activated")
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "I'm listening.", self.alsa_output
-                )
-            else:
-                log.info("Wake phrase detected — already active")
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "Yes, I'm here.", self.alsa_output
-                )
+            self._busy.set()
+            try:
+                if not self._active:
+                    self._active = True
+                    log.info("Wake phrase detected — voice active")
+                    _log_entry("system", "Voice activated")
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "I'm listening.", self.alsa_output
+                    )
+                else:
+                    log.info("Wake phrase detected — already active")
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "Yes, I'm here.", self.alsa_output
+                    )
+            finally:
+                self._busy.clear()
             return
 
         # Sleep phrase — only meaningful when active
@@ -981,10 +1263,14 @@ class RealtimeSession:
             if self._active:
                 self._active = False
                 log.info("Sleep phrase detected — going silent")
-                _log_entry("system", "⏸ Voice silenced")
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "Going silent now. Say Five wake up to resume.", self.alsa_output
-                )
+                _log_entry("system", "Voice silenced")
+                self._busy.set()
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "Going silent now. Say Five wake up to resume.", self.alsa_output
+                    )
+                finally:
+                    self._busy.clear()
             return
 
         # Calibration — works in both modes (audio feedback either way)
@@ -1077,9 +1363,13 @@ class RealtimeSession:
                             "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                             "turn_detection": {
                                 "type":                "server_vad",
-                                "threshold":           0.3,   # lower = more sensitive (headset mic)
-                                "prefix_padding_ms":   200,
-                                "silence_duration_ms": 600,   # faster turn detection for conversation
+                                "threshold":           0.3,   # lower = more sensitive
+                                "prefix_padding_ms":   300,   # capture sentence lead-in ("Five,…")
+                                # WebRTC AGC noise-suppression turns brief
+                                # inter-word gaps into hard silence; 600ms ended
+                                # turns mid-sentence ("Can you" → rest lost while
+                                # busy). 1100ms keeps a full sentence as one turn.
+                                "silence_duration_ms": 1100,
                             },
                         },
                     },
@@ -1146,21 +1436,61 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_response(302)
                 self.send_header("Location", "/log")
                 self.end_headers()
+            elif self.path in ("/monitor", "/monitor/start", "/monitor/stop"):
+                # Passive capture-only monitoring (no Five, no TTS).
+                # /monitor toggles; /monitor/start and /monitor/stop are explicit.
+                if sess:
+                    if self.path == "/monitor/start":
+                        new_state = True
+                    elif self.path == "/monitor/stop":
+                        new_state = False
+                    else:
+                        new_state = not sess._monitoring
+                    if new_state and not sess._monitoring:
+                        sess._monitoring = True
+                        sess._active = False  # ensure fully silent
+                        log.info("HTTP monitor START — capture-only")
+                        _log_entry("system", "Monitoring only - capture display, silent")
+                    elif not new_state and sess._monitoring:
+                        sess._monitoring = False
+                        log.info("HTTP monitor STOP")
+                        _log_entry("system", "Monitoring stopped")
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+            elif self.path == "/multilang":
+                # Toggle multi-language mode. Off (default) = only English/
+                # Chinese shown/processed; other languages dropped.
+                if sess:
+                    sess._multilang = not sess._multilang
+                    state_txt = "ON (all languages)" if sess._multilang else "OFF (EN/ZH only)"
+                    log.info("HTTP multilang %s", state_txt)
+                    _log_entry("system", f"Multi-language mode: {state_txt}")
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+            elif self.path == "/reset":
+                # Clear the on-screen conversation/capture log
+                CONVERSATION_LOG.clear()
+                log.info("HTTP reset — conversation log cleared")
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
             elif self.path == "/calibrate":
                 gate = _mic_gate_ref[0]
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Mic Calibration</title>
 <style>
-body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
+body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;padding:16px;}}
 h3{{margin:0 0 12px;}}
 #wrap{{width:100%;max-width:500px;}}
 canvas{{width:100%;height:44px;border-radius:6px;display:block;}}
-#info{{font-size:13px;color:#aaa;margin:8px 0;min-height:20px;}}
+#info{{font-size:16px;color:#aaa;margin:8px 0;min-height:20px;}}
 #result{{margin-top:12px;padding:10px;background:#1a3a1a;border-radius:6px;font-size:15px;color:#7f7;display:none;}}
 #countdown{{font-size:13px;color:#aaa;margin-top:4px;}}
 .btnrow{{margin-top:14px;display:flex;gap:10px;}}
-button{{padding:10px 22px;border:none;color:#fff;border-radius:6px;font-size:15px;cursor:pointer;}}
+button{{padding:12px 26px;border:none;color:#fff;border-radius:8px;font-size:17px;cursor:pointer;}}
 #btn{{background:#2a5;}} #btn:disabled{{background:#555;cursor:default;}}
 #backbtn{{background:#335;}}
 </style></head><body>
@@ -1213,7 +1543,7 @@ es.onmessage = e => {{
   currentGate = gate;
   draw(peak, gate);
   if(!calRunning) info.textContent =
-    peak < gate ? '🔵 Below gate (noise floor)' :
+    peak < gate ? 'Below gate (noise floor)' :
     peak < MAX*0.5 ? '🟢 Speech range' : '🔴 Very loud';
 }};
 
@@ -1227,7 +1557,7 @@ function startCal(){{
     clearInterval(t);
     calRunning = false;
     result.style.display='block';
-    result.innerHTML = '✅ Done! New gate: <b>' + d.gate + '</b> &nbsp;(noise peak was ' + d.noise_peak + ')<br><small>Returning to log in 3 seconds…</small>';
+    result.innerHTML = 'Done! New gate: <b>' + d.gate + '</b> &nbsp;(noise peak was ' + d.noise_peak + ')<br><small>Returning to log in 3 seconds…</small>';
     info.textContent = 'Yellow line updated.';
     btn.disabled = false;
     setTimeout(()=>{{ es.close(); location.href='/dashboard'; }}, 5000);
@@ -1275,8 +1605,8 @@ function startCal(){{
                     body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Speaker Calibration — Headset</title>
-<style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
-h3{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:6px 0;}}
+<style>body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;padding:16px;}}
+h3{{margin:0 0 8px;}} .info{{color:#aaa;font-size:16px;margin:6px 0;}}
 #vol{{font-size:2em;font-weight:bold;margin:16px 0;text-align:center;}}
 .row{{display:flex;gap:10px;justify-content:center;margin:8px 0;}}
 button{{padding:12px 24px;border:none;color:#fff;border-radius:6px;font-size:16px;cursor:pointer;}}
@@ -1293,8 +1623,8 @@ Play the test sentence and adjust until comfortable.</div>
   <button id="btnLouder"  onclick="adj(+10)">+ Louder</button>
 </div>
 <div class="row">
-  <button id="btnPlay" onclick="startLoop()">▶ Play test</button>
-  <button id="btnStop" onclick="stopLoop()">■ Stop</button>
+  <button id="btnPlay" onclick="startLoop()">Play test</button>
+  <button id="btnStop" onclick="stopLoop()">Stop</button>
 </div>
 <div class="row">
   <button id="btnSet" onclick="setLevel()">✓ Set this level</button>
@@ -1333,7 +1663,7 @@ setInterval(upd, 2000);
                         rows = "".join(_row(m) for m in prev.get("measurements", []))
                         sw_pct = int(prev.get("safe_sw_vol", 1.0) * 100)
                         warn = ('<div style="background:#5a1a00;border-radius:6px;padding:8px;'
-                                'margin-bottom:6px;">⚠ No microphone detected — connect mic and recalibrate.</div>'
+                                'margin-bottom:6px;">No microphone detected - connect mic and recalibrate.</div>'
                                 ) if prev.get("status") == "no_mic" else ""
                         prev_html = (
                             warn +
@@ -1345,13 +1675,13 @@ setInterval(upd, 2000);
                     body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Speaker Calibration</title>
-<style>body{{font-family:sans-serif;background:#111;color:#eee;padding:16px;}}
+<style>body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;padding:16px;}}
 h3,h4{{margin:0 0 8px;}} .info{{color:#aaa;font-size:13px;margin:4px 0;}}
 #status{{margin:10px 0;font-size:14px;min-height:18px;}}
 .sect{{border-top:1px solid #333;margin-top:16px;padding-top:12px;}}
 #vol{{font-size:1.6em;font-weight:bold;margin:8px 0;}}
 .row{{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;}}
-button{{padding:10px 18px;border:none;color:#fff;border-radius:6px;font-size:14px;cursor:pointer;}}
+button{{padding:12px 22px;border:none;color:#fff;border-radius:8px;font-size:17px;cursor:pointer;}}
 #btn{{background:#2a5;}} #btn:disabled{{background:#555;}}
 .bAdj{{background:#335;}} .bPlay{{background:#226;}}
 .bStop{{background:#622;}} .bSet{{background:#a62;}}
@@ -1370,8 +1700,8 @@ a{{color:#7af;}}</style></head><body>
 <div class="row">
   <button class="bAdj" onclick="adj(-10)">− Quieter</button>
   <button class="bAdj" onclick="adj(+10)">+ Louder</button>
-  <button class="bPlay" onclick="startLoop()">▶ Play test</button>
-  <button class="bStop" onclick="stopLoop()">■ Stop</button>
+  <button class="bPlay" onclick="startLoop()">Play test</button>
+  <button class="bStop" onclick="stopLoop()">Stop</button>
   <button class="bSet"  onclick="setLevel()">✓ Set this level</button>
 </div>
 <div id="mstatus" style="color:#aaa;font-size:13px;margin-top:6px;"></div>
@@ -1400,8 +1730,8 @@ function runCal(){{
   fetch('/speaker-cal/run').then(r=>r.json()).then(d=>{{
     document.getElementById('btn').disabled=false;
     document.getElementById('status').innerHTML=
-      (d.status=='no_mic' ? '⚠ No mic detected — connect microphone first.' :
-      '&#10003; Set to PW <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>');
+      (d.status=='no_mic' ? 'No mic detected - connect microphone first.' :
+      'Set to PW <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>');
     setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{
     document.getElementById('btn').disabled=false;
@@ -1428,25 +1758,38 @@ setInterval(upd, 2000);
                                  sess.alsa_output, new_alsa)
                         sess.alsa_output = new_alsa
 
-                # announce result — play at calibrated level, skip auto-reduce so we
-                # don't override the level we just found
+                # Announce result ALWAYS at a guaranteed-audible level (the
+                # calibrated level may be near-silent), then drop the speaker
+                # to the calibrated operating level for normal use.
                 if sess:
                     import threading as _t
-                    sw = result.get("safe_sw_vol", _cal_sw_volume)
-                    pw = result.get("safe_vol", 60)
-                    def _cal_announce(sw=sw, pw=pw, alsa=sess.alsa_output, st=result.get("status","ok")):
+                    sw  = result.get("safe_sw_vol", _cal_sw_volume)
+                    pw  = result.get("safe_vol", CAL_FALLBACK_PW)
+                    snk = _find_usb_speaker_sink()
+                    def _cal_announce(sw=sw, pw=pw, snk=snk,
+                                      alsa=sess.alsa_output,
+                                      st=result.get("status", "ok")):
                         if st == "no_mic":
-                            msg = ("Warning: no microphone detected during speaker calibration. "
-                                   "Please connect a microphone and run calibration again. "
-                                   "Speaker volume kept at minimum for safety.")
+                            msg = ("Calibration finished. The mic could not hear "
+                                   "the speaker, so I set a usable default volume. "
+                                   "Use Manual adjustment to fine-tune.")
+                        elif st == "ok":
+                            msg = (f"Calibration done. Speaker set to {pw} percent.")
                         else:
-                            msg = (f"Calibration done. "
-                                   f"Speaker level: {pw} percent PipeWire, "
-                                   f"software {int(sw*100)} percent.")
-                        # Temporarily suppress auto-reduce by patching the flag
+                            msg = ("Calibration had a problem. Speaker set to a "
+                                   "safe default. Use Manual adjustment.")
                         speak.__globals__["_skip_auto_reduce"] = True
                         try:
-                            speak(msg, alsa, volume=sw)
+                            # Force an audible level for the announcement itself
+                            if snk:
+                                subprocess.run(["pactl", "set-sink-volume", snk,
+                                                f"{CAL_ANNOUNCE_PW}%"],
+                                               capture_output=True)
+                            speak(msg, alsa, volume=CAL_ANNOUNCE_SW)
+                            # Settle to the calibrated operating level
+                            if snk:
+                                subprocess.run(["pactl", "set-sink-volume", snk,
+                                                f"{pw}%"], capture_output=True)
                         finally:
                             speak.__globals__["_skip_auto_reduce"] = False
                     _t.Thread(target=_cal_announce, daemon=True).start()
@@ -1569,7 +1912,7 @@ setInterval(upd, 2000);
                     device_banner = (
                         f'<div id="dbanner" style="background:#5a2200;border-radius:8px;'
                         f'padding:10px;margin-bottom:8px;font-weight:bold;">'
-                        f'&#9888; {_device_change_msg[0]}</div>'
+                        f'{_device_change_msg[0]}</div>'
                         f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
                         f'if(b)b.remove();}},5000);</script>'
                     )
@@ -1578,49 +1921,65 @@ setInterval(upd, 2000);
                     device_banner = (
                         f'<div id="dbanner" style="background:#1a3a1a;border-radius:8px;'
                         f'padding:8px;margin-bottom:8px;color:#5f5;font-size:13px;">'
-                        f'&#10003; No device change detected.</div>'
+                        f'No device change detected.</div>'
                         f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
                         f'if(b)b.remove();}},5000);</script>'
                     )
 
                 active = sess._active if sess else False
+                monitoring = sess._monitoring if sess else False
+                multilang  = sess._multilang if sess else False
                 rows = ""
-                for e in CONVERSATION_LOG:
+                for e in reversed(CONVERSATION_LOG):
+                    ts = e.get("ts", "")
+                    ts_span = f'<span class="ts">{ts}</span> ' if ts else ""
                     if e["role"] == "you":
-                        rows += f'<div class="you"><b>You:</b> {e["text"]}</div>'
+                        rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
                     elif e["role"] == "five":
-                        rows += f'<div class="five"><b>Five:</b> {e["text"]}</div>'
+                        rows += f'<div class="five">{ts_span}<b>Five:</b> {e["text"]}</div>'
+                    elif e["role"] == "monitor":
+                        rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
                     else:
-                        rows += f'<div class="sys">{e["text"]}</div>'
+                        rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
                 # All device info gathered outside do_GET to avoid UnboundLocalError scoping
                 _ds = _get_device_status()
                 device_panel = (
                     f'<div style="background:#1a1a2a;border-radius:8px;padding:8px 12px;'
                     f'margin-bottom:8px;font-size:12px;color:#aaa;line-height:1.8;">'
                     f'<b style="color:#eee">Audio devices</b><br>'
-                    f'🎤 Mic: {_ds["mic"]}<br>'
-                    f'🔊 Speaker: {_ds["speaker_alsa"]} &nbsp;|&nbsp; '
+                    f'Mic: {_ds["mic"]}<br>'
+                    f'Speaker: {_ds["speaker_alsa"]} &nbsp;|&nbsp; '
                     f'Vol {_ds["spk_vol"]} &nbsp;|&nbsp; SW {_ds["sw_pct"]}%<br>'
-                    f'🔧 Mic gate: {_ds["gate"]} &nbsp;|&nbsp; Gain: {_ds["gain"]}×'
+                    f'Mic gate: {_ds["gate"]} &nbsp;|&nbsp; Gain: {_ds["gain"]}x'
                     f'</div>'
                 )
 
-                state = "ACTIVE 🎙" if active else "SILENT 🔇"
+                state = ("MONITORING" if monitoring
+                         else "ACTIVE" if active else "SILENT")
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="3">
 <title>RealTimeTalk Dashboard</title>
 <style>
-body{{font-family:sans-serif;padding:10px;background:#111;color:#eee;}}
+html,body{{height:100%;margin:0;}}
+body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;display:flex;flex-direction:column;}}
+#top{{padding:12px 12px 0;flex-shrink:0;}}
+#log{{flex:1;overflow-y:auto;padding:0 12px 12px;}}
 .you{{background:#1a3a1a;border-radius:8px;padding:8px;margin:6px 0;}}
 .five{{background:#1a2a3a;border-radius:8px;padding:8px;margin:6px 0;}}
+.mon{{background:#2a2030;border-left:3px solid #b58;border-radius:6px;padding:8px;margin:6px 0;}}
 .sys{{color:#888;font-size:0.85em;text-align:center;margin:4px 0;}}
+.ts{{color:#666;font-size:0.8em;font-family:monospace;}}
 h3{{margin:0 0 10px;}}
-a{{color:#7af;margin-right:12px;}}
+a{{color:#7af;margin-right:14px;font-size:17px;}}
+a.on{{color:#5f5;font-weight:bold;}}
+a.reset{{color:#f86;}}
 </style></head><body>
+<div id="top">
 <h3>RealTimeTalk Dashboard — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/dashboard">Dashboard</a>
-<hr>{device_panel}{device_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}
+<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/monitor/start" class="{'on' if monitoring else ''}">Start Monitor</a><a href="/monitor/stop" class="{'' if monitoring else 'on'}">Stop Monitor</a><a href="/multilang" class="{'on' if multilang else ''}">Multi-lang: {'ON' if multilang else 'OFF'}</a><a href="/reset" class="reset">Reset</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/dashboard">Dashboard</a>
+<hr>{device_panel}{device_banner}</div>
+<div id="log">{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 </body></html>"""
                 _html(self, 200, body)
             elif self.path == "/status":
@@ -1750,7 +2109,16 @@ if __name__ == "__main__":
 
     MIC_GAIN      = args.mic_gain
     MIC_GATE_PEAK = args.mic_gate
-    _mic_gate_ref[0] = args.mic_gate
+    if _activate_agc_source():
+        MIC_GAIN      = AGC_MIC_GAIN
+        MIC_GATE_PEAK = AGC_MIC_GATE
+        log.info("WebRTC AGC source active (%s) — adaptive gain/noise on; "
+                 "using gain=%.1f gate=%d", AGC_SOURCE_NAME,
+                 MIC_GAIN, MIC_GATE_PEAK)
+    else:
+        log.info("AGC source unavailable — fallback to static gain=%.1f "
+                 "gate=%d", MIC_GAIN, MIC_GATE_PEAK)
+    _mic_gate_ref[0] = MIC_GATE_PEAK
 
     asyncio.run(main(
         args.http_port,
