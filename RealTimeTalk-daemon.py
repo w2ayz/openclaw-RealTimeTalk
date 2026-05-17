@@ -110,6 +110,10 @@ CAL_ANNOUNCE_SW   = 0.75
 # that's the MINIMUM comfortable volume (the function's stated goal), instead
 # of the loudest step. Tuned to the knee where the tone becomes unambiguous.
 CAL_AUDIBLE_SNR   = 80.0
+# Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
+# the interrupt threshold while Five is speaking, kill TTS immediately.
+SPEAK_INTERRUPT_PEAK   = 1200  # raw mic peak to trigger interrupt (AGC speech >> background)
+SPEAK_INTERRUPT_BLOCKS = 6     # × 50 ms = 300 ms sustained speech → interrupt
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
 
@@ -508,8 +512,10 @@ _cal_sw_volume: float = 1.0   # updated after calibration; used by speak() for n
 MAX_LOG_ENTRIES = 40
 
 def _log_entry(role: str, text: str):
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    CONVERSATION_LOG.append({"role": role, "text": text, "ts": ts})
+    now = datetime.datetime.now()
+    ts  = now.strftime("%H:%M:%S")
+    CONVERSATION_LOG.append({"role": role, "text": text, "ts": ts,
+                              "epoch": now.timestamp()})
     if len(CONVERSATION_LOG) > MAX_LOG_ENTRIES:
         CONVERSATION_LOG.pop(0)
 
@@ -759,6 +765,35 @@ def _is_cjk(ch: str) -> bool:
 def _is_chinese_text(text: str) -> bool:
     return any(_is_cjk(c) for c in text)
 
+def _is_likely_noise(text: str) -> bool:
+    """Return True if the transcript looks like a noise hallucination.
+
+    Two checks:
+    1. Any word ≥ 4 Latin letters with ZERO standard vowels (a/e/i/o/u) —
+       impossible in real English (e.g. 'Dyftm', 'ftm', 'knopk').
+    2. Whole-text vowel ratio < 10% across 10+ Latin letters — catches
+       dense consonant hallucinations even when split across short words.
+    Skipped entirely for mostly-CJK text (Chinese has no Latin vowels).
+    """
+    cjk_count = sum(1 for c in text if _is_cjk(c))
+    all_latin  = [c for c in text if c.isalpha() and ord(c) < 256]
+    if cjk_count > len(all_latin):
+        return False                            # mostly Chinese — skip
+
+    # Check 1: any individual word with zero vowels
+    for word in text.split():
+        letters = [c for c in word if c.isalpha() and ord(c) < 256]
+        if len(letters) >= 4 and not any(c.lower() in "aeiou" for c in letters):
+            return True
+
+    # Check 2: extremely low overall vowel density
+    if len(all_latin) >= 10:
+        vowels = sum(1 for c in all_latin if c.lower() in "aeiou")
+        if vowels / len(all_latin) < 0.10:
+            return True
+
+    return False
+
 def _to_simplified(text: str) -> str:
     """Normalize captured Chinese to Simplified. gpt-4o-transcribe often
     returns Traditional; convert deterministically (zhconv, pure-Python).
@@ -870,50 +905,72 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0):
         with _mic_level_lock:
             baseline_peak = _mic_level_current[0]
 
-        # Play — monitor mic level concurrently in a thread
+        # Play via Popen — interruptible if user speaks mid-sentence.
+        # _monitor_and_play polls mic every 50ms; if speech peaks are sustained
+        # above the interrupt threshold, it kills aplay immediately.
         mic_peaks_during: list[int] = []
-        _play_done = _threading.Event()
+        _interrupted   = [False]
+        _aplay_rc      = [0]
 
-        def _monitor_mic():
-            while not _play_done.is_set():
-                with _mic_level_lock:
-                    mic_peaks_during.append(_mic_level_current[0])
-                _spk_time.sleep(0.05)
-
-        _m = _threading.Thread(target=_monitor_mic, daemon=True)
-        _m.start()
-        r = subprocess.run(["aplay", "-D", alsa_output, "-q", final_wav])
-        if r.returncode != 0 and alsa_output != "pulse":
-            log.warning("aplay failed on %s, retrying via pulse", alsa_output)
-            subprocess.run(["aplay", "-D", "pulse", "-q", final_wav])
-        _play_done.set()
-        _m.join(timeout=0.5)
-
-        # Auto-reduce volume if speaker is bleeding into mic significantly (skip after calibration)
-        if speak.__globals__.get("_skip_auto_reduce", False):
-            return
-        if mic_peaks_during:
-            avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
-            # If mic sees 5× more signal during playback than ambient → speaker too loud
-            if baseline_peak > 0 and avg_during > baseline_peak * 5 and avg_during > 500:
+        def _monitor_and_play(cmd):
+            proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+            consec = 0
+            while True:
                 try:
+                    _aplay_rc[0] = proc.wait(timeout=0.05)
+                    break                    # finished normally
+                except subprocess.TimeoutExpired:
+                    pass
+                with _mic_level_lock:
+                    p = _mic_level_current[0]
+                mic_peaks_during.append(p)
+                if p > max(baseline_peak * 15, SPEAK_INTERRUPT_PEAK):
+                    consec += 1
+                    if consec >= SPEAK_INTERRUPT_BLOCKS:
+                        log.info("Speech interrupt — stopping TTS")
+                        _interrupted[0] = True
+                        try: proc.kill()
+                        except Exception: pass
+                        break
+                else:
+                    consec = 0
+
+        _m = _threading.Thread(daemon=True, target=_monitor_and_play,
+                               args=(["aplay", "-D", alsa_output, "-q", final_wav],))
+        _m.start(); _m.join()
+
+        if not _interrupted[0] and _aplay_rc[0] != 0 and alsa_output != "pulse":
+            log.warning("aplay failed on %s, retrying via pulse", alsa_output)
+            _m2 = _threading.Thread(daemon=True, target=_monitor_and_play,
+                                    args=(["aplay", "-D", "pulse", "-q", final_wav],))
+            _m2.start(); _m2.join()
+
+        # Auto-reduce: only fire on genuinely loud bleed (20× baseline AND >2000
+        # absolute). With WebRTC AGC the baseline is near-zero so the old 5×/500
+        # thresholds fired on every normal playback and collapsed the volume.
+        if _interrupted[0] or speak.__globals__.get("_skip_auto_reduce", False):
+            pass
+        elif mic_peaks_during:
+            avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
+            if baseline_peak > 0 and avg_during > baseline_peak * 40 and avg_during > 4000:
+                try:
+                    import re as _re
                     sinks = subprocess.run(["pactl", "list", "short", "sinks"],
                                            capture_output=True, text=True).stdout
                     for line in sinks.splitlines():
                         parts = line.split()
                         if parts and "hdmi" not in line.lower() and "bluez" not in line.lower():
-                            cur = subprocess.run(
-                                ["pactl", "get-sink-volume", parts[0]],
-                                capture_output=True, text=True).stdout
-                            import re as _re
+                            cur = subprocess.run(["pactl", "get-sink-volume", parts[0]],
+                                                 capture_output=True, text=True).stdout
                             m = _re.search(r'(\d+)%', cur)
                             if m:
                                 cur_pct = int(m.group(1))
                                 new_pct = max(10, cur_pct - 10)
-                                subprocess.run(["pactl", "set-sink-volume", parts[0], f"{new_pct}%"],
-                                               capture_output=True)
-                                log.info("Auto-reduced speaker %s%%→%d%% (mic bleed %.0f > %.0f×baseline)",
-                                         cur_pct, new_pct, avg_during, baseline_peak * 5)
+                                subprocess.run(["pactl", "set-sink-volume", parts[0],
+                                                f"{new_pct}%"], capture_output=True)
+                                log.info("Auto-reduced speaker %d%%→%d%% "
+                                         "(bleed %.0f > 20×baseline %.0f)",
+                                         cur_pct, new_pct, avg_during, baseline_peak)
                 except Exception as e:
                     log.debug("Auto-volume error: %s", e)
 
@@ -1229,11 +1286,19 @@ class RealtimeSession:
             return
 
         # Monitoring-only mode: passively log captured segments (no Five/TTS).
+        # Shows everything verbatim — including noise — so capture quality is visible.
         if self._monitoring:
             t = transcript.strip()
             if t:
                 log.info("Monitor: %s", t)
                 _log_entry("monitor", t)
+            return
+
+        # Noise hallucination filter: drop consonant-heavy gibberish from background
+        # noise that slipped past the VAD. (Monitoring mode is exempt so you can
+        # still diagnose what the transcriber produces.)
+        if _is_likely_noise(transcript):
+            log.debug("Dropped noise hallucination: %r", transcript)
             return
 
         normalized = transcript.strip().rstrip(".!?,").lower()
@@ -1288,6 +1353,7 @@ class RealtimeSession:
         try:
             log.info("Routing to Five: %s", transcript)
             _log_entry("you", transcript)
+            _log_entry("thinking", "Five is thinking...")  # live counter shown on dashboard
             # Prefix tells Five to ignore cron/heartbeat background context
             voice_msg = f"[voice] {transcript}"
             reply = await self.gw.ask(voice_msg, session_key=self.session_key)
@@ -1363,7 +1429,7 @@ class RealtimeSession:
                             "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                             "turn_detection": {
                                 "type":                "server_vad",
-                                "threshold":           0.3,   # lower = more sensitive
+                                "threshold":           0.6,   # raised: AGC normalises speech so 0.6 reliably catches voice but ignores background noise
                                 "prefix_padding_ms":   300,   # capture sentence lead-in ("Five,…")
                                 # WebRTC AGC noise-suppression turns brief
                                 # inter-word gaps into hard silence; 600ms ended
@@ -1929,6 +1995,21 @@ setInterval(upd, 2000);
                 active = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
                 multilang  = sess._multilang if sess else False
+                # Pre-compute how long each "thinking" entry waited for a Five reply.
+                # None = still thinking (show live counter); float = seconds taken (show static).
+                thinking_dur: dict = {}
+                for _i, _e in enumerate(CONVERSATION_LOG):
+                    if _e["role"] == "thinking":
+                        _ep = _e.get("epoch", 0.0)
+                        for _j in range(_i + 1, len(CONVERSATION_LOG)):
+                            if CONVERSATION_LOG[_j]["role"] == "five":
+                                thinking_dur[_ep] = (
+                                    CONVERSATION_LOG[_j].get("epoch", _ep) - _ep
+                                )
+                                break
+                        else:
+                            thinking_dur[_ep] = None  # still waiting
+
                 rows = ""
                 for e in reversed(CONVERSATION_LOG):
                     ts = e.get("ts", "")
@@ -1939,6 +2020,15 @@ setInterval(upd, 2000);
                         rows += f'<div class="five">{ts_span}<b>Five:</b> {e["text"]}</div>'
                     elif e["role"] == "monitor":
                         rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
+                    elif e["role"] == "thinking":
+                        ep  = e.get("epoch", 0.0)
+                        dur = thinking_dur.get(ep)
+                        if dur is None:
+                            # Still waiting — live counter
+                            rows += (f'<div class="thinking">{ts_span}'
+                                     f'Five is thinking... '
+                                     f'<span class="tctr" data-start="{ep:.3f}">0</span>s</div>')
+                        # else: Five replied — hide this line entirely
                     else:
                         rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
                 # All device info gathered outside do_GET to avoid UnboundLocalError scoping
@@ -1969,6 +2059,7 @@ body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;display:f
 .five{{background:#1a2a3a;border-radius:8px;padding:8px;margin:6px 0;}}
 .mon{{background:#2a2030;border-left:3px solid #b58;border-radius:6px;padding:8px;margin:6px 0;}}
 .sys{{color:#888;font-size:0.85em;text-align:center;margin:4px 0;}}
+.thinking{{color:#f90;background:#1a1400;border-left:3px solid #f90;border-radius:6px;padding:8px;margin:6px 0;font-style:italic;}}
 .ts{{color:#666;font-size:0.8em;font-family:monospace;}}
 h3{{margin:0 0 10px;}}
 a{{color:#7af;margin-right:14px;font-size:17px;}}
@@ -1980,6 +2071,14 @@ a.reset{{color:#f86;}}
 <a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/monitor/start" class="{'on' if monitoring else ''}">Start Monitor</a><a href="/monitor/stop" class="{'' if monitoring else 'on'}">Stop Monitor</a><a href="/multilang" class="{'on' if multilang else ''}">Multi-lang: {'ON' if multilang else 'OFF'}</a><a href="/reset" class="reset">Reset</a><a href="/calibrate">Calibrate mic</a><a href="/speaker-cal">Speaker cal</a><a href="/restart">Restart</a><a href="/dashboard">Dashboard</a>
 <hr>{device_panel}{device_banner}</div>
 <div id="log">{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
+<script>
+setInterval(function(){{
+  var now=Date.now()/1000;
+  document.querySelectorAll('.tctr').forEach(function(el){{
+    el.textContent=Math.max(0,Math.floor(now-parseFloat(el.dataset.start)));
+  }});
+}},500);
+</script>
 </body></html>"""
                 _html(self, 200, body)
             elif self.path == "/status":
