@@ -110,6 +110,12 @@ CAL_ANNOUNCE_SW   = 0.75
 # that's the MINIMUM comfortable volume (the function's stated goal), instead
 # of the loudest step. Tuned to the knee where the tone becomes unambiguous.
 CAL_AUDIBLE_SNR   = 80.0
+# Per-device calibration store — persists Vol/SW levels across restarts.
+# New/unknown devices start at minimum safe levels; known devices restore
+# their previously calibrated settings automatically on connect.
+CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
+CAL_NEW_DEV_PW    = 1      # PipeWire % for unknown device (minimum safe)
+CAL_NEW_DEV_SW    = 0.10   # SW for unknown device (10% — clearly audible but not loud)
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Five is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 1200  # raw mic peak to trigger interrupt (AGC speech >> background)
@@ -219,18 +225,15 @@ def _get_device_status() -> dict:
               "spk_vol": "?", "sw_pct": 100, "gate": 500, "gain": 3.0}
     try:
         # Speaker: use the calibrated/active non-HDMI sink, not the PipeWire default
-        # speaker_alsa = real ALSA device string (for service file / aplay)
-        # speaker_name = friendly display name for the portal
-        cal_sink_name = _find_usb_speaker_sink_name()
-        sink_id       = _find_usb_speaker_sink()
-        if cal_sink_name:
-            result["speaker_name"] = _friendly_pw_name("sink", cal_sink_name)
-        else:
-            default_sink = subprocess.run(
-                ["pactl", "get-default-sink"], capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-            if default_sink:
-                result["speaker_name"] = _friendly_pw_name("sink", default_sink)
+        # Always use the PipeWire default sink — the actually selected speaker.
+        # _find_usb_speaker_sink() picks the first available which may not be
+        # the one the user chose.
+        default_sink = subprocess.run(
+            ["pactl", "get-default-sink"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        sink_id = default_sink  # pactl accepts sink names, not just indices
+        if default_sink:
+            result["speaker_name"] = _friendly_pw_name("sink", default_sink)
         # Keep speaker_alsa as the actual ALSA output string (from service file)
         try:
             content = open(SERVICE_FILE).read()
@@ -310,6 +313,7 @@ def _safe_volume_new_sinks(safe_pct: int = 70):
 _audio_fingerprint = [_get_audio_fingerprint()]   # [0] = last known state
 _device_change_msg = [""]                          # [0] = pending announcement or ""
 _speaker_cal_result: dict = {}                     # last calibration result
+_cal_mode_override = [None]  # None=auto-detect, "headset"=force headset, "speaker"=force speaker
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -577,6 +581,11 @@ def run_speaker_calibration(alsa_output: str = None,
         # Persist the found ALSA output card to the service file so restarts use the right device
         if status == "ok":
             _update_service_alsa_output(speaker_alsa)
+        # Save calibrated levels to per-device store (even fallback/no_mic levels)
+        _default_s = subprocess.run(["pactl","get-default-sink"],
+                                    capture_output=True,text=True).stdout.strip()
+        if _default_s:
+            _save_device_cal(_default_s, found_pw, found_sw)
 
     except Exception as e:
         log.error("Speaker calibration error: %s", e)
@@ -784,6 +793,60 @@ def _set_default_source(name: str) -> bool:
     except Exception:
         return False
 
+# ── Per-device calibration store ─────────────────────────────────────────────
+
+_cal_store: dict = {}   # {sink_name: {"pw_pct": int, "sw_vol": float, "name": str}}
+
+def _load_cal_store() -> None:
+    global _cal_store
+    try:
+        with open(CAL_STORE_FILE) as f:
+            _cal_store = json.load(f)
+        log.info("Loaded calibration store: %d device(s)", len(_cal_store))
+    except (FileNotFoundError, json.JSONDecodeError):
+        _cal_store = {}
+
+def _save_cal_store() -> None:
+    try:
+        os.makedirs(os.path.dirname(CAL_STORE_FILE), exist_ok=True)
+        with open(CAL_STORE_FILE, "w") as f:
+            json.dump(_cal_store, f, indent=2)
+    except Exception as e:
+        log.warning("Could not save calibration store: %s", e)
+
+def _save_device_cal(sink_name: str, pw_pct: int, sw_vol: float) -> None:
+    """Record calibrated levels for a speaker device and persist to disk."""
+    friendly = _friendly_pw_name("sink", sink_name)
+    _cal_store[sink_name] = {"pw_pct": pw_pct, "sw_vol": sw_vol, "name": friendly}
+    _save_cal_store()
+    log.info("Saved calibration for %r: PW=%d%% SW=%.2f", friendly, pw_pct, sw_vol)
+
+def _apply_device_cal(sink_name: str) -> bool:
+    """Apply saved calibration levels for a sink, or minimum safe levels if unknown.
+
+    Returns True if a previously calibrated level was found and applied,
+    False if minimum/default levels were applied (new/unknown device).
+    """
+    import re as _rec
+    if sink_name in _cal_store:
+        entry   = _cal_store[sink_name]
+        pw      = entry.get("pw_pct", CAL_FALLBACK_PW)
+        sw      = entry.get("sw_vol", CAL_FALLBACK_SW)
+        subprocess.run(["pactl", "set-sink-volume", sink_name, f"{pw}%"],
+                       capture_output=True)
+        globals()['_cal_sw_volume'] = sw
+        log.info("Restored calibration for %r: PW=%d%% SW=%.2f",
+                 entry.get("name", sink_name), pw, sw)
+        return True
+    else:
+        # Unknown device — start at minimum to protect ears/speakers
+        subprocess.run(["pactl", "set-sink-volume", sink_name, f"{CAL_NEW_DEV_PW}%"],
+                       capture_output=True)
+        globals()['_cal_sw_volume'] = CAL_NEW_DEV_SW
+        log.info("New/unknown device %r — set minimum safe levels PW=%d%% SW=%.2f",
+                 sink_name, CAL_NEW_DEV_PW, CAL_NEW_DEV_SW)
+        return False
+
 # ── Service file helpers ──────────────────────────────────────────────────────
 
 SERVICE_FILE = os.path.expanduser(
@@ -807,6 +870,26 @@ def _update_service_alsa_output(new_alsa: str):
         log.info("Service updated: --alsa-output %s", new_alsa)
     except Exception as e:
         log.warning("Could not update service alsa-output: %s", e)
+
+
+def _update_service_input_source(source_name: str):
+    """Persist --input-source <name> in the systemd service ExecStart line."""
+    try:
+        with open(SERVICE_FILE) as f:
+            content = f.read()
+        import re as _re
+        content = _re.sub(r" --input-source \S+", "", content)
+        if source_name:
+            content = content.replace(
+                "\nRestart=no",
+                f" --input-source {source_name}\nRestart=no",
+            )
+        with open(SERVICE_FILE, "w") as f:
+            f.write(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        log.info("Service updated: --input-source %s", source_name)
+    except Exception as e:
+        log.warning("Could not update service input-source: %s", e)
 
 
 def _update_service_gate(new_gate: int):
@@ -925,7 +1008,7 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
 
     return [(s, l) for s, l in segments if s]
 
-def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0):
+def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
     """Synthesise text with Piper and play via aplay.
 
@@ -941,13 +1024,15 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0):
     if not clean:
         return
     segments = _split_by_script(clean)
-    # Prepend 300ms silence — wakes USB speakers from low-power state gradually
-    silence_path = tempfile.mktemp(suffix=".wav")
+    # Prepend silence to wake USB speakers from low-power state (0 = skip for loops)
     import wave as _wave, struct as _struct
-    with _wave.open(silence_path, 'wb') as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
-        wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * 0.3))
-    wav_parts: list[str] = [silence_path]
+    wav_parts: list[str] = []
+    if silence_ms > 0:
+        silence_path = tempfile.mktemp(suffix=".wav")
+        with _wave.open(silence_path, 'wb') as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
+            wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
+        wav_parts.append(silence_path)
     try:
         for seg_text, lang in segments:
             voice = PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN
@@ -1643,7 +1728,16 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/calibration")
                 self.end_headers()
             elif self.path == "/calibration":
-                is_headset = _detect_headset()
+                # Determine headset mode: manual override > auto-detection
+                _override = _cal_mode_override[0]
+                if _override == "headset":
+                    is_headset = True
+                elif _override == "speaker":
+                    is_headset = False
+                else:
+                    is_headset = _detect_headset()
+                _mode_label = ("Headset" if is_headset else "Speaker") + \
+                              (" (auto)" if _override is None else " (manual)")
                 ds = _get_device_status()
                 gate = _mic_gate_ref[0]
                 prev = _speaker_cal_result
@@ -1662,13 +1756,31 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     prev_html = (warn +
                         f'<p>Last result: PW <b>{prev.get("safe_vol")}%</b> + software <b>{sw_pct}%</b></p>'
                         f'<table class="snrtbl"><tr><th>Level</th><th>Mic SNR</th></tr>{spk_rows}</table>')
+                headset_notice = ('<p class="info" style="margin:4px 0;color:#fa0;">'
+                    'Headset mode — use Manual adjustment to set volume.</p>'
+                    ) if is_headset else ""
                 spk_adj_section = f"""
 <div class="sect"><h4>Manual adjustment</h4>
-<p class="info">Play test sound and adjust until comfortable.</p>
-<div id="vol">Vol: {ds["spk_vol"]}  SW: {ds["sw_pct"]}%</div>
-<div class="row">
-  <button class="bQ" onclick="adj(-10)">− Quieter</button>
-  <button class="bL" onclick="adj(+10)">+ Louder</button>
+{headset_notice}
+<table style="border-collapse:collapse;margin:4px 0;width:100%;">
+  <tr>
+    <td style="color:#aaa;font-size:13px;width:32px;">Vol</td>
+    <td style="font-weight:bold;font-size:1.1em;width:52px;" id="volval">{ds["spk_vol"]}</td>
+    <td><div class="row" style="margin:0;gap:5px;">
+      <button class="bQ" onclick="adjVol(-10)">− Quieter</button>
+      <button class="bL" onclick="adjVol(+10)">+ Louder</button>
+    </div></td>
+  </tr>
+  <tr>
+    <td style="color:#aaa;font-size:13px;">SW</td>
+    <td style="font-weight:bold;font-size:1.1em;" id="swval">{ds["sw_pct"]}%</td>
+    <td><div class="row" style="margin:0;gap:5px;">
+      <button class="bQ" onclick="adjSW(-10)">− Softer</button>
+      <button class="bL" onclick="adjSW(+10)">+ Louder</button>
+    </div></td>
+  </tr>
+</table>
+<div class="row" style="margin:4px 0;">
   <button class="bP" onclick="startLoop()">Play test</button>
   <button class="bS" onclick="stopLoop()">Stop</button>
   <button class="bSet" onclick="setLevel()">Set this level</button>
@@ -1685,50 +1797,76 @@ def start_http_server(port: int, on_stop, session_ref: list):
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Calibration</title>
 <style>
-body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;padding:16px;max-width:640px;}}
-h3{{margin:0 0 12px;}} h4{{margin:8px 0 4px;color:#9cf;}}
-.info{{color:#aaa;font-size:15px;margin:4px 0;}}
-.warn{{background:#5a1a00;border-radius:6px;padding:8px;margin-bottom:6px;}}
-.devpanel{{background:#1a1a2a;border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:15px;line-height:1.8;}}
+body{{font-family:sans-serif;font-size:14px;background:#111;color:#eee;padding:8px 12px;max-width:640px;}}
+h3{{margin:0 0 6px;font-size:16px;}} h4{{margin:4px 0 2px;font-size:14px;color:#9cf;}}
+.info{{color:#aaa;font-size:13px;margin:2px 0;}}
+.warn{{background:#5a1a00;border-radius:5px;padding:5px 8px;margin-bottom:4px;font-size:13px;}}
+.devpanel{{background:#1a1a2a;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:13px;line-height:1.6;}}
 .devpanel b{{color:#eee;}}
-.sect{{border-top:1px solid #333;margin-top:16px;padding-top:12px;}}
-canvas{{width:100%;height:44px;border-radius:6px;display:block;margin:8px 0;}}
-#micinfo{{font-size:15px;color:#aaa;margin:4px 0;min-height:20px;}}
-#micresult{{margin-top:10px;padding:10px;background:#1a3a1a;border-radius:6px;font-size:15px;color:#7f7;display:none;}}
-#vol{{font-size:1.5em;font-weight:bold;margin:8px 0;}}
-#calstatus{{margin:8px 0;font-size:15px;min-height:18px;}}
-#mstatus{{margin-top:6px;}}
-.row{{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;}}
-button{{padding:11px 22px;border:none;color:#fff;border-radius:8px;font-size:16px;cursor:pointer;}}
+.sect{{border-top:1px solid #333;margin-top:8px;padding-top:6px;}}
+canvas{{width:100%;height:36px;border-radius:5px;display:block;margin:4px 0;}}
+#micinfo{{font-size:13px;color:#aaa;margin:2px 0;min-height:16px;}}
+#micresult{{margin-top:6px;padding:6px;background:#1a3a1a;border-radius:5px;font-size:13px;color:#7f7;display:none;}}
+#calstatus{{margin:4px 0;font-size:13px;min-height:16px;}}
+#mstatus{{margin-top:3px;font-size:13px;}}
+.row{{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0;}}
+button{{padding:7px 14px;border:none;color:#fff;border-radius:6px;font-size:13px;cursor:pointer;}}
 #micbtn{{background:#2a5;}} #micbtn:disabled{{background:#555;cursor:default;}}
 #acbtn{{background:#2a5;}} #acbtn:disabled{{background:#555;cursor:default;}}
-#devbtn{{background:#446;}} #devbtn:disabled{{background:#555;cursor:default;}}
 .bQ{{background:#555;}} .bL{{background:#2a5;}} .bP{{background:#226;}}
 .bS{{background:#622;}} .bSet{{background:#a62;}}
-.snrtbl{{border-collapse:collapse;font-size:13px;margin:6px 0;}}
-.snrtbl th,.snrtbl td{{border:1px solid #333;padding:3px 8px;}}
-a{{color:#7af;font-size:17px;}}
+.snrtbl{{border-collapse:collapse;font-size:12px;margin:4px 0;width:100%;}}
+.snrtbl th,.snrtbl td{{border:1px solid #333;padding:3px 6px;text-align:left;}}
+.snrtbl tr.active-row{{background:#1a3a1a;}}
+.use-btn{{padding:3px 10px;font-size:12px;background:#446;border:none;color:#fff;border-radius:4px;cursor:pointer;white-space:nowrap;}}
+.use-btn:hover{{background:#558;}}
+.use-btn.active{{background:#272;cursor:default;}}
+#devbtn{{background:#446;font-size:13px;padding:6px 14px;}}
+#devtoggle{{color:#9cf;cursor:pointer;font-size:13px;background:none;border:none;padding:0;margin-left:6px;}}
+#devlist{{margin-top:6px;}}
+#devmsg{{font-size:13px;color:#fa0;}}
+a{{color:#7af;font-size:14px;}}
 </style></head><body>
 <h3>Calibration</h3>
-<div class="devpanel">
-  <b>Mic:</b> {ds["mic"]} &nbsp;|&nbsp; Gate: {ds["gate"]} &nbsp;|&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;|&nbsp; Vol: {ds["spk_vol"]} &nbsp;|&nbsp; SW: {ds["sw_pct"]}%
+
+<div class="devpanel" id="curdev">
+  <b>Mic:</b> {ds["mic"]} &nbsp;|&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;|&nbsp; Gain: {ds["gain"]}x<br>
+  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;|&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;|&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span>
 </div>
-{'<p class="info">Headset detected — acoustic leakage measurement not available.<br>Use manual adjustment below.</p>' if is_headset else ""}
+<div style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;">
+  <span style="font-size:12px;color:#aaa;">Cal mode:</span>
+  <b style="font-size:13px;color:{'#fa0' if is_headset else '#5f5'};">{_mode_label}</b>
+  <button onclick="setCalMode('headset')" style="padding:3px 10px;font-size:12px;background:{'#622' if is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Headset</button>
+  <button onclick="setCalMode('speaker')" style="padding:3px 10px;font-size:12px;background:{'#2a5' if not is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Speaker</button>
+  <button onclick="setCalMode('auto')" style="padding:3px 10px;font-size:12px;background:{'#446' if _override is None else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Auto</button>
+</div>
+{spk_adj_section}
+<div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
+  <button id="devbtn" onclick="toggleDevices()">Audio Devices</button>
+  <span id="devtoggle" onclick="toggleDevices()">▼ expand</span>
+</div>
+<div id="devlist" style="display:none;">
+  <div id="devout" style="font-size:14px;">Loading…</div>
+</div>
+
+
 <div class="sect"><h4>Mic calibration</h4>
-<p class="info">Stay quiet for 3 seconds to measure ambient noise and set the gate.</p>
-<canvas id="meter" height="44"></canvas>
-<div id="micinfo">Yellow line = current gate ({gate}). Stay quiet to see noise floor.</div>
+<p class="info">Yellow line = gate threshold. Speech above the line passes; noise below is silenced.</p>
+<canvas id="meter" height="36"></canvas>
+<div id="micinfo" style="font-size:12px;color:#aaa;margin:2px 0;min-height:14px;"></div>
+<div style="display:flex;align-items:center;gap:8px;margin:6px 0;">
+  <span style="font-size:12px;color:#aaa;white-space:nowrap;">Gate:</span>
+  <input type="range" id="gateslider" min="{MIC_GATE_MIN}" max="{MIC_GATE_MAX}" step="25"
+         value="{gate}" style="flex:1;accent-color:#ff0;" oninput="onGateSlide(this.value)"
+         onchange="saveGate(this.value)">
+  <span id="gateval" style="font-size:13px;color:#ff0;font-weight:bold;width:36px;text-align:right;">{gate}</span>
+</div>
 <div id="micresult"></div>
-<div class="row"><button id="micbtn" onclick="startMicCal()">Calibrate mic (3 sec quiet)</button></div>
+<div class="row">
+  <button id="micbtn" onclick="startMicCal()">Auto-calibrate (3 sec quiet)</button>
+</div>
 </div>
 {auto_cal_section}
-{spk_adj_section}
-<div class="sect"><h4>Device status</h4>
-<p class="info">Scan all available audio inputs and outputs.</p>
-<div class="row"><button id="devbtn" onclick="checkDevices()">Check Device Status</button></div>
-<div id="devout" style="margin-top:10px;display:none;font-size:14px;"></div>
-</div>
 <p><a href="/dashboard">← Dashboard</a></p>
 <script>
 /* --- Mic level meter --- */
@@ -1756,10 +1894,30 @@ const es=new EventSource('/levels');
 es.onmessage=e=>{{
   const [peak,gate]=e.data.split(',').map(Number);
   draw(peak,gate);
+  // Keep slider in sync with live gate (e.g. after auto-calibrate)
+  const sl=document.getElementById('gateslider');
+  const gv=document.getElementById('gateval');
+  if(sl && !sl.matches(':active')){{ sl.value=gate; if(gv) gv.textContent=gate; }}
   if(!calRunning) micinfo.textContent=
-    peak<gate?'Below gate (noise floor)':
+    peak<gate?'Below gate — noise silenced':
     peak<MAX*0.5?'Speech range':'Very loud';
 }};
+let _gateTimer=null;
+function onGateSlide(val){{
+  document.getElementById('gateval').textContent=val;
+  // Clear stale auto-calibrate result when user manually adjusts
+  const r=document.getElementById('micresult');
+  if(r) r.style.display='none';
+  clearTimeout(_gateTimer);
+  _gateTimer=setTimeout(()=>fetch('/mic-gate/set?value='+val),150);
+}}
+function saveGate(val){{
+  // Persist to service file on mouseup
+  clearTimeout(_gateTimer);
+  fetch('/mic-gate/set?value='+val).then(r=>r.json()).then(d=>{{
+    document.getElementById('gateval').textContent=d.gate;
+  }});
+}}
 function startMicCal(){{
   calRunning=true; micbtn.disabled=true;
   let secs=3; micinfo.textContent='Stay quiet… '+secs+'s';
@@ -1769,14 +1927,33 @@ function startMicCal(){{
     micresult.style.display='block';
     micresult.innerHTML='Done! New gate: <b>'+d.gate+'</b> (noise peak: '+d.noise_peak+')';
     micinfo.textContent='Yellow line updated.'; micbtn.disabled=false;
+    // Auto-hide after announcement has played (~4s)
+    setTimeout(()=>{{micresult.style.display='none';}},4000);
+    // Sync slider to the new gate from auto-calibrate
+    const sl=document.getElementById('gateslider');
+    const gv=document.getElementById('gateval');
+    if(sl){{ sl.value=d.gate; }} if(gv){{ gv.textContent=d.gate; }}
   }}).catch(()=>{{clearInterval(t);calRunning=false;micbtn.disabled=false;
     micinfo.textContent='Calibration failed — try again.';}});
 }}
 /* --- Speaker controls --- */
 function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
-  const v=document.getElementById('vol');
-  if(v) v.textContent='Vol: '+d.spk_vol+'  SW: '+d.sw_pct+'%';
+  const vv=document.getElementById('volval');
+  const sv=document.getElementById('swval');
+  if(vv) vv.textContent=d.spk_vol;
+  if(sv) sv.textContent=d.sw_pct+'%';
+  // Keep top panel in sync
+  const pv=document.getElementById('panelvol');
+  const ps=document.getElementById('panelsw');
+  const pg=document.getElementById('panelgate');
+  if(pv) pv.textContent=d.spk_vol;
+  if(ps) ps.textContent=d.sw_pct+'%';
+  if(pg) pg.textContent=d.gate;
 }});}}
+function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
+function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
+function adj(d){{adjVol(d);}}
+
 function adj(d){{fetch('/speaker-cal/adjust?delta='+d).then(()=>upd());}}
 function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Playing test loop…';}});}}
@@ -1799,53 +1976,124 @@ function runCal(){{
   }}).catch(e=>{{if(btn)btn.disabled=false;if(st)st.textContent='Error: '+e;}});
 }}
 setInterval(upd,2000);
-function checkDevices(){{
+/* --- Device selection --- */
+let _devExpanded=false, _devTimer=null;
+function toggleDevices(){{
+  _devExpanded=!_devExpanded;
+  const list=document.getElementById('devlist');
+  const tog=document.getElementById('devtoggle');
+  list.style.display=_devExpanded?'block':'none';
+  tog.textContent=_devExpanded?'▲ collapse':'▼ expand';
+  if(_devExpanded){{
+    loadDevices();
+    _devTimer=setInterval(loadDevices, 2000);
+  }} else {{
+    if(_devTimer){{ clearInterval(_devTimer); _devTimer=null; }}
+  }}
+}}
+function loadDevices(){{
   const out=document.getElementById('devout');
-  const btn=document.getElementById('devbtn');
-  btn.disabled=true; btn.textContent='Checking…';
-  out.style.display='none';
+  if(!out) return;
+  // Don't show "Loading…" on refresh — only on first open (when empty)
+  if(!out.dataset.loaded) out.textContent='Loading…';
   fetch('/device-status').then(r=>r.json()).then(d=>{{
-    btn.disabled=false; btn.textContent='Check Device Status';
-    if(d.error){{ out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>'; out.style.display='block'; return; }}
-    let html='';
-    html+='<b>Speakers (PipeWire sinks)</b><table class="snrtbl" style="width:100%;margin:6px 0">';
-    html+='<tr><th>Description</th><th>State</th><th>Card</th><th>Active</th></tr>';
+    if(d.error){{out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>';return;}}
+    let h='';
+    h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
+    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th></tr>';
     (d.sinks||[]).forEach(s=>{{
-      const isDefault=(s.name===d.default_sink);
-      const skip=s.name.startsWith('rtt_agc')||s.name.includes('monitor');
-      if(!skip) html+='<tr'+(isDefault?' style="background:#1a3a1a"':'')+'>'
-        +'<td>'+(s.desc||s.name)+'</td>'
-        +'<td>'+s.state+'</td>'
-        +'<td>'+(s.card?'card '+s.card:'BT/other')+'</td>'
-        +'<td>'+(isDefault?'<b style="color:#5f5">Default</b>':'')+'</td></tr>';
+      if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
+      const active=(s.name===d.default_sink);
+      h+='<tr'+(active?' class="active-row"':'')+'>'
+        +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
+        +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'BT')+'</td>'
+        +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
+        +'<td><button class="use-btn'+(active?' active':'')+'"'
+        +' data-dtype="sink" data-dname="'+s.name+'"'
+        +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
+        +(active?' disabled':'')
+        +'>'+(active?'Active':'Use')+'</button></td></tr>';
     }});
-    html+='</table>';
-    html+='<b>Microphones (PipeWire sources)</b><table class="snrtbl" style="width:100%;margin:6px 0">';
-    html+='<tr><th>Description</th><th>State</th><th>Card</th><th>Active</th></tr>';
+    h+='</table>';
+    h+='<p style="margin:12px 0 8px;color:#9cf;font-weight:bold">Microphones</p>';
+    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th></tr>';
     (d.sources||[]).forEach(s=>{{
-      const isDefault=(s.name===d.default_source);
-      const skip=s.name.includes('monitor')||s.name.startsWith('rtt_agc_sink');
-      if(!skip) html+='<tr'+(isDefault?' style="background:#1a3a1a"':'')+'>'
-        +'<td>'+(s.desc||s.name)+'</td>'
-        +'<td>'+s.state+'</td>'
-        +'<td>'+(s.card?'card '+s.card:'-')+'</td>'
-        +'<td>'+(isDefault?'<b style="color:#5f5">Default</b>':'')+'</td></tr>';
+      if(s.name.includes('monitor')||s.name==='rtt_agc_sink'||s.name==='rtt_agc_source') return;
+      const active=(s.name===d.default_source);
+      h+='<tr'+(active?' class="active-row"':'')+'>'
+        +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
+        +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'-')+'</td>'
+        +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
+        +'<td><button class="use-btn'+(active?' active':'')+'"'
+        +' data-dtype="source" data-dname="'+s.name+'"'
+        +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
+        +(active?' disabled':'')
+        +'>'+(active?'Active':'Use')+'</button></td></tr>';
     }});
-    html+='</table>';
+    h+='</table>';
+    // Reserved status area — fixed min-height so no layout shift when message appears/clears
+    h+='<div id="devmsg" style="min-height:52px;padding:6px 0;font-size:14px;color:#fa0;"></div>';
     if((d.alsa_cards||[]).length){{
-      html+='<b>ALSA cards</b><table class="snrtbl" style="margin:6px 0">';
-      html+='<tr><th>Card #</th><th>Name</th></tr>';
-      d.alsa_cards.forEach(c=>html+='<tr><td>card '+c.num+'</td><td>'+c.name+'</td></tr>');
-      html+='</table>';
+      h+='<p style="margin:6px 0 2px;font-size:12px;color:#666;">ALSA: '
+        +d.alsa_cards.map(c=>'<span style="color:#888">'+c.num+'</span> '+c.name).join(' &nbsp;|&nbsp; ')+'</p>';
     }}
-    out.innerHTML=html; out.style.display='block';
-  }}).catch(e=>{{
-    btn.disabled=false; btn.textContent='Check Device Status';
-    out.innerHTML='<span style="color:#f55">Failed: '+e+'</span>'; out.style.display='block';
-  }});
+    out.innerHTML=h;
+    out.dataset.loaded='1';
+  }}).catch(e=>{{out.innerHTML='<span style="color:#f55">Failed: '+e+'</span>';}});
+}}
+function setDevice(type,name){{
+  const msg=document.getElementById('devmsg');
+  msg.textContent=(type==='sink'?'Setting speaker':'Setting mic')+': '+name+' — restarting audio in 1s…';
+  fetch('/device-set?type='+type+'&name='+encodeURIComponent(name))
+    .then(r=>r.json()).then(d=>{{
+      msg.textContent=d.msg||'Done.';
+      if(d.ok){{
+        sessionStorage.setItem('devExpanded','1');
+        if(_devTimer){{ clearInterval(_devTimer); _devTimer=null; }}
+        setTimeout(()=>location.reload(),4500);
+      }} else msg.style.color='#f55';
+    }}).catch(e=>{{msg.textContent='Error: '+e; msg.style.color='#f55';}});
+}}
+// Restore expanded state after a device-switch reload
+if(sessionStorage.getItem('devExpanded')){{
+  sessionStorage.removeItem('devExpanded');
+  toggleDevices();
+}}
+function setCalMode(mode){{
+  fetch('/cal-mode?mode='+mode).then(()=>location.reload());
 }}
 </script></body></html>"""
                 _html(self, 200, body)
+            elif self.path.startswith("/cal-mode"):
+                import json as _json, urllib.parse as _up
+                qs   = _up.parse_qs(_up.urlparse(self.path).query)
+                mode = qs.get("mode", ["auto"])[0]   # "auto", "headset", "speaker"
+                if mode in ("auto", "headset", "speaker"):
+                    _cal_mode_override[0] = None if mode == "auto" else mode
+                    log.info("Cal mode override → %s", mode)
+                resp = _json.dumps({"mode": mode}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/mic-gate/set"):
+                import json as _json, urllib.parse as _up
+                qs   = _up.parse_qs(_up.urlparse(self.path).query)
+                val  = int(qs.get("value", [_mic_gate_ref[0]])[0])
+                val  = max(MIC_GATE_MIN, min(MIC_GATE_MAX, val))
+                _mic_gate_ref[0] = val
+                globals()['MIC_GATE_PEAK'] = val
+                _update_service_gate(val)
+                log.info("Mic gate set to %d via slider", val)
+                resp = _json.dumps({"gate": val}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
             elif self.path == "/calibrate/run":
                 if sess:
                     import asyncio as _aio, json as _json, time as _time
@@ -2090,9 +2338,22 @@ setInterval(upd, 2000);
                 _headset_cal_loop[0] = True
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 def _loop(alsa=alsa):
-                    while _headset_cal_loop[0]:
-                        speak("This is a headset volume test. Adjust until comfortable.", alsa)
-                        import time as _tl; _tl.sleep(0.5)
+                    import tempfile as _tf, os as _os
+                    # Pre-render WAV once — avoids Piper startup overhead on every iteration
+                    _pre = _tf.mktemp(suffix=".wav")
+                    try:
+                        import subprocess as _sp
+                        _sp.run(
+                            [PIPER_CMD, "--model", PIPER_VOICE_EN, "-f", _pre, "-q"],
+                            input=b"This is an audio test. 1, 2, 3, 4, 5.",
+                            capture_output=True, env=PIPER_ENV,
+                        )
+                        while _headset_cal_loop[0]:
+                            _sp.run(["aplay", "-D", alsa, "-q", _pre],
+                                    capture_output=True)
+                    finally:
+                        try: _os.unlink(_pre)
+                        except FileNotFoundError: pass
                 import threading as _t2
                 _t2.Thread(target=_loop, daemon=True).start()
                 _html(self, 200, "<p>Loop started.</p>")
@@ -2103,18 +2364,33 @@ setInterval(upd, 2000);
 
             elif self.path.startswith("/speaker-cal/adjust"):
                 import json as _json, re as _re5, urllib.parse as _up
-                qs = _up.parse_qs(_up.urlparse(self.path).query)
+                qs    = _up.parse_qs(_up.urlparse(self.path).query)
                 delta = int(qs.get("delta", ["0"])[0])
-                sink = _find_usb_speaker_sink()
-                if sink:
-                    # Get current volume
-                    cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
-                                             capture_output=True, text=True).stdout
-                    m = _re5.search(r'(\d+)%', cur_out)
-                    cur = int(m.group(1)) if m else 50
-                    new_vol = max(1, min(100, cur + delta))
-                    subprocess.run(["pactl", "set-sink-volume", sink, f"{new_vol}%"],
-                                   capture_output=True)
+                kind  = qs.get("type", ["vol"])[0]   # "vol" or "sw"
+
+                def _snap10(val, d):
+                    """Snap to nearest multiple of 10, then step by 10; min 1."""
+                    snapped = round(val / 10) * 10
+                    result  = snapped + d
+                    return max(1, min(100, result))
+
+                if kind == "sw":
+                    # Adjust software gain (_cal_sw_volume)
+                    cur_sw  = int(_cal_sw_volume * 100)
+                    new_sw  = _snap10(cur_sw, delta)
+                    globals()['_cal_sw_volume'] = new_sw / 100.0
+                else:
+                    # Adjust PipeWire volume of the default sink
+                    sink = subprocess.run(["pactl","get-default-sink"],
+                                          capture_output=True,text=True).stdout.strip()
+                    if sink:
+                        cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
+                                                 capture_output=True, text=True).stdout
+                        m = _re5.search(r'(\d+)%', cur_out)
+                        cur = int(m.group(1)) if m else 50
+                        new_vol = _snap10(cur, delta)
+                        subprocess.run(["pactl", "set-sink-volume", sink, f"{new_vol}%"],
+                                       capture_output=True)
                 resp = _json.dumps(_get_device_status()).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json")
                 self.send_header("Content-Length", str(len(resp))); self.end_headers()
@@ -2159,12 +2435,14 @@ setInterval(upd, 2000);
                                                     capture_output=True,text=True).stdout.strip()
                     sinks   = _parse_pw_blocks(sinks_raw, "Sink")
                     sources = _parse_pw_blocks(sources_raw, "Source")
-                    # Parse ALSA cards
+                    # Parse ALSA cards — deduplicate by card number (aplay+arecord both list each card)
+                    _seen_cards = set()
                     alsa_cards = []
                     for line in cards_raw.splitlines():
                         if line.startswith("card "):
                             m = _re5.match(r'card (\d+): (\S+) \[([^\]]+)\]', line)
-                            if m:
+                            if m and m.group(1) not in _seen_cards:
+                                _seen_cards.add(m.group(1))
                                 alsa_cards.append({"num": m.group(1), "id": m.group(2), "name": m.group(3)})
                     data = {
                         "default_sink":   default_sink,
@@ -2176,6 +2454,71 @@ setInterval(upd, 2000);
                 except Exception as e:
                     data = {"error": str(e)}
                 resp = _json.dumps(data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/device-set"):
+                import json as _json, urllib.parse as _up
+                qs  = _up.parse_qs(self.path.split("?",1)[1] if "?" in self.path else "")
+                dev_type = qs.get("type",[""])[0]   # "source" or "sink"
+                dev_name = _up.unquote(qs.get("name",[""])[0])
+                result   = {"ok": False, "msg": ""}
+                try:
+                    if dev_type == "sink" and dev_name:
+                        subprocess.run(["pactl","set-default-sink", dev_name],
+                                        check=True, capture_output=True)
+                        # Ensure the new sink has an audible volume — speaker-cal safety
+                        # resets all sinks to 1%, which would leave it inaudible.
+                        # Apply saved calibration levels, or minimum safe if unknown
+                        _known = _apply_device_cal(dev_name)
+                        log.info("HTTP device-set: default sink → %s (%s)",
+                                 dev_name, "calibrated" if _known else "new/unknown → minimum")
+                        result["ok"]  = True
+                        result["msg"] = (
+                            f"Speaker set to {dev_name}. "
+                            + ("Restored calibrated levels. " if _known
+                               else "New device — starting at minimum. Use Manual adjustment. ")
+                            + "Restarting audio…"
+                        )
+                    elif dev_type == "source" and dev_name:
+                        subprocess.run(["pactl","set-default-source", dev_name],
+                                        check=True, capture_output=True)
+                        # Tune gain/gate for the selected mic type
+                        g = globals()
+                        if dev_name == AGC_SOURCE_NAME:
+                            g['MIC_GAIN'] = AGC_MIC_GAIN
+                            g['MIC_GATE_PEAK'] = AGC_MIC_GATE
+                            # Clear explicit input-source so AGC re-activates on restart
+                            _update_service_input_source("")
+                        else:
+                            # Direct source: moderate gain/gate, user can recalibrate mic
+                            g['MIC_GAIN'] = 6.0
+                            g['MIC_GATE_PEAK'] = 200
+                            g['RAW_MIC_SOURCE'] = dev_name
+                            # Persist choice so daemon restart doesn't revert to AGC
+                            _update_service_input_source(dev_name)
+                        _mic_gate_ref[0] = g['MIC_GATE_PEAK']
+                        log.info("HTTP device-set: default source → %s gain=%.1f gate=%d",
+                                 dev_name, g['MIC_GAIN'], g['MIC_GATE_PEAK'])
+                        result["ok"]  = True
+                        result["msg"] = (f"Mic set to {dev_name} "
+                                         f"(gain {g['MIC_GAIN']}x gate {g['MIC_GATE_PEAK']}). "
+                                         "Restarting audio…")
+                    else:
+                        result["msg"] = "Missing type or name"
+                    if result["ok"]:
+                        # Restart daemon so new defaults are picked up by sd.InputStream
+                        threading.Thread(target=lambda: (
+                            __import__("time").sleep(0.5),
+                            __import__("subprocess").run(
+                                ["systemctl","--user","restart","openclaw-realtimetalk"])
+                        ), daemon=True).start()
+                except Exception as e:
+                    result["msg"] = str(e)
+                resp = _json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
@@ -2194,15 +2537,17 @@ setInterval(upd, 2000);
                 import json as _json, re as _re6
                 _headset_cal_loop[0] = False
                 ds = _get_device_status()
-                # Persist to service file
                 _update_service_alsa_output(ds["speaker_alsa"])
-                sink = _find_usb_speaker_sink()
+                # Always use the PipeWire default sink (currently selected speaker)
+                sink = subprocess.run(["pactl","get-default-sink"],
+                                      capture_output=True,text=True).stdout.strip()
                 if sink:
                     cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
                                              capture_output=True, text=True).stdout
                     m = _re6.search(r'(\d+)%', cur_out)
                     pw = int(m.group(1)) if m else 50
-                    _update_service_gate(pw)   # reuse gate update pattern for mic-gate; actually store vol
+                    # Save to per-device calibration store
+                    _save_device_cal(sink, pw, _cal_sw_volume)
                 log.info("Headset cal: saved level PW=%s SW=%d%%", ds["spk_vol"], ds["sw_pct"])
                 # Announce
                 if sess:
@@ -2249,10 +2594,16 @@ setInterval(upd, 2000);
                     if sess:
                         import threading as _t
                         def _announce_change():
-                            _safe_volume_new_sinks(1)   # PipeWire at 1%
+                            _safe_volume_new_sinks(1)   # PipeWire at 1% safety reset
                             import time as _time; _time.sleep(0.5)
-                            # Extra software attenuation on top: 1% × 5% = 0.05% of full scale
-                            speak(msg, sess.alsa_output, volume=NEW_DEVICE_VOLUME)
+                            # Apply saved calibration for the new default sink
+                            # (or minimum safe if unknown device)
+                            _cur_sink = subprocess.run(
+                                ["pactl","get-default-sink"],
+                                capture_output=True,text=True).stdout.strip()
+                            if _cur_sink:
+                                _apply_device_cal(_cur_sink)
+                            speak(msg, sess.alsa_output, volume=_cal_sw_volume)
                         _t.Thread(target=_announce_change, daemon=True).start()
 
                 if _device_change_msg[0]:
@@ -2461,6 +2812,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="OpenClaw RealTimeTalk daemon")
     p.add_argument("--http-port",      type=int, default=DEFAULT_HTTP_PORT,
                    help=f"HTTP toggle port (default {DEFAULT_HTTP_PORT})")
+    p.add_argument("--input-source",   type=str, default=None,
+                   help="PipeWire source name to use as mic (overrides AGC auto-select)")
     p.add_argument("--input-device",   type=int, default=None,
                    help="sounddevice input device index (see --list-devices)")
     p.add_argument("--alsa-output",    type=str, default=ALSA_OUTPUT,
@@ -2489,7 +2842,15 @@ if __name__ == "__main__":
 
     MIC_GAIN      = args.mic_gain
     MIC_GATE_PEAK = args.mic_gate
-    if _activate_agc_source():
+    if args.input_source:
+        # User explicitly chose a physical mic — set it as PipeWire default
+        # and use direct (non-AGC) gain/gate settings.
+        _set_default_source(args.input_source)
+        MIC_GAIN      = 6.0
+        MIC_GATE_PEAK = max(MIC_GATE_MIN, args.mic_gate)
+        log.info("Explicit --input-source %s — direct mode gain=%.1f gate=%d",
+                 args.input_source, MIC_GAIN, MIC_GATE_PEAK)
+    elif _activate_agc_source():
         MIC_GAIN      = AGC_MIC_GAIN
         MIC_GATE_PEAK = AGC_MIC_GATE
         log.info("WebRTC AGC source active (%s) — adaptive gain/noise on; "
@@ -2499,6 +2860,15 @@ if __name__ == "__main__":
         log.info("AGC source unavailable — fallback to static gain=%.1f "
                  "gate=%d", MIC_GAIN, MIC_GATE_PEAK)
     _mic_gate_ref[0] = MIC_GATE_PEAK
+
+    # Load per-device calibration store and apply to current default sink
+    _load_cal_store()
+    _default_sink = subprocess.run(["pactl","get-default-sink"],
+                                   capture_output=True,text=True).stdout.strip()
+    if _default_sink:
+        _known = _apply_device_cal(_default_sink)
+        if not _known:
+            log.info("Unknown speaker at startup — using minimum safe levels")
 
     asyncio.run(main(
         args.http_port,
