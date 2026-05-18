@@ -1827,8 +1827,10 @@ button{{padding:7px 14px;border:none;color:#fff;border-radius:6px;font-size:13px
 #devmsg{{font-size:13px;color:#fa0;}}
 a{{color:#7af;font-size:14px;}}
 </style></head><body>
-<h3>Calibration</h3>
-
+<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">
+  <h3 style="margin:0;">Calibration</h3>
+  <a href="/dashboard" style="font-size:13px;color:#7af;">← Dashboard</a>
+</div>
 <div class="devpanel" id="curdev">
   <b>Mic:</b> {ds["mic"]} &nbsp;|&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;|&nbsp; Gain: {ds["gain"]}x<br>
   <b>Speaker:</b> {ds["speaker_name"]} &nbsp;|&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;|&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span>
