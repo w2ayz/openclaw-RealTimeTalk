@@ -752,6 +752,58 @@ def _agc_source_available() -> bool:
         return False
 
 
+def _update_agc_capture_source(physical_source: str) -> bool:
+    """Redirect the WebRTC AGC module to capture from a different physical mic.
+
+    Updates the PipeWire config file and hot-swaps the echo-cancel module
+    (no PipeWire restart needed). AGC remains the daemon's default source;
+    only the underlying hardware input changes.
+    """
+    import re as _re7
+    config = os.path.expanduser(
+        "~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
+    try:
+        with open(config) as f:
+            content = f.read()
+        content = _re7.sub(
+            r'target\.object\s*=\s*"[^"]*"',
+            f'target.object = "{physical_source}"',
+            content,
+        )
+        with open(config, "w") as f:
+            f.write(content)
+        # Update RAW_MIC_SOURCE so speaker-cal captures from the right mic
+        globals()['RAW_MIC_SOURCE'] = physical_source
+        # Hot-swap: unload old echo-cancel module, load new one
+        mods = subprocess.run(["pactl", "list", "short", "modules"],
+                              capture_output=True, text=True).stdout
+        for line in mods.splitlines():
+            if "echo-cancel" in line:
+                mid = line.split()[0]
+                subprocess.run(["pactl", "unload-module", mid],
+                               capture_output=True)
+        import time as _t2; _t2.sleep(0.5)
+        subprocess.run([
+            "pactl", "load-module", "module-echo-cancel",
+            "aec_method=webrtc",
+            f"source_name={AGC_SOURCE_NAME}",
+            f"source_master={physical_source}",
+            "sink_name=rtt_agc_sink",
+            ('aec_args=webrtc.gain_control=1 webrtc.noise_suppression=1 '
+             'webrtc.high_pass_filter=1 webrtc.voice_detection=1 '
+             'webrtc.extended_filter=1 webrtc.transient_suppression=1'),
+        ], capture_output=True)
+        _t2.sleep(0.5)
+        subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME],
+                       capture_output=True)
+        log.info("AGC capture redirected to %s (AGC still active as default)",
+                 physical_source)
+        return True
+    except Exception as e:
+        log.warning("Could not redirect AGC capture: %s", e)
+        return False
+
+
 def _activate_agc_source() -> bool:
     """Make the WebRTC AGC source the PipeWire default if it exists.
 
@@ -1024,7 +1076,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     if not clean:
         return
     segments = _split_by_script(clean)
-    # Prepend silence to wake USB speakers from low-power state (0 = skip for loops)
+    # Pad playback so USB/PipeWire sinks do not clip the first or last phoneme.
     import wave as _wave, struct as _struct
     wav_parts: list[str] = []
     if silence_ms > 0:
@@ -1048,6 +1100,13 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                           result.stderr.decode(errors="replace")[:120])
                 continue
             wav_parts.append(part_path)
+
+        if silence_ms > 0 and len(wav_parts) > 1:
+            tail_silence_path = tempfile.mktemp(suffix=".wav")
+            with _wave.open(tail_silence_path, 'wb') as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
+                wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
+            wav_parts.append(tail_silence_path)
 
         if not wav_parts:
             return
@@ -1608,7 +1667,7 @@ class RealtimeSession:
                             "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                             "turn_detection": {
                                 "type":                "server_vad",
-                                "threshold":           0.6,   # raised: AGC normalises speech so 0.6 reliably catches voice but ignores background noise
+                                "threshold":           0.45,  # AGC normalises speech; 0.45 is sensitive enough to catch all speech while noise suppression prevents false triggers
                                 "prefix_padding_ms":   300,   # capture sentence lead-in ("Five,…")
                                 # WebRTC AGC noise-suppression turns brief
                                 # inter-word gaps into hard silence; 600ms ended
@@ -2486,29 +2545,34 @@ setInterval(upd, 2000);
                             + "Restarting audio…"
                         )
                     elif dev_type == "source" and dev_name:
-                        subprocess.run(["pactl","set-default-source", dev_name],
-                                        check=True, capture_output=True)
-                        # Tune gain/gate for the selected mic type
-                        g = globals()
+                        # AGC is always the daemon's default source.
+                        # Selecting a physical mic redirects AGC to capture
+                        # from it — AGC never gets bypassed.
                         if dev_name == AGC_SOURCE_NAME:
-                            g['MIC_GAIN'] = AGC_MIC_GAIN
-                            g['MIC_GATE_PEAK'] = AGC_MIC_GATE
-                            # Clear explicit input-source so AGC re-activates on restart
-                            _update_service_input_source("")
+                            # User picked the AGC source explicitly — no change needed
+                            subprocess.run(["pactl","set-default-source", AGC_SOURCE_NAME],
+                                           capture_output=True)
+                            log.info("HTTP device-set: AGC source confirmed as default")
+                            result["ok"]  = True
+                            result["msg"] = "AGC mic is already active. No change needed."
                         else:
-                            # Direct source: moderate gain/gate, user can recalibrate mic
-                            g['MIC_GAIN'] = 6.0
-                            g['MIC_GATE_PEAK'] = 200
-                            g['RAW_MIC_SOURCE'] = dev_name
-                            # Persist choice so daemon restart doesn't revert to AGC
-                            _update_service_input_source(dev_name)
-                        _mic_gate_ref[0] = g['MIC_GATE_PEAK']
-                        log.info("HTTP device-set: default source → %s gain=%.1f gate=%d",
-                                 dev_name, g['MIC_GAIN'], g['MIC_GATE_PEAK'])
-                        result["ok"]  = True
-                        result["msg"] = (f"Mic set to {dev_name} "
-                                         f"(gain {g['MIC_GAIN']}x gate {g['MIC_GATE_PEAK']}). "
-                                         "Restarting audio…")
+                            # Redirect AGC to capture from the chosen physical mic
+                            ok = _update_agc_capture_source(dev_name)
+                            # AGC gain/gate always applies (AGC normalises)
+                            g = globals()
+                            g['MIC_GAIN']      = AGC_MIC_GAIN
+                            g['MIC_GATE_PEAK'] = AGC_MIC_GATE
+                            _mic_gate_ref[0]   = AGC_MIC_GATE
+                            # Clear any --input-source override so AGC stays active on restart
+                            _update_service_input_source("")
+                            log.info("HTTP device-set: AGC redirected to %s", dev_name)
+                            result["ok"]  = True
+                            result["msg"] = (
+                                f"AGC mic redirected to {dev_name}. "
+                                "WebRTC AGC still active. Restarting audio…"
+                                if ok else
+                                f"Could not redirect AGC — check PipeWire. Restarting…"
+                            )
                     else:
                         result["msg"] = "Missing type or name"
                     if result["ok"]:
