@@ -2520,7 +2520,7 @@ function setCalMode(mode){{
   fetch('/cal-mode?mode='+mode).then(()=>location.reload());
 }}
 setInterval(function(){{
-  fetch('/device-status').then(function(r){{return r.json();}}).then(function(d){{
+  fetch('/speaker-cal/vol').then(function(r){{return r.json();}}).then(function(d){{
     var f=function(id,v){{var e=document.getElementById(id);if(e)e.textContent=v;}};
     f('panelspk', d.speaker_name);
     f('panelmic', d.mic);
@@ -3242,7 +3242,7 @@ setInterval(function(){{
   }});
 }},500);
 setInterval(function(){{
-  fetch('/device-status').then(function(r){{return r.json();}}).then(function(d){{
+  fetch('/speaker-cal/vol').then(function(r){{return r.json();}}).then(function(d){{
     var dp=document.getElementById('dp');
     if(dp) dp.innerHTML='&#127908; '+d.mic+' &ensp;&#128266; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
   }}).catch(function(){{}});
