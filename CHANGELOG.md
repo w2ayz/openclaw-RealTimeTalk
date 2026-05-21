@@ -1,5 +1,62 @@
 # Changelog
 
+## v1.8.0 — 2026-05-21
+
+Mac-version ports, complete UI redesign, acoustic self-interrupt fix, noise hallucination filters.
+
+### Added
+
+- **Acoustic coupling-based TTS self-interrupt guard.** `speak()` loads the WAV PCM, plays the first 1 s while simultaneously recording from the mic, and measures the ratio `coupling = guard_max_mic / guard_max_out`. The interrupt threshold is then set to `output_peak × coupling × 1.8` — proportional to room acoustics rather than a fixed constant. This eliminates false self-interrupts on loud speakers and avoids premature threshold exceedance on quiet ones. Ported from Mac version.
+
+- **`interruptible` parameter on `speak()`.** Only Five's main reply is `interruptible=True`; all system announcements (volume confirmations, status messages) are protected from the acoustic interrupt guard.
+
+- **`_post_busy_until` echo gate.** After TTS completes, `_mic_cb` ignores all audio for 300 ms, preventing the tail-end speaker echo from triggering a new transcript.
+
+- **`/continue` HTTP route.** Resumes paused TTS mid-sentence via `_resume_from_http()`.
+
+- **`/gateway-reset` HTTP route.** Drops and reconnects the OpenClaw WebSocket without restarting the daemon.
+
+- **MONITOR_ON/OFF_PHRASES and CONTINUE_PHRASES** — wake-phrase sets for voice-activated monitoring toggle and TTS resume.
+
+- **WAKE_PHRASES expanded** — Chinese/Cantonese variants ("五醒醒", "五你好", "喂五", etc.) and "wake up five".
+
+- **Empty reply guard.** When the gateway history fallback returns an empty string, `speak()` voices "Sorry, I didn't get a response." instead of silently doing nothing.
+
+- **Noise hallucination filters (layered):**
+  - `langdetect` word threshold lowered from ≥ 3 to ≥ 2 — catches 2-word foreign phrases (e.g. Dutch "naar voren").
+  - Short-word noise guard: single transcribed word < 6 chars not in `_SHORT_CMDS` set → dropped before routing to Five.
+  - Existing script-level Unicode rejection (Arabic / Japanese / Korean / Cyrillic) unchanged.
+
+- **CJK↔Latin boundary splitting in `_normalize`.** Regex inserts spaces at CJK↔ASCII transitions so mixed phrases like "我係wake up" tokenise correctly for wake-phrase matching.
+
+- **`_read_raw_mic_from_agc_config()`.** Reads `target.object` from PipeWire AGC config file (`99-rtt-agc.conf`) at startup to initialise `RAW_MIC_SOURCE`. Mic selection made in the calibration UI persists across daemon restarts.
+
+- **Per-device calibration persistence for manual ±adjustments.** `/speaker-cal/adjust` now calls `_save_device_cal()` after every step, not only on explicit save. Ensures levels survive a daemon restart even if the user never pressed Save.
+
+- **Mac-style dashboard UI.** Complete redesign:
+  - Fonts: Outfit (body) + JetBrains Mono (brand / timestamps) via Google Fonts CDN.
+  - Dark design system — `#07090f` background, `#0d1119` surface, CSS custom properties throughout.
+  - Header: brand pill → state badge → Calibrate button.
+  - State badge is color-coded per state: ACTIVE `#34d399`, SILENT `#64748b`, THINKING `#f59e0b`, SPEAKING `#2dd4bf`, PAUSED `#a5b4fc`, MONITORING `#60a5fa`.
+  - Nav buttons: rounded pill style with hover edge-highlight (box-shadow glow on pointer entry).
+  - Device bar: compact single line including `Eff%` (Vol × SW effective percent).
+  - Conversation rows: full-width colored bands newest-first; You `#38bdf8 / #051928`, Five `#f59e0b / #130e02`, Monitor `#a78bfa / #0e0820`.
+  - Speaking / Paused banner with inline Stop / Continue buttons.
+  - Microphone table uses `RAW_MIC_SOURCE` for Active detection instead of PipeWire RUNNING state (both mics showed Running under AGC-always-on design).
+  - Timestamp color changed from `#253344` to `#5a7088` — readable against dark background.
+
+- **Mac-style calibration UI.** Same design system: accent blue section headers, tab-style cal-mode selector, `Eff:` display, pill buttons with hover glow.
+
+### Fixed
+
+- **Gateway crash on retryable error.** `connect()` previously raised a bare `RuntimeError` when the gateway returned `retryable: true`, which was not caught by the outer retry loop (`except ConnectionRefusedError / OSError`). Fixed by re-raising as `ConnectionRefusedError` when `err.get("retryable")` is true.
+
+- **Thinking counter stuck after voice interrupt.** The `CancelledError` path in `_handle_transcript` did not log the final `_log_entry("five", "")`, leaving the thinking spinner running on the dashboard. Fixed.
+
+- **History fetch limit.** Increased to accommodate longer codex-harness reply extraction.
+
+---
+
 ## v1.3 — 2026-05-14
 
 End-to-end voice working on the Pi. Fixes for the OpenAI Realtime API GA changes,
