@@ -2530,7 +2530,7 @@ setInterval(function(){{
     f('panelgate',d.gate);
     f('panelgain',d.gain);
   }}).catch(function(){{}});
-}}, 5000);
+}}, 2000);
 </script></body></html>"""
                 _html(self, 200, body)
             elif self.path.startswith("/cal-mode"):
