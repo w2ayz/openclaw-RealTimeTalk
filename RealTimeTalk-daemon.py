@@ -2284,8 +2284,8 @@ a:hover{{text-decoration:underline;}}
   <a href="/dashboard" class="back">&#8592; Dashboard</a>
 </div>
 <div class="devpanel" id="curdev">
-  <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
+  <b>Mic:</b> <span id="panelmic">{ds["mic"]}</span> &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: <span id="panelgain">{ds["gain"]}</span>x<br>
+  <b>Speaker:</b> <span id="panelspk">{ds["speaker_name"]}</span> &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
@@ -2519,6 +2519,18 @@ if(sessionStorage.getItem('devExpanded')){{
 function setCalMode(mode){{
   fetch('/cal-mode?mode='+mode).then(()=>location.reload());
 }}
+setInterval(function(){{
+  fetch('/device-status').then(function(r){{return r.json();}}).then(function(d){{
+    var f=function(id,v){{var e=document.getElementById(id);if(e)e.textContent=v;}};
+    f('panelspk', d.speaker_name);
+    f('panelmic', d.mic);
+    f('panelvol', d.spk_vol);
+    f('panelsw',  d.sw_pct+'%');
+    f('paneleff', d.effective_pct+'%');
+    f('panelgate',d.gate);
+    f('panelgain',d.gain);
+  }}).catch(function(){{}});
+}}, 5000);
 </script></body></html>"""
                 _html(self, 200, body)
             elif self.path.startswith("/cal-mode"):
@@ -3229,6 +3241,12 @@ setInterval(function(){{
     el.textContent=Math.max(0,Math.floor(now-parseFloat(el.dataset.start)));
   }});
 }},500);
+setInterval(function(){{
+  fetch('/device-status').then(function(r){{return r.json();}}).then(function(d){{
+    var dp=document.getElementById('dp');
+    if(dp) dp.innerHTML='&#127908; '+d.mic+' &ensp;&#128266; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
+  }}).catch(function(){{}});
+}}, 5000);
 </script>
 </body></html>"""
                 _html(self, 200, body)
