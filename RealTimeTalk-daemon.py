@@ -23,6 +23,8 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
+__version__ = "1.8.0"
+
 import argparse
 import asyncio
 import base64
@@ -46,6 +48,12 @@ try:
     from zhconv import convert as _zh_convert   # traditional → simplified
 except Exception:                                # pragma: no cover
     _zh_convert = None
+
+try:
+    from langdetect import detect as _langdetect, LangDetectException as _LangDetectException
+    _HAVE_LANGDETECT = True
+except ImportError:
+    _HAVE_LANGDETECT = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -89,10 +97,22 @@ MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a heads
 AGC_SOURCE_NAME   = "rtt_agc_source"
 AGC_MIC_GAIN      = 2.0          # AGC already normalizes; light trim only
 AGC_MIC_GATE      = 60           # AGC+NS clean the signal; gate only residual
-# Raw C-Media mic — speaker calibration must measure through this directly,
-# NOT the AGC source (WebRTC noise-suppression kills the steady 440 Hz test
-# tone and AGC distorts level → calibration impossible through AGC).
-RAW_MIC_SOURCE    = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
+# Raw physical mic that AGC captures from. Read from the PipeWire AGC config
+# so the user's mic selection (via device picker) survives daemon restarts.
+def _read_raw_mic_from_agc_config() -> str:
+    """Read target.object from the PipeWire AGC config file."""
+    import re as _re_mc
+    _agc_conf = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
+    try:
+        with open(_agc_conf) as _f:
+            _m = _re_mc.search(r'target\.object\s*=\s*"([^"]+)"', _f.read())
+            if _m:
+                return _m.group(1)
+    except Exception:
+        pass
+    return "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
+
+RAW_MIC_SOURCE = _read_raw_mic_from_agc_config()
 NEW_DEVICE_VOLUME = 0.05         # software attenuation for new-speaker announcement (5% of signal)
                                  # combined with PipeWire 1% = ~0.05% of full scale
 # When mic-leakage calibration can't measure a level (mic can't hear the
@@ -274,6 +294,12 @@ def _get_device_status() -> dict:
     result["sw_pct"] = int(_cal_sw_volume * 100)
     result["gate"]   = _mic_gate_ref[0]
     result["gain"]   = MIC_GAIN
+    # Effective volume = PipeWire% × SW (combined attenuation visible to speaker)
+    try:
+        _pct = int(result["spk_vol"].rstrip("%")) if isinstance(result["spk_vol"], str) else 0
+        result["effective_pct"] = int(_pct * _cal_sw_volume)
+    except Exception:
+        result["effective_pct"] = 0
     return result
 
 
@@ -314,6 +340,12 @@ _audio_fingerprint = [_get_audio_fingerprint()]   # [0] = last known state
 _device_change_msg = [""]                          # [0] = pending announcement or ""
 _speaker_cal_result: dict = {}                     # last calibration result
 _cal_mode_override = [None]  # None=auto-detect, "headset"=force headset, "speaker"=force speaker
+_paused_speech:       list = [None]   # (clean_text, alsa_output) saved when TTS is interrupted; None otherwise
+_http_interrupt:      list = [False]  # set by /interrupt to cut TTS mid-playback
+_last_mic_cb:         list = [0.0]    # epoch of last _mic_cb call — used for hot-plug detection
+_post_busy_until:     list = [0.0]    # timestamp: mic sends silence until this time after TTS ends
+_is_speaking:         list = [False]  # True while speak() is playing audio
+_current_think_task:  list = [None]   # asyncio.Task for current gw.ask(); cancelled by /interrupt
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -627,8 +659,16 @@ CALIBRATE_PHRASES = {
     "adjust mic for noise", "adjust microphone for noise",
 }
 
-WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on"}
-SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off"}
+WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on",
+                 "five 醒来", "five 醒", "five 开始", "wake up five", "wake up 5"}
+SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
+                 "five 睡觉", "five 休息", "five 停", "sleep five"}
+MONITOR_ON_PHRASES  = {"five start monitoring", "start monitoring", "five monitor on",
+                       "monitor on", "five monitoring on"}
+MONITOR_OFF_PHRASES = {"five stop monitoring", "stop monitoring", "five monitor off",
+                       "monitor off", "five monitoring off"}
+CONTINUE_PHRASES    = {"continue", "five continue", "please continue", "go on", "go ahead",
+                       "keep going", "继续", "继续说", "你继续", "请继续"}
 
 def _is_english_or_chinese(text: str) -> bool:
     """Return True only if the transcript appears to be English or Chinese.
@@ -659,12 +699,26 @@ def _is_english_or_chinese(text: str) -> bool:
             continue
         # Anything else (accented Latin for German/French/etc.) → reject
         return False
+    # Pure ASCII — use langdetect on ≥2-word texts to catch other Latin-script
+    # languages (French, Dutch, German, etc.) that GPT-4o hallucinates.
+    # Threshold is 2 (not 3) so short phrases like "naar voren" are still caught.
+    if _HAVE_LANGDETECT and len(text.split()) >= 2:
+        try:
+            lang = _langdetect(text)
+            if lang not in ("en", "zh-cn", "zh-tw"):
+                log.info("langdetect rejected %r as %r", text[:60], lang)
+                return False
+        except _LangDetectException:
+            pass  # inconclusive — let it through
     return True
 
 def _normalize(text: str) -> str:
     import string
     t = text.strip().lower()
     t = t.translate(str.maketrans(string.punctuation, " " * len(string.punctuation)))
+    # Insert space at CJK↔Latin boundaries so "我係wake" → "我係 wake"
+    t = re.sub(r'([一-鿿㐀-䶿])([a-zA-Z0-9])', r'\1 \2', t)
+    t = re.sub(r'([a-zA-Z0-9])([一-鿿㐀-䶿])', r'\1 \2', t)
     # treat digit "5" as "five"
     t = re.sub(r'\b5\b', 'five', t)
     return " ".join(t.split())
@@ -1060,8 +1114,11 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
 
     return [(s, l) for s, l in segments if s]
 
-def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300):
+def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
+          resumable: bool = False, interruptible: bool = False):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
+    # resumable=True: if interrupted, save (text, alsa_output) to _paused_speech for /continue
+    # interruptible=True: enable user-voice interrupt detection (only for Five's main reply)
     """Synthesise text with Piper and play via aplay.
 
     Writes text to a temp file and runs Piper with `-i <file>` rather than piping
@@ -1141,29 +1198,83 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         with _mic_level_lock:
             baseline_peak = _mic_level_current[0]
 
-        # Play via Popen — interruptible if user speaks mid-sentence.
-        # _monitor_and_play polls mic every 50ms; if speech peaks are sustained
-        # above the interrupt threshold, it kills aplay immediately.
+        # Load output PCM for coupling measurement (Mac-style acoustic coupling).
+        # The coupling ratio (mic_peak / output_peak) scales the interrupt threshold
+        # to the actual room acoustics — tight headset → high threshold, separate
+        # mic/speaker → lower threshold, always above SPEAK_INTERRUPT_PEAK floor.
+        import wave as _wpcm
+        try:
+            with _wpcm.open(final_wav, 'rb') as _wf:
+                _sr = _wf.getframerate()
+                _final_pcm = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
+        except Exception:
+            _final_pcm = np.array([], dtype=np.int16)
+            _sr = PIPER_SAMPLE_RATE
+        _output_peak   = int(np.max(np.abs(_final_pcm))) if len(_final_pcm) else 0
+        _TICK_SAMPLES  = max(1, _sr * 50 // 1000)   # samples per 50ms tick
+        _GUARD_TICKS   = 20                          # 1s guard: 300ms silence + 700ms audio
+        _SAFETY        = 1.8                         # threshold = echo × 1.8
+
         mic_peaks_during: list[int] = []
         _interrupted   = [False]
         _aplay_rc      = [0]
 
         def _monitor_and_play(cmd):
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
-            consec = 0
+            consec      = 0
+            guard       = _GUARD_TICKS
+            guard_max_out = 0   # peak output PCM during guard
+            guard_max_mic = 0   # peak mic echo during guard
+            interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
+            tick_idx    = 0
             while True:
                 try:
                     _aplay_rc[0] = proc.wait(timeout=0.05)
-                    break                    # finished normally
+                    break
                 except subprocess.TimeoutExpired:
                     pass
                 with _mic_level_lock:
                     p = _mic_level_current[0]
                 mic_peaks_during.append(p)
-                if p > max(baseline_peak * 15, SPEAK_INTERRUPT_PEAK):
+
+                if guard > 0:
+                    # Measure output PCM for this tick to compute coupling
+                    s0 = tick_idx * _TICK_SAMPLES
+                    s1 = s0 + _TICK_SAMPLES
+                    if len(_final_pcm) and s1 <= len(_final_pcm):
+                        tick_out = int(np.max(np.abs(_final_pcm[s0:s1])))
+                        if tick_out > guard_max_out:
+                            guard_max_out = tick_out
+                    if p > guard_max_mic:
+                        guard_max_mic = p
+                    tick_idx += 1
+                    guard -= 1
+                    if guard == 0:
+                        if guard_max_out > 200:
+                            coupling = guard_max_mic / guard_max_out
+                            interrupt_threshold[0] = max(
+                                int(_output_peak * coupling * _SAFETY),
+                                SPEAK_INTERRUPT_PEAK,
+                            )
+                            log.info("TTS coupling=%.3f echo=%d out=%d → threshold=%d",
+                                     coupling, guard_max_mic, guard_max_out,
+                                     interrupt_threshold[0])
+                        else:
+                            log.info("TTS no coupling data → threshold=%d (floor)",
+                                     interrupt_threshold[0])
+                    continue
+
+                if _http_interrupt[0]:
+                    _http_interrupt[0] = False
+                    _interrupted[0] = True
+                    try: proc.kill()
+                    except Exception: pass
+                    break
+                if p > interrupt_threshold[0]:
                     consec += 1
                     if consec >= SPEAK_INTERRUPT_BLOCKS:
-                        log.info("Speech interrupt — stopping TTS")
+                        log.info("Speech interrupt — stopping TTS (peak=%d thr=%d)",
+                                 p, interrupt_threshold[0])
                         _interrupted[0] = True
                         try: proc.kill()
                         except Exception: pass
@@ -1171,15 +1282,31 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 else:
                     consec = 0
 
-        _m = _threading.Thread(daemon=True, target=_monitor_and_play,
-                               args=(["aplay", "-D", alsa_output, "-q", final_wav],))
-        _m.start(); _m.join()
+        _is_speaking[0] = True
+        if interruptible:
+            _m = _threading.Thread(daemon=True, target=_monitor_and_play,
+                                   args=(["aplay", "-D", alsa_output, "-q", final_wav],))
+            _m.start(); _m.join()
+            if not _interrupted[0] and _aplay_rc[0] != 0 and alsa_output != "pulse":
+                log.warning("aplay failed on %s, retrying via pulse", alsa_output)
+                _m2 = _threading.Thread(daemon=True, target=_monitor_and_play,
+                                        args=(["aplay", "-D", "pulse", "-q", final_wav],))
+                _m2.start(); _m2.join()
+        else:
+            # Non-interruptible: play to completion, no interrupt monitor
+            rc = subprocess.call(["aplay", "-D", alsa_output, "-q", final_wav],
+                                 stderr=subprocess.DEVNULL)
+            if rc != 0 and alsa_output != "pulse":
+                subprocess.call(["aplay", "-D", "pulse", "-q", final_wav],
+                                stderr=subprocess.DEVNULL)
+        _is_speaking[0] = False
 
-        if not _interrupted[0] and _aplay_rc[0] != 0 and alsa_output != "pulse":
-            log.warning("aplay failed on %s, retrying via pulse", alsa_output)
-            _m2 = _threading.Thread(daemon=True, target=_monitor_and_play,
-                                    args=(["aplay", "-D", "pulse", "-q", final_wav],))
-            _m2.start(); _m2.join()
+        # Save text for /continue if interrupted mid-sentence; clear on normal finish.
+        if _interrupted[0] and resumable:
+            _paused_speech[0] = (strip_markdown(text), alsa_output)
+            log.info("TTS interrupted — saved %d chars for /continue", len(strip_markdown(text)))
+        elif not _interrupted[0]:
+            _paused_speech[0] = None
 
         # Auto-reduce: only fire on genuinely loud bleed (20× baseline AND >2000
         # absolute). With WebRTC AGC the baseline is near-zero so the old 5×/500
@@ -1215,6 +1342,11 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     except Exception as e:
         log.error("speak() error: %s", e)
     finally:
+        _is_speaking[0] = False
+        # Always gate the mic after TTS so room echo doesn't get transcribed,
+        # regardless of whether _busy is managed by the caller.
+        import time as _t_sp
+        _post_busy_until[0] = _t_sp.time() + 0.6
         for p in wav_parts:
             try: os.unlink(p)
             except FileNotFoundError: pass
@@ -1263,6 +1395,9 @@ class GatewayClient:
         }))
         hello = json.loads(await self._ws.recv())
         if not hello.get("ok"):
+            err = hello.get("error") or {}
+            if err.get("retryable"):
+                raise ConnectionRefusedError(err.get("message", "gateway not ready"))
             raise RuntimeError(f"Gateway connect failed: {hello.get('error')}")
         scopes = hello.get("payload", {}).get("auth", {}).get("scopes", [])
         log.info("OpenClaw gateway connected (scopes: %s)", scopes)
@@ -1363,8 +1498,18 @@ class GatewayClient:
         # Codex harness delivers replies via the `message` tool, not chat
         # content — the chat-final event is empty. Pull the reply from
         # chat.history where the message-tool call arguments are persisted.
-        if not text:
-            await asyncio.sleep(0.6)  # let message-tool result persist
+        # Also catch short gateway status tokens ("Sent.", "Done.", "OK", etc.)
+        # that surface as the chat-final text instead of the real reply.
+        _stripped = (text or "").strip().rstrip(".")
+        _is_status_token = (
+            len(text or "") < 25
+            and _stripped.lower() in ("sent", "ok", "done", "error", "failed",
+                                      "accepted", "received")
+        )
+        if not text or _is_status_token:
+            if _is_status_token:
+                log.info("Status token %r — fetching reply from history", text)
+            await asyncio.sleep(1.2)  # let message-tool result fully persist
             text = await self._reply_from_history(session_key)
         return text
 
@@ -1381,7 +1526,7 @@ class GatewayClient:
         try:
             await self._ws.send(json.dumps({
                 "type": "req", "id": hid, "method": "chat.history",
-                "params": {"sessionKey": session_key, "limit": 8},
+                "params": {"sessionKey": session_key, "limit": 12},
             }))
             resp = await asyncio.wait_for(hfut, timeout=10)
         except (asyncio.TimeoutError, Exception) as e:
@@ -1446,8 +1591,11 @@ class RealtimeSession:
         self._active      = False             # start silent; wake phrase enables voice
         self._monitoring  = False             # passive capture-only mode (no Five, no TTS)
         self._multilang   = False             # False = only show/process EN/ZH
+        self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
 
     def _mic_cb(self, indata, frames, time_info, status):
+        import time as _tcb
+        _last_mic_cb[0] = _tcb.time()
         raw = indata[::RESAMPLE_RATIO, 0]
         raw_peak = int(np.max(np.abs(raw)))
         with _mic_level_lock:
@@ -1456,8 +1604,9 @@ class RealtimeSession:
         if self._calibrating:
             self.loop.call_soon_threadsafe(self._cal_peaks.append, raw_peak)
             return
-        if self._busy.is_set():
-            return  # discard mic input while Five is speaking to prevent feedback
+        import time as _tcb2
+        if self._busy.is_set() or _tcb2.time() < _post_busy_until[0]:
+            return  # discard mic input while Five is speaking or during echo gate
         if raw_peak < MIC_GATE_PEAK:
             out_arr = np.zeros_like(raw)
         else:
@@ -1470,6 +1619,64 @@ class RealtimeSession:
             self._mic_q.put_nowait(data)
         except asyncio.QueueFull:
             pass
+
+    async def _watch_mic_stream(self):
+        """Detect USB mic hot-unplug and reopen the stream when replugged."""
+        import time as _wm
+        await asyncio.sleep(5.0)   # let stream settle before watching
+        while not self.stop_event.is_set():
+            await asyncio.sleep(2.0)
+            if self.stop_event.is_set():
+                break
+            elapsed = _wm.time() - _last_mic_cb[0]
+            if elapsed < 4.0:
+                continue
+            log.warning("Mic silent %.1fs — hot-plug recovery starting", elapsed)
+            old = self._mic_stream_ref[0]
+            try:
+                if old:
+                    old.stop()
+                    old.close()
+            except Exception:
+                pass
+            self._mic_stream_ref[0] = None
+            # PortAudio caches device list at init — need terminate + reinitialize to see new device
+            await asyncio.sleep(1.5)
+            try:
+                sd._terminate()
+                sd._initialize()
+                log.info("PortAudio reinitialized for hot-plug")
+            except Exception as e:
+                log.warning("PortAudio reinit error: %s", e)
+            try:
+                new_stream = sd.InputStream(
+                    samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
+                    blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
+                    device=self.input_device,
+                )
+                new_stream.start()
+                self._mic_stream_ref[0] = new_stream
+                _last_mic_cb[0] = _wm.time()
+                log.info("Mic stream reopened after hot-plug")
+                _log_entry("system", "Mic reconnected.")
+            except Exception as e:
+                log.warning("Mic reconnect failed (%s) — will retry", e)
+                _last_mic_cb[0] = _wm.time()  # back off
+
+    async def _resume_from_http(self, text: str, alsa_output: str):
+        """Resume paused TTS triggered by the /continue HTTP button."""
+        if self._busy.is_set():
+            return
+        self._busy.set()
+        try:
+            _log_entry("system", "Resuming…")
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak, text, alsa_output
+            )
+        finally:
+            import time as _t_gate
+            _post_busy_until[0] = _t_gate.time() + 0.6
+            self._busy.clear()
 
     async def _run_calibration(self):
         """Measure ambient noise via the live mic stream and update MIC_GATE_PEAK."""
@@ -1488,7 +1695,7 @@ class RealtimeSession:
             )
             return
         noise_peak = max(peaks)
-        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+        new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
         MIC_GATE_PEAK = new_gate
         log.info("Calibration: noise_peak=%d → MIC_GATE_PEAK=%d", noise_peak, new_gate)
         # Persist to service file so it survives restarts
@@ -1516,29 +1723,9 @@ class RealtimeSession:
         # Default to Simplified Chinese (transcriber often returns Traditional)
         transcript = _to_simplified(transcript)
 
-        # Language gate: by default only English/Chinese are shown/processed.
-        # Other languages (often noise hallucinations) are dropped unless the
-        # user enables multi-language mode.
-        if not self._multilang and not _is_english_or_chinese(transcript):
-            log.debug("Dropped non-EN/ZH (multilang off): %r", transcript)
-            return
-
-        # Monitoring-only mode: passively log captured segments (no Five/TTS).
-        # Shows everything verbatim — including noise — so capture quality is visible.
-        if self._monitoring:
-            t = transcript.strip()
-            if t:
-                log.info("Monitor: %s", t)
-                _log_entry("monitor", t)
-            return
-
-        # Noise hallucination filter: drop consonant-heavy gibberish from background
-        # noise that slipped past the VAD. (Monitoring mode is exempt so you can
-        # still diagnose what the transcriber produces.)
-        if _is_likely_noise(transcript):
-            log.debug("Dropped noise hallucination: %r", transcript)
-            return
-
+        # Normalize and check control phrases BEFORE the language gate so that
+        # wake/sleep/calibrate always work even if the transcriber produces a
+        # slightly garbled or accented variant that _is_english_or_chinese rejects.
         normalized = transcript.strip().rstrip(".!?,").lower()
 
         # Wake phrase — always checked regardless of active state
@@ -1582,10 +1769,80 @@ class RealtimeSession:
             asyncio.create_task(self._run_calibration())
             return
 
+        # Monitoring toggle — works regardless of active state
+        if _matches_phrase(normalized, MONITOR_ON_PHRASES):
+            if not self._monitoring:
+                self._monitoring = True
+                log.info("Voice command: monitoring ON")
+                _log_entry("system", "Monitoring started.")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Monitoring started.", self.alsa_output
+                )
+            return
+        if _matches_phrase(normalized, MONITOR_OFF_PHRASES):
+            if self._monitoring:
+                self._monitoring = False
+                log.info("Voice command: monitoring OFF")
+                _log_entry("system", "Monitoring stopped.")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Monitoring stopped.", self.alsa_output
+                )
+            return
+
+        # Continue phrase — resume paused TTS without asking Five again
+        if _matches_phrase(normalized, CONTINUE_PHRASES):
+            saved = _paused_speech[0]
+            if saved:
+                saved_text, saved_dev = saved
+                log.info("Voice continue — resuming %d chars", len(saved_text))
+                _log_entry("system", "Resuming…")
+                self._busy.set()
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, saved_text, saved_dev
+                    )
+                finally:
+                    import time as _t_gate2
+                    _post_busy_until[0] = _t_gate2.time() + 0.6
+                    self._busy.clear()
+            return
+
+        # Language gate: drop non-EN/ZH transcripts (noise hallucinations in
+        # other scripts). Control phrases above are already handled and exempt.
+        if not self._multilang and not _is_english_or_chinese(transcript):
+            log.debug("Dropped non-EN/ZH (multilang off): %r", transcript)
+            return
+
+        # Monitoring-only mode: passively log captured segments (no Five/TTS).
+        if self._monitoring:
+            t = transcript.strip()
+            if t:
+                log.info("Monitor: %s", t)
+                _log_entry("monitor", t)
+            return
+
+        # Noise hallucination filter: drop consonant-heavy gibberish.
+        if _is_likely_noise(transcript):
+            log.debug("Dropped noise hallucination: %r", transcript)
+            return
+
         # All other speech: only route to Five when active
         if not self._active:
             log.debug("Silent mode — ignoring: %s", transcript)
             return
+
+        # Short-word noise guard: single words under 6 characters that aren't
+        # known commands are almost always noise hallucinations, not real speech.
+        _SHORT_CMDS = {"ok", "okay", "yes", "no", "sure", "go", "stop", "wait",
+                       "help", "hey", "hi", "bye", "好", "是", "否", "不", "对",
+                       "继续", "再来", "谢谢", "好的"}
+        _norm_words = normalized.split()
+        if len(_norm_words) == 1 and len(normalized) < 6 and normalized not in _SHORT_CMDS:
+            log.info("Short noise guard — dropped single word: %r", transcript)
+            return
+
+        # New request — discard any previously paused speech
+        _paused_speech[0] = None
 
         self._busy.set()
         try:
@@ -1594,20 +1851,45 @@ class RealtimeSession:
             _log_entry("thinking", "Five is thinking...")  # live counter shown on dashboard
             # Prefix tells Five to ignore cron/heartbeat background context
             voice_msg = f"[voice] {transcript}"
-            reply = await self.gw.ask(voice_msg, session_key=self.session_key)
+            _think_task = asyncio.ensure_future(
+                self.gw.ask(voice_msg, session_key=self.session_key)
+            )
+            _current_think_task[0] = _think_task
+            try:
+                reply = await _think_task
+            except asyncio.CancelledError:
+                log.info("Thinking interrupted via /interrupt")
+                _log_entry("five", "")   # clears thinking counter
+                _log_entry("system", "Interrupted.")
+                return
+            finally:
+                _current_think_task[0] = None
+            if not reply:
+                log.warning("History fallback also empty — no reply from Five")
+                _log_entry("system", "No reply from Five — please try again.")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Sorry, I didn't get a response. Please try again.",
+                    self.alsa_output
+                )
+                return
             log.info("Five: %s", reply)
             _log_entry("five", reply)
             await asyncio.get_running_loop().run_in_executor(
-                None, speak, reply, self.alsa_output
+                None, speak, reply, self.alsa_output, -1.0, 300, True, True  # resumable, interruptible
             )
         except asyncio.TimeoutError:
             log.error("OpenClaw agent timed out")
+            _log_entry("five", "")   # clears the thinking counter on dashboard
             await asyncio.get_running_loop().run_in_executor(
                 None, speak, "Sorry, I timed out on that.", self.alsa_output
             )
         except Exception as e:
             log.error("Error routing transcript: %s", e)
+            _log_entry("five", "")   # clears the thinking counter on dashboard
         finally:
+            # Set echo gate: mic_cb discards audio until this timestamp expires
+            import time as _t_gate3
+            _post_busy_until[0] = _t_gate3.time() + 0.6
             self._busy.clear()
 
     async def _recv_ws(self, ws):
@@ -1627,7 +1909,7 @@ class RealtimeSession:
                             transcript = chunk["transcript"]
                             break
                 transcript = transcript.strip()
-                if transcript and not self._busy.is_set():
+                if transcript and not self._busy.is_set() and not _is_speaking[0]:
                     log.info("You: %s", transcript)
                     asyncio.create_task(self._handle_transcript(transcript))
 
@@ -1667,13 +1949,9 @@ class RealtimeSession:
                             "transcription": {"model": OPENAI_TRANSCRIBE_MODEL},
                             "turn_detection": {
                                 "type":                "server_vad",
-                                "threshold":           0.45,  # AGC normalises speech; 0.45 is sensitive enough to catch all speech while noise suppression prevents false triggers
-                                "prefix_padding_ms":   300,   # capture sentence lead-in ("Five,…")
-                                # WebRTC AGC noise-suppression turns brief
-                                # inter-word gaps into hard silence; 600ms ended
-                                # turns mid-sentence ("Can you" → rest lost while
-                                # busy). 1100ms keeps a full sentence as one turn.
-                                "silence_duration_ms": 1100,
+                                "threshold":           0.35,  # more sensitive; AGC+noise-suppression keeps false triggers low
+                                "prefix_padding_ms":   500,   # capture speech onset better ("Five,…")
+                                "silence_duration_ms": 700,   # faster end-of-utterance; AGC keeps inter-word gaps short
                             },
                         },
                     },
@@ -1681,23 +1959,34 @@ class RealtimeSession:
             }))
             log.info("Session active — speak now (routed through Five / OpenClaw)")
 
+            import time as _st
+            _last_mic_cb[0] = _st.time()   # seed so watchdog doesn't fire immediately
             in_stream = sd.InputStream(
                 samplerate=DEVICE_RATE, channels=CHANNELS, dtype="int16",
                 blocksize=DEVICE_BLOCKSIZE, callback=self._mic_cb,
                 device=self.input_device,
             )
-
-            with in_stream:
+            in_stream.start()
+            self._mic_stream_ref[0] = in_stream
+            try:
                 tasks = [
                     asyncio.create_task(self._send_mic(ws)),
                     asyncio.create_task(self._recv_ws(ws)),
                     asyncio.create_task(self.stop_event.wait()),
+                    asyncio.create_task(self._watch_mic_stream()),
                 ]
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in pending:
                     task.cancel()
+            finally:
+                try:
+                    in_stream.stop()
+                    in_stream.close()
+                except Exception:
+                    pass
+                self._mic_stream_ref[0] = None
 
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
@@ -1731,14 +2020,14 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     sess._active = True
                     log.info("HTTP wake")
                 self.send_response(302)
-                self.send_header("Location", "/log")
+                self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path == "/sleep":
                 if sess and sess._active:
                     sess._active = False
                     log.info("HTTP sleep")
                 self.send_response(302)
-                self.send_header("Location", "/log")
+                self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path in ("/monitor", "/monitor/start", "/monitor/stop"):
                 # Passive capture-only monitoring (no Five, no TTS).
@@ -1773,10 +2062,57 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
+            elif self.path == "/continue":
+                saved = _paused_speech[0]
+                if saved and sess and sess.loop:
+                    saved_text, saved_dev = saved
+                    def _resume():
+                        asyncio.run_coroutine_threadsafe(
+                            sess._resume_from_http(saved_text, saved_dev), sess.loop
+                        )
+                    _threading.Thread(target=_resume, daemon=True).start()
+                    log.info("HTTP continue — resuming %d chars", len(saved_text))
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+
+            elif self.path == "/interrupt":
+                # Cancel the current think task if pending
+                task = _current_think_task[0]
+                if task is not None and sess and sess.loop:
+                    sess.loop.call_soon_threadsafe(task.cancel)
+                # Stop TTS if currently speaking
+                _http_interrupt[0] = True
+                if sess:
+                    sess._busy.clear()
+                    sess._active = True   # ensure back in listening mode
+                _log_entry("five", "")           # clears thinking counter
+                _log_entry("system", "Interrupted — listening.")
+                log.info("HTTP interrupt — cancelled thinking + TTS")
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
             elif self.path == "/reset":
                 # Clear the on-screen conversation/capture log
                 CONVERSATION_LOG.clear()
                 log.info("HTTP reset — conversation log cleared")
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+            elif self.path == "/gateway-reset":
+                # Disconnect and reconnect to the OpenClaw gateway
+                if sess and sess.gw and sess.loop:
+                    async def _gw_reset():
+                        try:
+                            await sess.gw.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1)
+                        await sess.gw.connect()
+                        log.info("Gateway reconnected after manual reset")
+                        _log_entry("system", "Gateway reconnected.")
+                    asyncio.run_coroutine_threadsafe(_gw_reset(), sess.loop)
+                log.info("HTTP gateway-reset requested")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -1853,53 +2189,73 @@ def start_http_server(port: int, on_stop, session_ref: list):
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
                 body = f"""<!DOCTYPE html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Calibration</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Calibration — RealTimeTalk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
-body{{font-family:sans-serif;font-size:14px;background:#111;color:#eee;padding:8px 12px;max-width:640px;}}
-h3{{margin:0 0 6px;font-size:16px;}} h4{{margin:4px 0 2px;font-size:14px;color:#9cf;}}
-.info{{color:#aaa;font-size:13px;margin:2px 0;}}
-.warn{{background:#5a1a00;border-radius:5px;padding:5px 8px;margin-bottom:4px;font-size:13px;}}
-.devpanel{{background:#1a1a2a;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:13px;line-height:1.6;}}
-.devpanel b{{color:#eee;}}
-.sect{{border-top:1px solid #333;margin-top:8px;padding-top:6px;}}
-canvas{{width:100%;height:36px;border-radius:5px;display:block;margin:4px 0;}}
-#micinfo{{font-size:13px;color:#aaa;margin:2px 0;min-height:16px;}}
-#micresult{{margin-top:6px;padding:6px;background:#1a3a1a;border-radius:5px;font-size:13px;color:#7f7;display:none;}}
-#calstatus{{margin:4px 0;font-size:13px;min-height:16px;}}
-#mstatus{{margin-top:3px;font-size:13px;}}
-.row{{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0;}}
-button{{padding:7px 14px;border:none;color:#fff;border-radius:6px;font-size:13px;cursor:pointer;}}
-#micbtn{{background:#2a5;}} #micbtn:disabled{{background:#555;cursor:default;}}
-#acbtn{{background:#2a5;}} #acbtn:disabled{{background:#555;cursor:default;}}
-.bQ{{background:#555;}} .bL{{background:#2a5;}} .bP{{background:#226;}}
-.bS{{background:#622;}} .bSet{{background:#a62;}}
-.snrtbl{{border-collapse:collapse;font-size:12px;margin:4px 0;width:100%;}}
-.snrtbl th,.snrtbl td{{border:1px solid #333;padding:3px 6px;text-align:left;}}
-.snrtbl tr.active-row{{background:#1a3a1a;}}
-.use-btn{{padding:3px 10px;font-size:12px;background:#446;border:none;color:#fff;border-radius:4px;cursor:pointer;white-space:nowrap;}}
-.use-btn:hover{{background:#558;}}
-.use-btn.active{{background:#272;cursor:default;}}
-#devbtn{{background:#446;font-size:13px;padding:6px 14px;}}
-#devtoggle{{color:#9cf;cursor:pointer;font-size:13px;background:none;border:none;padding:0;margin-left:6px;}}
-#devlist{{margin-top:6px;}}
-#devmsg{{font-size:13px;color:#fa0;}}
-a{{color:#7af;font-size:14px;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#07090f;--sf:#0d1119;--sf2:#121925;--bd:#1a2535;--tx:#dde4ef;--mu:#5a7088;--di:#253344;--you:#38bdf8;--bot:#f59e0b;--bb:#130e02;--rd:#ef4444;--rdb:#150303;--gn:#34d399;--gnb:#021a0e;--r:8px;}}
+body{{font-family:'Outfit',system-ui,sans-serif;font-size:15px;background:var(--bg);color:var(--tx);padding:12px 16px;max-width:680px;-webkit-text-size-adjust:100%;}}
+.ph{{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--bd);}}
+.pt{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
+a.back{{margin-left:auto;display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:8px;font-size:13px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;transition:border-color .12s,color .12s;}}
+a.back:hover{{border-color:var(--you);color:var(--you);box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
+.devpanel{{font-family:'JetBrains Mono',monospace;font-size:12px;color:#8aa0b8;line-height:1.7;padding:7px 10px;background:var(--bg);border-radius:5px;border:1px solid var(--di);margin-bottom:10px;}}
+.devpanel b{{color:var(--tx);}}
+.sect{{border-top:1px solid var(--bd);margin-top:14px;padding-top:10px;}}
+h4{{font-family:'Outfit',sans-serif;font-size:14px;font-weight:600;color:var(--you);margin:0 0 6px;}}
+.info{{color:var(--mu);font-size:13px;margin:3px 0;}}
+.warn{{background:#3a1500;border:1px solid #7a3000;border-radius:6px;padding:6px 10px;margin-bottom:6px;font-size:13px;color:var(--bot);}}
+canvas{{width:100%;height:38px;border-radius:5px;display:block;margin:6px 0;}}
+#micinfo{{font-size:12px;color:var(--mu);margin:2px 0;min-height:16px;font-family:'JetBrains Mono',monospace;}}
+#micresult{{margin-top:6px;padding:7px 10px;background:var(--gnb);border:1px solid var(--gn);border-radius:6px;font-size:13px;color:var(--gn);display:none;}}
+#calstatus{{margin:4px 0;font-size:13px;min-height:16px;color:var(--mu);font-family:'JetBrains Mono',monospace;}}
+#mstatus{{margin-top:4px;font-size:13px;color:var(--mu);}}
+.row{{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;}}
+button{{padding:7px 14px;border:1px solid var(--bd);color:var(--mu);background:var(--sf2);border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;cursor:pointer;transition:border-color .12s,color .12s,background .12s;}}
+button:hover{{border-color:var(--you);color:var(--you);background:#1e2d3d;box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
+button:disabled{{opacity:.4;cursor:default;border-color:var(--bd);color:var(--mu);background:var(--sf2);box-shadow:none;}}
+#micbtn,#acbtn{{color:var(--gn);border-color:var(--gn);background:var(--gnb);}}
+#micbtn:hover,#acbtn:hover{{background:#042e18;box-shadow:0 0 0 2px rgba(52,211,153,.25);}}
+.bL{{color:var(--gn);border-color:var(--gn);background:var(--gnb);}}
+.bL:hover{{background:#042e18;box-shadow:0 0 0 2px rgba(52,211,153,.25);}}
+.bP{{color:var(--you);border-color:var(--you);background:#051928;}}
+.bP:hover{{background:#0a2840;box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
+.bQ{{color:var(--mu);border-color:var(--bd);background:var(--sf2);}}
+.bS{{color:var(--rd);border-color:var(--rd);background:var(--rdb);}}
+.bS:hover{{background:#2a0808;box-shadow:0 0 0 2px rgba(239,68,68,.25);}}
+.bSet{{color:var(--bot);border-color:var(--bot);background:var(--bb);}}
+.bSet:hover{{background:#261b03;box-shadow:0 0 0 2px rgba(245,158,11,.25);}}
+.snrtbl{{border-collapse:collapse;font-size:12px;margin:6px 0;width:100%;font-family:'JetBrains Mono',monospace;}}
+.snrtbl th{{background:var(--sf2);color:var(--mu);font-weight:600;border:1px solid var(--bd);padding:4px 8px;text-align:left;}}
+.snrtbl td{{border:1px solid var(--bd);padding:4px 8px;color:var(--tx);}}
+.snrtbl tr.active-row{{background:var(--gnb);}}
+.use-btn{{padding:4px 10px;font-size:12px;background:var(--sf2);border:1px solid var(--bd);color:var(--mu);border-radius:5px;cursor:pointer;white-space:nowrap;font-family:'Outfit',sans-serif;transition:border-color .12s,color .12s;}}
+.use-btn:hover{{border-color:var(--you);color:var(--you);box-shadow:0 0 0 2px rgba(56,189,248,.2);}}
+.use-btn.active{{background:var(--gnb);border-color:var(--gn);color:var(--gn);cursor:default;}}
+#devbtn{{color:var(--you);border-color:var(--you);background:#051928;}}
+#devbtn:hover{{background:#0a2840;}}
+#devtoggle{{color:var(--you);cursor:pointer;font-size:13px;background:none;border:none;padding:0;margin-left:6px;font-family:'Outfit',sans-serif;}}
+#devlist{{margin-top:8px;}}
+#devmsg{{font-size:13px;color:var(--bot);font-family:'JetBrains Mono',monospace;}}
+a{{color:var(--you);text-decoration:none;}}
+a:hover{{text-decoration:underline;}}
 </style></head><body>
-<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">
-  <h3 style="margin:0;">Calibration</h3>
-  <a href="/dashboard" style="font-size:13px;color:#7af;">← Dashboard</a>
+<div class="ph">
+  <span class="pt">&#9679;&nbsp;Calibration</span>
+  <a href="/dashboard" class="back">&#8592; Dashboard</a>
 </div>
 <div class="devpanel" id="curdev">
-  <b>Mic:</b> {ds["mic"]} &nbsp;|&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;|&nbsp; Gain: {ds["gain"]}x<br>
-  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;|&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;|&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span>
+  <b>Mic:</b> {ds["mic"]} &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: {ds["gain"]}x<br>
+  <b>Speaker:</b> {ds["speaker_name"]} &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
-<div style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;">
-  <span style="font-size:12px;color:#aaa;">Cal mode:</span>
-  <b style="font-size:13px;color:{'#fa0' if is_headset else '#5f5'};">{_mode_label}</b>
-  <button onclick="setCalMode('headset')" style="padding:3px 10px;font-size:12px;background:{'#622' if is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Headset</button>
-  <button onclick="setCalMode('speaker')" style="padding:3px 10px;font-size:12px;background:{'#2a5' if not is_headset and _override else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Speaker</button>
-  <button onclick="setCalMode('auto')" style="padding:3px 10px;font-size:12px;background:{'#446' if _override is None else '#444'};border:none;color:#fff;border-radius:4px;cursor:pointer;">Auto</button>
+<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
+  <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
+  <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
+  <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
+  <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
+  <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -1916,11 +2272,11 @@ a{{color:#7af;font-size:14px;}}
 <canvas id="meter" height="36"></canvas>
 <div id="micinfo" style="font-size:12px;color:#aaa;margin:2px 0;min-height:14px;"></div>
 <div style="display:flex;align-items:center;gap:8px;margin:6px 0;">
-  <span style="font-size:12px;color:#aaa;white-space:nowrap;">Gate:</span>
+  <span style="font-size:12px;color:var(--mu);white-space:nowrap;font-family:'JetBrains Mono',monospace;">Gate:</span>
   <input type="range" id="gateslider" min="{MIC_GATE_MIN}" max="{MIC_GATE_MAX}" step="25"
-         value="{gate}" style="flex:1;accent-color:#ff0;" oninput="onGateSlide(this.value)"
+         value="{gate}" style="flex:1;accent-color:#f59e0b;" oninput="onGateSlide(this.value)"
          onchange="saveGate(this.value)">
-  <span id="gateval" style="font-size:13px;color:#ff0;font-weight:bold;width:36px;text-align:right;">{gate}</span>
+  <span id="gateval" style="font-size:13px;color:#f59e0b;font-weight:bold;width:40px;text-align:right;font-family:'JetBrains Mono',monospace;">{gate}</span>
 </div>
 <div id="micresult"></div>
 <div class="row">
@@ -1928,7 +2284,7 @@ a{{color:#7af;font-size:14px;}}
 </div>
 </div>
 {auto_cal_section}
-<p><a href="/dashboard">← Dashboard</a></p>
+<p style="margin-top:14px;"><a href="/dashboard" style="color:var(--you);">&#8592; Dashboard</a></p>
 <script>
 /* --- Mic level meter --- */
 const MAX=32768, gate0={gate};
@@ -2080,11 +2436,14 @@ function loadDevices(){{
     h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th></tr>';
     (d.sources||[]).forEach(s=>{{
       if(s.name.includes('monitor')||s.name==='rtt_agc_sink'||s.name==='rtt_agc_source') return;
-      const active=(s.name===d.default_source);
+      // AGC is always on — active mic is whichever physical device AGC captures from,
+      // not raw PipeWire RUNNING state (other devices can appear RUNNING as side-effect).
+      const active=(s.name===d.raw_mic_source);
+      const stateLabel=active?'<span style="color:#5f5">Running</span>':'Idle';
       h+='<tr'+(active?' class="active-row"':'')+'>'
         +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'-')+'</td>'
-        +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
+        +'<td>'+stateLabel+'</td>'
         +'<td><button class="use-btn'+(active?' active':'')+'"'
         +' data-dtype="source" data-dname="'+s.name+'"'
         +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
@@ -2166,7 +2525,7 @@ function setCalMode(mode){{
                             peaks.append(_mic_level_current[0])
                     peaks = peaks[2:]
                     noise_peak = max(peaks) if peaks else 0
-                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
                     _mic_gate_ref[0] = new_gate
                     MIC_GATE_PEAK = new_gate
                     log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
@@ -2223,7 +2582,7 @@ Play the test sentence and adjust until comfortable.</div>
 <div class="row"><button id="devbtn" onclick="checkDevices()">Check Device Status</button></div>
 <div id="devout" style="margin-top:10px;display:none;font-size:14px;"></div>
 </div>
-<p><a href="/dashboard">← Dashboard</a></p>
+<p style="margin-top:14px;"><a href="/dashboard" style="color:var(--you);">&#8592; Dashboard</a></p>
 <script>
 function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   document.getElementById('vol').textContent='Vol: '+d.spk_vol+'  SW: '+d.sw_pct+'%';
@@ -2435,6 +2794,8 @@ setInterval(upd, 2000);
                     result  = snapped + d
                     return max(1, min(100, result))
 
+                sink = subprocess.run(["pactl","get-default-sink"],
+                                      capture_output=True,text=True).stdout.strip()
                 if kind == "sw":
                     # Adjust software gain (_cal_sw_volume)
                     cur_sw  = int(_cal_sw_volume * 100)
@@ -2442,8 +2803,6 @@ setInterval(upd, 2000);
                     globals()['_cal_sw_volume'] = new_sw / 100.0
                 else:
                     # Adjust PipeWire volume of the default sink
-                    sink = subprocess.run(["pactl","get-default-sink"],
-                                          capture_output=True,text=True).stdout.strip()
                     if sink:
                         cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
                                                  capture_output=True, text=True).stdout
@@ -2452,6 +2811,15 @@ setInterval(upd, 2000);
                         new_vol = _snap10(cur, delta)
                         subprocess.run(["pactl", "set-sink-volume", sink, f"{new_vol}%"],
                                        capture_output=True)
+
+                # Persist adjusted levels so they restore on reconnect/restart
+                if sink:
+                    _cur_out = subprocess.run(["pactl", "get-sink-volume", sink],
+                                              capture_output=True, text=True).stdout
+                    _m2 = _re5.search(r'(\d+)%', _cur_out)
+                    _pw_now = int(_m2.group(1)) if _m2 else 50
+                    _save_device_cal(sink, _pw_now, _cal_sw_volume)
+
                 resp = _json.dumps(_get_device_status()).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json")
                 self.send_header("Content-Length", str(len(resp))); self.end_headers()
@@ -2508,6 +2876,8 @@ setInterval(upd, 2000);
                     data = {
                         "default_sink":   default_sink,
                         "default_source": default_source,
+                        "raw_mic_source": RAW_MIC_SOURCE,  # physical mic behind AGC
+                        "agc_source":     AGC_SOURCE_NAME,
                         "sinks":   sinks,
                         "sources": sources,
                         "alsa_cards": alsa_cards,
@@ -2653,17 +3023,25 @@ setInterval(upd, 2000);
                 new_fp = _get_audio_fingerprint()
                 device_banner = ""
                 if new_fp and new_fp != _audio_fingerprint[0]:
+                    old_fp = _audio_fingerprint[0]
                     _audio_fingerprint[0] = new_fp
-                    msg = "Audio devices changed. Please recalibrate the mic."
+                    # Suppress announcement if only HDMI changed — display-source
+                    # switches connect/disconnect HDMI audio but are not real
+                    # speaker changes and should not interrupt with audio.
+                    def _non_hdmi(fp):
+                        return "\n".join(
+                            l for l in fp.splitlines()
+                            if "hdmi" not in l.lower()
+                        )
+                    hdmi_only = (_non_hdmi(new_fp) == _non_hdmi(old_fp))
+                    msg = "Audio devices changed."
                     _device_change_msg[0] = msg
-                    log.info("Device change detected on /log refresh")
-                    if sess:
+                    log.info("Device change detected%s", " (HDMI only — silent)" if hdmi_only else "")
+                    if sess and not hdmi_only:
                         import threading as _t
                         def _announce_change():
                             _safe_volume_new_sinks(1)   # PipeWire at 1% safety reset
                             import time as _time; _time.sleep(0.5)
-                            # Apply saved calibration for the new default sink
-                            # (or minimum safe if unknown device)
                             _cur_sink = subprocess.run(
                                 ["pactl","get-default-sink"],
                                 capture_output=True,text=True).stdout.strip()
@@ -2674,8 +3052,8 @@ setInterval(upd, 2000);
 
                 if _device_change_msg[0]:
                     device_banner = (
-                        f'<div id="dbanner" style="background:#5a2200;border-radius:8px;'
-                        f'padding:10px;margin-bottom:8px;font-weight:bold;">'
+                        f'<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
+                        f'color:#f59e0b;">'
                         f'{_device_change_msg[0]}</div>'
                         f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
                         f'if(b)b.remove();}},5000);</script>'
@@ -2683,18 +3061,41 @@ setInterval(upd, 2000);
                     _device_change_msg[0] = ""
                 else:
                     device_banner = (
-                        f'<div id="dbanner" style="background:#1a3a1a;border-radius:8px;'
-                        f'padding:8px;margin-bottom:8px;color:#5f5;font-size:13px;">'
+                        f'<div id="dbanner" style="background:#021a0e;border:1px solid #34d399;'
+                        f'color:#34d399;">'
                         f'No device change detected.</div>'
                         f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
                         f'if(b)b.remove();}},5000);</script>'
                     )
 
-                active = sess._active if sess else False
+                active     = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
                 multilang  = sess._multilang if sess else False
-                # Pre-compute how long each "thinking" entry waited for a Five reply.
-                # None = still thinking (show live counter); float = seconds taken (show static).
+                paused     = _paused_speech[0] is not None
+                speaking   = _is_speaking[0]
+                thinking   = _current_think_task[0] is not None
+
+                state = ("MONITORING" if monitoring
+                         else "SPEAKING"   if speaking
+                         else "THINKING"   if thinking
+                         else "PAUSED"     if (active and paused)
+                         else "ACTIVE"     if active else "SILENT")
+                _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
+                       "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
+                       "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
+                       }.get(state,("#141d2b","#64748b"))
+                state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
+
+                speaking_banner = (
+                    '<div class="spkbanner">&#128266; Five is speaking&hellip;'
+                    ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
+                    if speaking else
+                    '<div class="spkbanner paused">&#9646;&#9646; Paused'
+                    ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
+                    if (active and paused) else ""
+                )
+
+                # Pre-compute thinking durations
                 thinking_dur: dict = {}
                 for _i, _e in enumerate(CONVERSATION_LOG):
                     if _e["role"] == "thinking":
@@ -2706,7 +3107,7 @@ setInterval(upd, 2000);
                                 )
                                 break
                         else:
-                            thinking_dur[_ep] = None  # still waiting
+                            thinking_dur[_ep] = None
 
                 rows = ""
                 for e in reversed(CONVERSATION_LOG):
@@ -2722,53 +3123,68 @@ setInterval(upd, 2000);
                         ep  = e.get("epoch", 0.0)
                         dur = thinking_dur.get(ep)
                         if dur is None:
-                            # Still waiting — live counter
                             rows += (f'<div class="thinking">{ts_span}'
-                                     f'Five is thinking... '
-                                     f'<span class="tctr" data-start="{ep:.3f}">0</span>s</div>')
-                        # else: Five replied — hide this line entirely
+                                     f'Five is thinking&hellip; '
+                                     f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
+                                     f' &nbsp;<a href="/interrupt" class="irupt">&#10005; Interrupt</a>'
+                                     f'</div>')
                     else:
                         rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
-                # All device info gathered outside do_GET to avoid UnboundLocalError scoping
+
                 _ds = _get_device_status()
                 device_panel = (
-                    f'<div style="background:#1a1a2a;border-radius:8px;padding:8px 12px;'
-                    f'margin-bottom:8px;font-size:12px;color:#aaa;line-height:1.8;">'
-                    f'<b style="color:#eee">Audio devices</b><br>'
-                    f'Mic: {_ds["mic"]}<br>'
-                    f'Speaker: {_ds["speaker_name"]} &nbsp;|&nbsp; '
-                    f'Vol {_ds["spk_vol"]} &nbsp;|&nbsp; SW {_ds["sw_pct"]}%<br>'
-                    f'Mic gate: {_ds["gate"]} &nbsp;|&nbsp; Gain: {_ds["gain"]}x'
-                    f'</div>'
+                    f'<div id="dp">&#127908; {_ds["mic"]} &ensp;'
+                    f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
+                    f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x</div>'
                 )
 
-                state = ("MONITORING" if monitoring
-                         else "ACTIVE" if active else "SILENT")
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="refresh" content="3">
-<title>RealTimeTalk Dashboard</title>
+<title>RealTimeTalk</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
-html,body{{height:100%;margin:0;}}
-body{{font-family:sans-serif;font-size:17px;background:#111;color:#eee;display:flex;flex-direction:column;}}
-#top{{padding:12px 12px 0;flex-shrink:0;}}
-#log{{flex:1;overflow-y:auto;padding:0 12px 12px;}}
-.you{{background:#1a3a1a;border-radius:8px;padding:8px;margin:6px 0;}}
-.five{{background:#1a2a3a;border-radius:8px;padding:8px;margin:6px 0;}}
-.mon{{background:#2a2030;border-left:3px solid #b58;border-radius:6px;padding:8px;margin:6px 0;}}
-.sys{{color:#888;font-size:0.85em;text-align:center;margin:4px 0;}}
-.thinking{{color:#f90;background:#1a1400;border-left:3px solid #f90;border-radius:6px;padding:8px;margin:6px 0;font-style:italic;}}
-.ts{{color:#666;font-size:0.8em;font-family:monospace;}}
-h3{{margin:0 0 10px;}}
-a{{color:#7af;margin-right:14px;font-size:17px;}}
-a.on{{color:#5f5;font-weight:bold;}}
-a.reset{{color:#f86;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{--bg:#07090f;--sf:#0d1119;--sf2:#121925;--bd:#1a2535;--tx:#dde4ef;--mu:#5a7088;--di:#253344;--you:#38bdf8;--yb:#051928;--bot:#f59e0b;--bb:#130e02;--mon:#a78bfa;--mb:#0e0820;--sy:#304558;--rd:#ef4444;--rdb:#150303;--gn:#34d399;--gnb:#021a0e;--r:8px;}}
+html,body{{height:100%;}}
+body{{font-family:'Outfit',system-ui,sans-serif;font-size:16px;background:var(--bg);color:var(--tx);display:flex;flex-direction:column;overflow:hidden;-webkit-text-size-adjust:100%;}}
+#top{{flex-shrink:0;background:var(--sf);border-bottom:1px solid var(--bd);padding:10px 14px 8px;}}
+.hrow{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
+.brand{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
+.spill{{margin-left:10px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:5px 14px;border-radius:20px;border:2px solid transparent;white-space:nowrap;}}
+.nav{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px;}}
+a.btn{{display:inline-flex;align-items:center;gap:3px;padding:7px 14px;border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:36px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
+a.btn:hover{{background:#1e2d3d;border-color:var(--you);color:var(--you);box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
+a.btn.on{{background:var(--gnb);border-color:var(--gn);color:var(--gn);}}
+a.btn.on:hover{{background:#053d20;color:#fff;box-shadow:0 0 0 2px rgba(52,211,153,.25);}}
+a.btn.danger{{color:var(--rd);}}
+a.btn.danger:hover{{background:var(--rdb);border-color:var(--rd);box-shadow:0 0 0 2px rgba(239,68,68,.25);}}
+#dp{{font-family:'JetBrains Mono',monospace;font-size:12px;color:#8aa0b8;padding:6px 10px;background:var(--bg);border-radius:5px;border:1px solid var(--di);margin-top:4px;}}
+#dbanner{{border-radius:6px;padding:6px 10px;margin-top:6px;font-size:13px;font-family:'JetBrains Mono',monospace;}}
+#log{{flex:1;overflow-y:auto;padding:10px 14px;}}
+.you{{background:var(--yb);border-left:3px solid var(--you);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.you b{{color:var(--you);}}
+.five{{background:var(--bb);border-left:3px solid var(--bot);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.five b{{color:var(--bot);}}
+.mon{{background:var(--mb);border-left:3px solid var(--mon);border-radius:var(--r);padding:8px 10px;margin:3px 0;}}
+.sys{{color:var(--sy);font-size:.8em;text-align:center;margin:3px 0;font-family:'JetBrains Mono',monospace;}}
+.thinking{{background:var(--bb);border-left:3px solid var(--bot);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--bot);font-style:italic;}}
+.ts{{font-family:'JetBrains Mono',monospace;font-size:.75em;color:var(--mu);margin-right:4px;}}
+a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.irupt:hover{{background:var(--rd);color:#fff;}}
+a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.cont:hover{{background:var(--gn);color:#000;}}
+.spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
+.spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
+@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:9px 12px;font-size:13px;}}}}
+@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<h3>RealTimeTalk Dashboard — {state}</h3>
-<a href="/wake">Wake</a><a href="/sleep">Sleep</a><a href="/monitor/start" class="{'on' if monitoring else ''}">Start Monitor</a><a href="/monitor/stop" class="{'' if monitoring else 'on'}">Stop Monitor</a><a href="/multilang" class="{'on' if multilang else ''}">Multi-lang: {'ON' if multilang else 'OFF'}</a><a href="/reset" class="reset">Reset</a><a href="/calibration">Calibration</a><a href="/restart">Restart</a><a href="/dashboard">Dashboard</a>
-<hr>{device_panel}{device_banner}</div>
-<div id="log">{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn">&#9999; Calibrate</a></div>
+<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang else ''}">&#127760; {'ON' if multilang else 'OFF'} Multi-lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
+{device_panel}{device_banner}</div>
+<div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
 setInterval(function(){{
   var now=Date.now()/1000;
@@ -2869,7 +3285,7 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
         import time; time.sleep(duration)
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
-    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.25)))
+    recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
     print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
 
