@@ -2500,14 +2500,21 @@ function loadDevices(){{
 }}
 function setDevice(type,name){{
   const msg=document.getElementById('devmsg');
-  msg.textContent=(type==='sink'?'Setting speaker':'Setting mic')+': '+name+' — restarting audio in 1s…';
+  msg.textContent=(type==='sink'?'Switching speaker':'Setting mic')+': '+name+'…';
   fetch('/device-set?type='+type+'&name='+encodeURIComponent(name))
     .then(r=>r.json()).then(d=>{{
       msg.textContent=d.msg||'Done.';
       if(d.ok){{
-        sessionStorage.setItem('devExpanded','1');
-        if(_devTimer){{ clearInterval(_devTimer); _devTimer=null; }}
-        setTimeout(()=>location.reload(),4500);
+        if(d.restart){{
+          // Mic switch requires daemon restart — reload page after restart settles
+          sessionStorage.setItem('devExpanded','1');
+          if(_devTimer){{ clearInterval(_devTimer); _devTimer=null; }}
+          setTimeout(()=>location.reload(),4500);
+        }} else {{
+          // Speaker switch: no restart needed, test loop keeps playing on new device.
+          // Device bar updates via the 2s polling interval automatically.
+          setTimeout(()=>{{ msg.textContent=''; }}, 3000);
+        }}
       }} else msg.style.color='#f55';
     }}).catch(e=>{{msg.textContent='Error: '+e; msg.style.color='#f55';}});
 }}
@@ -2995,12 +3002,20 @@ setInterval(upd, 2000);
                     else:
                         result["msg"] = "Missing type or name"
                     if result["ok"]:
-                        # Restart daemon so new defaults are picked up by sd.InputStream
-                        threading.Thread(target=lambda: (
-                            __import__("time").sleep(0.5),
-                            __import__("subprocess").run(
-                                ["systemctl","--user","restart","openclaw-realtimetalk"])
-                        ), daemon=True).start()
+                        if dev_type == "sink":
+                            # Speaker switch: PipeWire handles it immediately.
+                            # No daemon restart needed — aplay -D default picks up the
+                            # new sink on the next call, so test loops continue uninterrupted.
+                            result["restart"] = False
+                            result["msg"] = result["msg"].replace(" Restarting audio…", "")
+                        else:
+                            # Mic switch: sd.InputStream must be restarted to pick up new source.
+                            result["restart"] = True
+                            threading.Thread(target=lambda: (
+                                __import__("time").sleep(0.5),
+                                __import__("subprocess").run(
+                                    ["systemctl","--user","restart","openclaw-realtimetalk"])
+                            ), daemon=True).start()
                 except Exception as e:
                     result["msg"] = str(e)
                 resp = _json.dumps(result).encode()
