@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.8.1 — 2026-05-21
+
+Gateway WebSocket drops silently after inactivity — transcripts routed to Five failed with `sent 1011 keepalive ping timeout`.
+
+### Fixed
+
+- **Gateway WebSocket keepalive.** Added `ping_interval=25, ping_timeout=10` to `websockets.connect()` for the gateway connection. The client now sends a ping every 25 s, preventing the server from timing out and closing the socket during quiet periods.
+
+- **Gateway auto-reconnect.** `GatewayClient.listen()` is now a reconnect loop. On `ConnectionClosed` or any other error it clears all in-flight futures (so `ask()` doesn't hang), then retries `connect()` with 5 s backoff until the gateway is reachable again. The daemon no longer needs a restart to recover from a dropped gateway connection.
+
+- **`ask()` waits for connection ready.** Added `_ready: asyncio.Event` (set on successful handshake, cleared on disconnect). `ask()` awaits `_ready` with a 20 s timeout before sending, so any message queued during a reconnect window is delivered once the connection is restored rather than failing immediately.
+
+---
+
 ## v1.8.0 — 2026-05-21
 
 Mac-version ports, complete UI redesign, acoustic self-interrupt fix, noise hallucination filters.
