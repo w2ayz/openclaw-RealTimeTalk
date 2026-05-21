@@ -172,6 +172,7 @@ def _detect_headset() -> bool:
 
 
 _headset_cal_loop = [False]    # flag to stop the looping playback
+_headset_cal_proc = [None]     # current aplay subprocess so stop can kill it immediately
 
 
 def _alsa_card_info(source_name: str) -> str:
@@ -2825,8 +2826,11 @@ setInterval(upd, 2000);
                             capture_output=True, env=PIPER_ENV,
                         )
                         while _headset_cal_loop[0]:
-                            _sp.run(["aplay", "-D", alsa, "-q", _pre],
-                                    capture_output=True)
+                            proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
+                                             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            _headset_cal_proc[0] = proc
+                            proc.wait()
+                            _headset_cal_proc[0] = None
                     finally:
                         try: _os.unlink(_pre)
                         except FileNotFoundError: pass
@@ -2836,6 +2840,10 @@ setInterval(upd, 2000);
 
             elif self.path == "/speaker-cal/loop-stop":
                 _headset_cal_loop[0] = False
+                proc = _headset_cal_proc[0]
+                if proc and proc.poll() is None:
+                    proc.kill()
+                _headset_cal_proc[0] = None
                 _html(self, 200, "<p>Loop stopped.</p>")
 
             elif self.path.startswith("/speaker-cal/adjust"):
