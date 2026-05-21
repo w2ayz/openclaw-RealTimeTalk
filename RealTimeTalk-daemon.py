@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 import argparse
 import asyncio
@@ -1367,6 +1367,7 @@ class GatewayClient:
     def __init__(self, token: str):
         self.token = token
         self._ws = None
+        self._ready = asyncio.Event()   # set when WS is fully handshaked
         # Maps request-id → Future for chat.send acks
         self._send_acks: dict[str, asyncio.Future] = {}
         # Maps runId → Future[str] for final chat replies
@@ -1375,7 +1376,10 @@ class GatewayClient:
         self._assistant_text: dict[str, str] = {}
 
     async def connect(self):
-        self._ws = await websockets.connect(OPENCLAW_GW_URL)
+        self._ready.clear()
+        self._ws = await websockets.connect(
+            OPENCLAW_GW_URL, ping_interval=25, ping_timeout=10
+        )
         await self._ws.recv()  # connect.challenge — backend clients skip signing
         await self._ws.send(json.dumps({
             "type": "req", "id": "gw-connect", "method": "connect",
@@ -1401,66 +1405,99 @@ class GatewayClient:
             raise RuntimeError(f"Gateway connect failed: {hello.get('error')}")
         scopes = hello.get("payload", {}).get("auth", {}).get("scopes", [])
         log.info("OpenClaw gateway connected (scopes: %s)", scopes)
+        self._ready.set()
 
     async def listen(self, stop_event: asyncio.Event):
-        """Route incoming gateway events to waiting futures. Run as a task."""
-        try:
-            async for raw in self._ws:
-                if stop_event.is_set():
-                    break
-                msg = json.loads(raw)
-                mtype = msg.get("type", "")
-                event = msg.get("event", "")
-                payload = msg.get("payload") or {}
-                msg_id = msg.get("id", "")
+        """Route incoming gateway events to waiting futures. Auto-reconnects on drop."""
+        while not stop_event.is_set():
+            try:
+                async for raw in self._ws:
+                    if stop_event.is_set():
+                        return
+                    msg = json.loads(raw)
+                    mtype = msg.get("type", "")
+                    event = msg.get("event", "")
+                    payload = msg.get("payload") or {}
+                    msg_id = msg.get("id", "")
 
-                # Resolve chat.send acks
-                if mtype == "res" and msg_id in self._send_acks:
-                    fut = self._send_acks.pop(msg_id)
-                    if not fut.done():
-                        fut.set_result(msg)
+                    # Resolve chat.send acks
+                    if mtype == "res" and msg_id in self._send_acks:
+                        fut = self._send_acks.pop(msg_id)
+                        if not fut.done():
+                            fut.set_result(msg)
 
-                # Track assistant-stream text as a reliable reply source
-                elif event == "agent" and payload.get("stream") == "assistant":
-                    rid = payload.get("runId")
-                    atext = (payload.get("data") or {}).get("text", "")
-                    if rid and atext:
-                        self._assistant_text[rid] = atext
+                    # Track assistant-stream text as a reliable reply source
+                    elif event == "agent" and payload.get("stream") == "assistant":
+                        rid = payload.get("runId")
+                        atext = (payload.get("data") or {}).get("text", "")
+                        if rid and atext:
+                            self._assistant_text[rid] = atext
 
-                # Resolve agent replies on final chat event
-                elif event == "chat" and payload.get("state") == "final":
-                    run_id = payload.get("runId")
-                    cmsg = payload.get("message", {}) or {}
-                    content = cmsg.get("content", []) or []
-                    # Standard content array (type=text)
-                    text = " ".join(
-                        c.get("text", "") for c in content if c.get("type") == "text"
-                    ).strip()
-                    # Fallback: Responses API output_text items
-                    if not text:
+                    # Resolve agent replies on final chat event
+                    elif event == "chat" and payload.get("state") == "final":
+                        run_id = payload.get("runId")
+                        cmsg = payload.get("message", {}) or {}
+                        content = cmsg.get("content", []) or []
+                        # Standard content array (type=text)
                         text = " ".join(
-                            c.get("text", "") for c in content
-                            if c.get("type") in ("output_text", "text_delta")
+                            c.get("text", "") for c in content if c.get("type") == "text"
                         ).strip()
-                    # Fallback: top-level text / deltaText
-                    if not text:
-                        text = (cmsg.get("text") or payload.get("deltaText") or "").strip()
-                    # Fallback: assistant-stream text captured during the run
-                    if not text:
-                        text = self._assistant_text.get(run_id, "").strip()
-                    if not text:
-                        log.warning("chat final empty: payload=%s",
-                                    json.dumps(payload)[:600])
-                    self._assistant_text.pop(run_id, None)
-                    fut = self._reply_futs.pop(run_id, None)
-                    if fut and not fut.done():
-                        fut.set_result(text)
+                        # Fallback: Responses API output_text items
+                        if not text:
+                            text = " ".join(
+                                c.get("text", "") for c in content
+                                if c.get("type") in ("output_text", "text_delta")
+                            ).strip()
+                        # Fallback: top-level text / deltaText
+                        if not text:
+                            text = (cmsg.get("text") or payload.get("deltaText") or "").strip()
+                        # Fallback: assistant-stream text captured during the run
+                        if not text:
+                            text = self._assistant_text.get(run_id, "").strip()
+                        if not text:
+                            log.warning("chat final empty: payload=%s",
+                                        json.dumps(payload)[:600])
+                        self._assistant_text.pop(run_id, None)
+                        fut = self._reply_futs.pop(run_id, None)
+                        if fut and not fut.done():
+                            fut.set_result(text)
 
-        except websockets.ConnectionClosed:
-            pass
+            except websockets.ConnectionClosed as e:
+                if stop_event.is_set():
+                    return
+                log.warning("Gateway connection dropped (%s) — reconnecting…", e)
+            except Exception as e:
+                if stop_event.is_set():
+                    return
+                log.warning("Gateway listen error (%s) — reconnecting…", e)
+
+            if stop_event.is_set():
+                return
+
+            # Fail any in-flight futures so ask() doesn't hang
+            self._ready.clear()
+            for fut in list(self._send_acks.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Gateway reconnecting"))
+            self._send_acks.clear()
+            for fut in list(self._reply_futs.values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Gateway reconnecting"))
+            self._reply_futs.clear()
+
+            while not stop_event.is_set():
+                try:
+                    await self.connect()
+                    log.info("Gateway reconnected.")
+                    _log_entry("system", "Gateway reconnected.")
+                    break
+                except (ConnectionRefusedError, OSError) as e:
+                    log.warning("Gateway reconnect failed (%s) — retrying in 5s…", e)
+                    await asyncio.sleep(5)
 
     async def ask(self, message: str, session_key: str = OPENCLAW_SESSION) -> str:
         """Send a message to the agent and return its complete reply text."""
+        await asyncio.wait_for(self._ready.wait(), timeout=20)
         loop = asyncio.get_running_loop()
         idem = str(uuid.uuid4())
         req_id = f"send:{idem}"
