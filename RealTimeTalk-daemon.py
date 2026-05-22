@@ -1499,7 +1499,7 @@ class GatewayClient:
                     log.info("Gateway reconnected.")
                     _log_entry("system", "Gateway reconnected.")
                     break
-                except (ConnectionRefusedError, OSError) as e:
+                except Exception as e:
                     log.warning("Gateway reconnect failed (%s) — retrying in 5s…", e)
                     await asyncio.sleep(5)
 
