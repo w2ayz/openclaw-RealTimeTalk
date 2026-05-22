@@ -1777,6 +1777,10 @@ class RealtimeSession:
         if _matches_phrase(normalized, WAKE_PHRASES):
             self._busy.set()
             try:
+                if self._monitoring:
+                    self._monitoring = False
+                    _persist_monitoring[0] = False
+                    log.info("Wake phrase detected — exiting monitoring, voice active")
                 if not self._active:
                     self._active = True
                     import time as _tact; _last_activity[0] = _tact.time()
@@ -2093,8 +2097,12 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     _last_activity[0] = __import__("time").time()
                     _wake_event[0].set()
                     log.info("HTTP wake — reconnecting from auto-sleep")
-                elif sess and not sess._active:
+                elif sess:
                     sess._active = True
+                    if sess._monitoring:
+                        sess._monitoring = False
+                        _persist_monitoring[0] = False
+                        log.info("HTTP wake — exiting monitoring mode")
                     _last_activity[0] = __import__("time").time()
                     log.info("HTTP wake")
                 self.send_response(302)
