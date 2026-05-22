@@ -1867,6 +1867,7 @@ class RealtimeSession:
             if t:
                 log.info("Monitor: %s", t)
                 _log_entry("monitor", t)
+                import time as _tmon; _last_activity[0] = _tmon.time()
             return
 
         # Noise hallucination filter: drop consonant-heavy gibberish.
@@ -1984,13 +1985,15 @@ class RealtimeSession:
         import time as _ti
         while not self.stop_event.is_set():
             await asyncio.sleep(30)
-            if self._monitoring:
-                continue   # never auto-sleep while monitoring is active
             idle = _ti.time() - _last_activity[0]
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
                 log.info("Auto-sleep: idle %d min — disconnecting from OpenAI", mins)
                 _log_entry("system", f"Auto-sleep after {mins} min idle. Say 'Hey Jarvis' or press Wake to resume.")
+                if self._monitoring:
+                    self._monitoring = False
+                    _persist_monitoring[0] = False
+                    log.info("Auto-sleep: monitoring turned off")
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Going to sleep. Say hey Jarvis to wake me up.", self.alsa_output
                 )
