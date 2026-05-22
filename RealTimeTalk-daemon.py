@@ -352,6 +352,7 @@ _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded i
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
+_persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -1632,8 +1633,8 @@ class RealtimeSession:
         self._busy        = asyncio.Event()   # set while Five is speaking
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
-        self._active      = False             # start silent; wake phrase enables voice
-        self._monitoring  = False             # passive capture-only mode (no Five, no TTS)
+        self._active      = False                      # start silent; wake phrase enables voice
+        self._monitoring  = _persist_monitoring[0]     # restored from last session
         self._multilang   = False             # False = only show/process EN/ZH
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
 
@@ -1818,6 +1819,7 @@ class RealtimeSession:
         if _matches_phrase(normalized, MONITOR_ON_PHRASES):
             if not self._monitoring:
                 self._monitoring = True
+                _persist_monitoring[0] = True
                 log.info("Voice command: monitoring ON")
                 _log_entry("system", "Monitoring started.")
                 await asyncio.get_running_loop().run_in_executor(
@@ -1827,6 +1829,7 @@ class RealtimeSession:
         if _matches_phrase(normalized, MONITOR_OFF_PHRASES):
             if self._monitoring:
                 self._monitoring = False
+                _persist_monitoring[0] = False
                 log.info("Voice command: monitoring OFF")
                 _log_entry("system", "Monitoring stopped.")
                 await asyncio.get_running_loop().run_in_executor(
@@ -1981,6 +1984,8 @@ class RealtimeSession:
         import time as _ti
         while not self.stop_event.is_set():
             await asyncio.sleep(30)
+            if self._monitoring:
+                continue   # never auto-sleep while monitoring is active
             idle = _ti.time() - _last_activity[0]
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
@@ -2111,11 +2116,13 @@ def start_http_server(port: int, on_stop, session_ref: list):
                         new_state = not sess._monitoring
                     if new_state and not sess._monitoring:
                         sess._monitoring = True
+                        _persist_monitoring[0] = True
                         sess._active = False  # ensure fully silent
                         log.info("HTTP monitor START — capture-only")
                         _log_entry("system", "Monitoring only - capture display, silent")
                     elif not new_state and sess._monitoring:
                         sess._monitoring = False
+                        _persist_monitoring[0] = False
                         log.info("HTTP monitor STOP")
                         _log_entry("system", "Monitoring stopped")
                 self.send_response(302)
