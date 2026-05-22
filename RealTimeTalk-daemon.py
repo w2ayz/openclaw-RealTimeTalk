@@ -353,6 +353,7 @@ _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI W
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
+_last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -1556,6 +1557,13 @@ class GatewayClient:
                 log.info("Status token %r — fetching reply from history", text)
             await asyncio.sleep(1.2)  # let message-tool result fully persist
             text = await self._reply_from_history(session_key)
+            # Reject stale history: if it matches the last reply we already
+            # delivered, the agent hasn't produced a new response yet.
+            if text and text == _last_five_reply[0]:
+                log.warning("History returned same reply as last time — treating as stale")
+                text = ""
+        if text:
+            _last_five_reply[0] = text
         return text
 
     async def _reply_from_history(self, session_key: str) -> str:
