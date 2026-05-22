@@ -351,6 +351,7 @@ _current_think_task:  list = [None]   # asyncio.Task for current gw.ask(); cance
 _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded in main()
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
+_oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -665,7 +666,8 @@ CALIBRATE_PHRASES = {
 }
 
 WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on",
-                 "five 醒来", "five 醒", "five 开始", "wake up five", "wake up 5"}
+                 "five 醒来", "five 醒", "five 开始", "wake up five", "wake up 5",
+                 "hey jarvis", "hey jarvis wake up"}  # also caught by openwakeword in SLEEP state
 SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
                  "five 睡觉", "five 休息", "five 停", "sleep five"}
 MONITOR_ON_PHRASES  = {"five start monitoring", "start monitoring", "five monitor on",
@@ -1983,9 +1985,9 @@ class RealtimeSession:
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
                 log.info("Auto-sleep: idle %d min — disconnecting from OpenAI", mins)
-                _log_entry("system", f"Auto-sleep after {mins} min idle. Press Wake or say 'Five wake up' to resume.")
+                _log_entry("system", f"Auto-sleep after {mins} min idle. Say 'Hey Jarvis' or press Wake to resume.")
                 await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "Going to sleep. Say Five wake up to resume.", self.alsa_output
+                    None, speak, "Going to sleep. Say hey Jarvis to wake me up.", self.alsa_output
                 )
                 _idle_disconnected[0] = True
                 await ws.close()
@@ -3324,6 +3326,86 @@ setInterval(function(){{
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Toggle: http://<pi-ip>:%d/stop  |  /wake  |  /sleep  |  /status", port)
 
+# ── openwakeword listener ─────────────────────────────────────────────────────
+
+def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
+    """Background thread: always-on local wake word detection via openwakeword.
+
+    Runs independently of the OpenAI session so wake detection works even in
+    SLEEP state (when the OpenAI WebSocket is closed).  Says "Hey Jarvis" to
+    wake Five from sleep; also refreshes _last_activity while awake so a user
+    speaking is never mis-counted as idle.
+    """
+    import queue as _q
+    import time as _ti
+
+    try:
+        import openwakeword as _oww_pkg
+        from openwakeword.model import Model as _OWWModel
+    except ImportError:
+        log.warning("openwakeword not installed — local wake word detection disabled")
+        return
+
+    _models_dir = os.path.join(os.path.dirname(_oww_pkg.__file__), "resources", "models")
+    _model_path = os.path.join(_models_dir, "hey_jarvis_v0.1.onnx")
+    if not os.path.exists(_model_path):
+        log.warning("hey_jarvis model not found at %s — local wake word disabled", _model_path)
+        return
+
+    try:
+        oww = _OWWModel(wakeword_models=[_model_path], inference_framework='onnx')
+    except Exception as exc:
+        log.error("openwakeword model load failed: %s", exc)
+        return
+
+    log.info("openwakeword listener ready — say 'Hey Jarvis' to wake from sleep")
+
+    OWW_RATE  = 16000
+    OWW_CHUNK = 1280   # 80 ms at 16 kHz — openwakeword's native frame size
+    _THRESHOLD = 0.5
+    _DEBOUNCE  = 3.0   # seconds to ignore detections after a trigger
+
+    audio_q: _q.Queue = _q.Queue(maxsize=50)
+
+    def _cb(indata, frames, t, status):
+        if not audio_q.full():
+            audio_q.put_nowait(indata[:, 0].copy())
+
+    last_trigger = 0.0
+    buf = np.array([], dtype=np.int16)
+
+    try:
+        with sd.InputStream(samplerate=OWW_RATE, channels=1, dtype='int16',
+                            blocksize=OWW_CHUNK, callback=_cb,
+                            device=input_device):
+            while not stop_flag[0]:
+                try:
+                    chunk = audio_q.get(timeout=0.15)
+                except _q.Empty:
+                    continue
+                buf = np.concatenate([buf, chunk])
+                while len(buf) >= OWW_CHUNK:
+                    frame = buf[:OWW_CHUNK]
+                    buf   = buf[OWW_CHUNK:]
+                    try:
+                        preds = oww.predict(frame)
+                    except Exception:
+                        continue
+                    score = preds.get('hey_jarvis_v0.1', 0.0)
+                    now   = _ti.time()
+                    if score >= _THRESHOLD and (now - last_trigger) >= _DEBOUNCE:
+                        last_trigger = now
+                        log.info("Wake word detected (score=%.2f)", score)
+                        if _idle_disconnected[0] and _wake_event[0]:
+                            _log_entry("system", "Wake word detected — waking up…")
+                            _last_activity[0] = now
+                            _wake_event[0].set()
+                        else:
+                            _last_activity[0] = now
+    except Exception as exc:
+        log.error("openwakeword listener crashed: %s", exc)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT,
@@ -3356,10 +3438,17 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     import threading as _thr
     _wake_event[0] = _thr.Event()
     _last_activity[0] = __import__("time").time()
+    _oww_stop_flag[0] = False
+    _thr.Thread(
+        target=_oww_wakeword_listener,
+        args=(input_device, _oww_stop_flag),
+        daemon=True,
+        name="oww-wakeword",
+    ).start()
 
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref)
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Five wake up' to activate)")
+    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or 'Five wake up' to activate)")
 
     while not stop_event.is_set():
         session = RealtimeSession(
@@ -3390,6 +3479,9 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             log.info("Reconnecting in %ds…", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
 
+    _oww_stop_flag[0] = True
+    if _wake_event[0]:
+        _wake_event[0].set()   # unblock any waiting executor
     gw_task.cancel()
     await gw.close()
     log.info("Daemon stopped.")

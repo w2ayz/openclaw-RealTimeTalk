@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.9.0 — 2026-05-22
+
+Auto-sleep cost saving and local "Hey Jarvis" wake word so Five can be woken without a phone.
+
+### Added
+
+- **Auto-sleep after 10 min idle.** `_idle_watcher()` coroutine inside `RealtimeSession` disconnects from the OpenAI Realtime WebSocket after `IDLE_SLEEP_MINS` (default 10) minutes of inactivity (no wake phrase, no routed transcript). Dashboard shows a new `SLEEP` state badge (slate). Five announces "Going to sleep. Say hey Jarvis to wake me up." before disconnecting. The main loop waits on `_wake_event` instead of sleeping the normal reconnect delay.
+
+- **Wake-from-sleep via HTTP `/wake`.** The existing `/wake` button on the dashboard sets `_wake_event` when in SLEEP state, reconnecting to OpenAI immediately.
+
+- **`openwakeword` local wake word listener (`_oww_wakeword_listener`).** Background daemon thread started at launch — runs a 16 kHz sounddevice input stream and feeds 80 ms frames to the `hey_jarvis_v0.1` ONNX model. Operates independently of the OpenAI session, so it works even during SLEEP. On detection (score ≥ 0.5, 3 s debounce), sets `_wake_event` (if sleeping) or refreshes `_last_activity` (if active, preventing premature auto-sleep). Thread stops cleanly on daemon exit.
+
+- **"Hey Jarvis" added to `WAKE_PHRASES`.** After waking from sleep and reconnecting to OpenAI, if the user says "hey Jarvis" again it is also treated as a wake command (not routed to Five) — consistent with openwakeword behaviour.
+
+- **`_oww_stop_flag` global.** Signals the openwakeword thread to exit when the daemon shuts down.
+
+- **SLEEP state in dashboard state badge.** Color: `#475569` (slate) on `#0e0e14` background.
+
+---
+
 ## v1.8.1 — 2026-05-21
 
 Gateway WebSocket drops silently after inactivity — transcripts routed to Five failed with `sent 1011 keepalive ping timeout`.
