@@ -3344,7 +3344,7 @@ setInterval(upd, 2000);
 
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta id="autorefresh" http-equiv="refresh" content="3">
+<meta id="autorefresh" http-equiv="refresh" content="60">
 <title>RealTimeTalk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
