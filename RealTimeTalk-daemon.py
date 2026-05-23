@@ -2180,8 +2180,12 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path == "/sleep":
-                if sess and sess._active:
+                if sess:
                     sess._active = False
+                    if sess._monitoring:
+                        sess._monitoring = False
+                        _persist_monitoring[0] = False
+                        log.info("HTTP sleep: monitoring cleared")
                     log.info("HTTP sleep")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
