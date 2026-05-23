@@ -356,6 +356,7 @@ _persist_monitoring:  list = [False]  # monitoring state persisted across sessio
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
+_persist_multilang:   list = [False]  # multilang state persisted across session reconnects
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -1646,7 +1647,7 @@ class RealtimeSession:
         self._calibrating = False
         self._active      = False                      # start silent; wake phrase enables voice
         self._monitoring  = _persist_monitoring[0]     # restored from last session
-        self._multilang   = False             # False = only show/process EN/ZH
+        self._multilang   = _persist_multilang[0]  # restored from last session
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
 
     def _mic_cb(self, indata, frames, time_info, status):
@@ -2017,6 +2018,10 @@ class RealtimeSession:
                     self._monitoring = False
                     _persist_monitoring[0] = False
                     log.info("Auto-sleep: monitoring turned off")
+                if self._multilang:
+                    self._multilang = False
+                    _persist_multilang[0] = False
+                    log.info("Auto-sleep: multi-lang turned off")
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Going to sleep. Say hey Jarvis to wake me up.", self.alsa_output
                 )
@@ -2164,6 +2169,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 # Chinese shown/processed; other languages dropped.
                 if sess:
                     sess._multilang = not sess._multilang
+                    _persist_multilang[0] = sess._multilang
                     state_txt = "ON (all languages)" if sess._multilang else "OFF (EN/ZH only)"
                     log.info("HTTP multilang %s", state_txt)
                     _log_entry("system", f"Multi-language mode: {state_txt}")
