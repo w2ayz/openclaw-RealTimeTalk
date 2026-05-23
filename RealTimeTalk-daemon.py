@@ -2006,6 +2006,8 @@ class RealtimeSession:
         import time as _ti
         while not self.stop_event.is_set():
             await asyncio.sleep(30)
+            if self._multilang:
+                continue  # multi-lang mode keeps session alive indefinitely
             idle = _ti.time() - _last_activity[0]
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
@@ -2165,6 +2167,10 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     state_txt = "ON (all languages)" if sess._multilang else "OFF (EN/ZH only)"
                     log.info("HTTP multilang %s", state_txt)
                     _log_entry("system", f"Multi-language mode: {state_txt}")
+                    if not sess._multilang:
+                        # Reset idle clock so auto-sleep doesn't fire immediately
+                        # after turning off multi-lang (could have been ON for hours).
+                        import time as _tms; _last_activity[0] = _tms.time()
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
