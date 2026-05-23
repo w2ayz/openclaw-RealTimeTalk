@@ -3387,12 +3387,14 @@ a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-
 a.cont:hover{{background:var(--gn);color:#000;}}
 .spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
 .spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
+#hint{{min-height:1.4em;font-size:.8em;color:#64748b;font-family:'JetBrains Mono',monospace;padding:3px 2px 0;transition:opacity .15s;}}
 @media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:9px 12px;font-size:13px;}}}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}">&#128065; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — Five will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#128276; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Stop passive monitoring' if monitoring else 'Start passive monitoring — transcribes speech without routing to Five'}">&#128065; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Cycle language mode (now: OFF — EN/ZH only, auto-sleep on)' if multilang == 'off' else 'Cycle language mode (now: EN/ZH only, auto-sleep off)' if multilang == 'en-zh' else 'Cycle language mode (now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off)' if multilang == 'whitelist' else 'Cycle language mode (now: Any language, auto-sleep off)'}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect Five&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div id="hint"></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -3408,6 +3410,14 @@ setInterval(function(){{
     if(dp) dp.innerHTML='&#127908; '+d.mic+' &ensp;&#128266; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
   }}).catch(function(){{}});
 }}, 5000);
+(function(){{
+  var hint=document.getElementById('hint');
+  if(!hint) return;
+  document.querySelectorAll('.btn[data-hint]').forEach(function(b){{
+    b.addEventListener('mouseenter',function(){{hint.textContent=b.dataset.hint;}});
+    b.addEventListener('mouseleave',function(){{hint.textContent='';}});
+  }});
+}})();
 </script>
 </body></html>"""
                 _html(self, 200, body)
