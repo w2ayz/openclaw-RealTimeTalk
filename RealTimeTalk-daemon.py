@@ -3403,9 +3403,9 @@ setInterval(function(){{
   }}).catch(function(){{}});
 }}, 5000);
 (function(){{
-  var _rt=setTimeout(()=>location.reload(),10000);
+  var _rt=setTimeout(()=>location.reload(),3000);
   function _cancelReload(){{clearTimeout(_rt);}}
-  function _scheduleReload(){{_rt=setTimeout(()=>location.reload(),10000);}}
+  function _scheduleReload(){{_rt=setTimeout(()=>location.reload(),3000);}}
   document.querySelectorAll('.btn[data-hint]').forEach(function(b){{
     b.addEventListener('mouseenter',function(){{
       _cancelReload();
