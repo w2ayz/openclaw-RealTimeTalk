@@ -3261,20 +3261,14 @@ setInterval(upd, 2000);
                 if _device_change_msg[0]:
                     device_banner = (
                         f'<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
-                        f'color:#f59e0b;">'
+                        f'color:#f59e0b;padding:3px 8px;">'
                         f'{_device_change_msg[0]}</div>'
                         f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
-                        f'if(b)b.remove();}},5000);</script>'
+                        f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
                 else:
-                    device_banner = (
-                        f'<div id="dbanner" style="background:#021a0e;border:1px solid #34d399;'
-                        f'color:#34d399;">'
-                        f'No device change detected.</div>'
-                        f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
-                        f'if(b)b.remove();}},5000);</script>'
-                    )
+                    device_banner = '<div id="dbanner"></div>'
 
                 active     = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
@@ -3387,14 +3381,13 @@ a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-
 a.cont:hover{{background:var(--gn);color:#000;}}
 .spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
 .spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
-#hint{{min-height:1.4em;font-size:.8em;color:#64748b;font-family:'JetBrains Mono',monospace;padding:3px 2px 0;transition:opacity .15s;}}
+#dbanner{{min-height:1.2em;font-size:.8em;font-family:'JetBrains Mono',monospace;padding:3px 8px;transition:color .1s;}}
 @media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:9px 12px;font-size:13px;}}}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
 <div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — Five will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#128276; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Stop passive monitoring' if monitoring else 'Start passive monitoring — transcribes speech without routing to Five'}">&#128065; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Cycle language mode (now: OFF — EN/ZH only, auto-sleep on)' if multilang == 'off' else 'Cycle language mode (now: EN/ZH only, auto-sleep off)' if multilang == 'en-zh' else 'Cycle language mode (now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off)' if multilang == 'whitelist' else 'Cycle language mode (now: Any language, auto-sleep off)'}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect Five&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
-<div id="hint"></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -3411,11 +3404,15 @@ setInterval(function(){{
   }}).catch(function(){{}});
 }}, 5000);
 (function(){{
-  var hint=document.getElementById('hint');
-  if(!hint) return;
   document.querySelectorAll('.btn[data-hint]').forEach(function(b){{
-    b.addEventListener('mouseenter',function(){{hint.textContent=b.dataset.hint;}});
-    b.addEventListener('mouseleave',function(){{hint.textContent='';}});
+    b.addEventListener('mouseenter',function(){{
+      var h=document.getElementById('dbanner');
+      if(h&&!h.style.background){{h.textContent=b.dataset.hint;h.style.color='#64748b';}}
+    }});
+    b.addEventListener('mouseleave',function(){{
+      var h=document.getElementById('dbanner');
+      if(h&&!h.style.background){{h.textContent='';h.style.color='';}}
+    }});
   }});
 }})();
 </script>
