@@ -354,6 +354,7 @@ _wake_event:          list = [None]   # threading.Event; set by /wake to reconne
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
+_wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -2103,6 +2104,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 if _idle_disconnected[0] and _wake_event[0]:
                     # Reconnect from auto-sleep
                     _last_activity[0] = __import__("time").time()
+                    _wake_activate[0] = True
                     _wake_event[0].set()
                     log.info("HTTP wake — reconnecting from auto-sleep")
                 elif sess:
@@ -3425,6 +3427,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                         if _idle_disconnected[0] and _wake_event[0]:
                             _log_entry("system", "Wake word detected — waking up…")
                             _last_activity[0] = now
+                            _wake_activate[0] = True
                             _wake_event[0].set()
                         else:
                             _last_activity[0] = now
@@ -3483,6 +3486,10 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             input_device=input_device, alsa_output=alsa_output,
             session_key=session_key,
         )
+        if _wake_activate[0]:
+            session._active = True
+            _wake_activate[0] = False
+            log.info("Wake-from-sleep: session started active")
         session_ref[0] = session
         try:
             await session.run()
