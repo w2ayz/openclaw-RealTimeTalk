@@ -21,15 +21,15 @@ Icons use BMP Unicode symbols (render on Pi/Chromium without a color emoji font)
 | ☾ | **Sleep** | — | Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume |
 | ◎ | **Monitor** | inactive | Now: OFF. Click → start passive monitoring (transcribes without routing to agent) |
 | ◎ | **Monitor On** | active (highlighted) | Now: Monitoring ON. Click → stop monitoring |
-| ⊕ | **OFF-Sleep** | multilang = off | Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off) |
-| ⊕ | **EN/ZH** | multilang = en-zh | Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS) |
-| ⊕ | **Whitelist** | multilang = whitelist | Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language |
-| ⊕ | **Any** | multilang = any | Now: Any language — auto-sleep off. Click → OFF |
+| ⊕ | **Multi-lang** | multilang = off (inactive) | Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off) |
+| ⊕ | **Multi-lang** | multilang = en-zh (highlighted) | Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS) |
+| ⊕ | **Multi-lang** | multilang = whitelist (highlighted) | Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language |
+| ⊕ | **Multi-lang** | multilang = any (highlighted) | Now: Any language — auto-sleep off. Click → OFF |
 | ✖ | **Clear Log** | danger style | Clear the conversation log (does not affect the agent's memory) |
 | ↻ | **Restart** | — | Restart the RealTimeTalk daemon (reconnects OpenAI and gateway) |
 | ⚠ | **Gateway Reset** | danger style | Drop and reconnect the OpenClaw gateway WebSocket without restarting |
 
-> **Multi-lang button** cycles through 4 states on each click: OFF-Sleep → EN/ZH → Whitelist → Any → OFF-Sleep.  
+> **Multi-lang button** label is always "Multi-lang"; cycles through 4 states on each click: OFF → EN/ZH → Whitelist → Any → OFF. Current state is shown in the hint text. Button is highlighted (active style) whenever state is not OFF.  
 > **Monitor button** is a 2-state toggle: Monitor ↔ Monitor On.
 
 ### State Pill (header, not clickable)
