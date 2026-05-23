@@ -1,5 +1,46 @@
 # Changelog
 
+## v2.0.0 — 2026-05-22
+
+Multi-language whitelist, monitoring UX overhaul, PAUSED-state listening fix, dashboard button hints, and a round of reliability fixes.
+
+### Added
+
+- **4-state multi-lang cycle.** Dashboard button cycles OFF → EN/ZH → Whitelist → Any → OFF.
+  - **OFF** — EN/ZH only, auto-sleep on (original default).
+  - **EN/ZH** — EN/ZH only, auto-sleep suppressed.
+  - **Whitelist** — accept only `MULTILANG_WHITELIST_LANGS` (default: `en`, `zh-cn`, `zh-tw`, `zh`, `ko`, `ja`, `es`, `ms`), auto-sleep suppressed.
+  - **Any** — all languages pass, auto-sleep suppressed.
+  - `_is_in_multilang_whitelist()` uses Unicode script ranges (Hangul → ko, kana → ja, CJK → zh, Arabic, Cyrillic, Devanagari) then falls back to langdetect for Latin-script text. Add/remove codes from `MULTILANG_WHITELIST_LANGS` to extend the list.
+
+- **Monitor button combined.** Single toggle button replaces separate Monitor On / Monitor Off buttons. Label shows `Monitor` (inactive) or `Monitor On` highlighted (active).
+
+- **Sleep button clears monitoring.** Clicking Sleep now also turns off monitoring in one tap.
+
+- **Button hover hints.** Hovering any nav button shows a description in the device banner area. The noisy "No device change detected." green bar is replaced by this silent hint zone. Hints are state-aware (Monitor and Lang describe current state). Page reload is paused while hovering so hints stay visible; resumes on mouseleave.
+
+- **JS-controlled page reload.** `<meta http-equiv="refresh">` replaced with a `setTimeout`-based reload (3 s) that can be `clearTimeout`'d on hover — giving reliable hint display without changing refresh cadence.
+
+### Fixed
+
+- **Wake-from-sleep immediately activates voice.** openwakeword detection and HTTP `/wake` both set `_wake_activate` flag before signalling `_wake_event`. New session starts with `_active=True` so the user can speak immediately without needing a second wake phrase.
+
+- **Voice input works immediately after TTS interrupt (PAUSED state).** Echo gate reduced from 600 ms → 150 ms when TTS is interrupted (speaker stops instantly when killed). `input_audio_buffer.clear` sent to OpenAI on resume so stale audio doesn't confuse VAD. Full 600 ms gate still applies after normal TTS completion.
+
+- **Multi-lang state persists across OpenAI 60-min session reconnects.** OpenAI Realtime API has a hard 60-min session limit. New sessions now restore `_multilang` from `_persist_multilang` (same pattern as `_persist_monitoring`), preventing auto-sleep from firing immediately after reconnect when multi-lang was suppressing it.
+
+- **Monitoring state badge persists across reconnects.** `_persist_monitoring` restored in `RealtimeSession.__init__` so MONITORING badge survives the 60-min OpenAI session expiry reconnect.
+
+- **Wake phrase / Wake button exits monitoring mode.** Saying a wake phrase or clicking Wake while monitoring now clears `_monitoring` and `_persist_monitoring` so Five becomes voice-active rather than staying in capture-only mode.
+
+- **Auto-sleep fires during monitoring after 10 min idle.** Monitoring transcripts update `_last_activity`; if the room is silent for `IDLE_SLEEP_MINS`, auto-sleep triggers and monitoring is cleared cleanly.
+
+- **Gateway reconnect loop no longer crashes on RuntimeError.** Inner reconnect `except` clause broadened from `(ConnectionRefusedError, OSError)` to `Exception` so any startup error is caught and retried rather than escaping and leaving `_ready` permanently unset.
+
+- **Stale reply no longer served after gateway queue backup.** `ask()` compares new history reply against `_last_five_reply`; if identical, treats it as a stale cache hit and returns empty so the user is prompted to retry rather than receiving a recycled answer.
+
+---
+
 ## v1.9.0 — 2026-05-22
 
 Auto-sleep cost saving and local "Hey Jarvis" wake word so Five can be woken without a phone.
