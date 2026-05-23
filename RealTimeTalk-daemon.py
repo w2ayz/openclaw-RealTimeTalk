@@ -3344,7 +3344,6 @@ setInterval(upd, 2000);
 
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta id="autorefresh" http-equiv="refresh" content="60">
 <title>RealTimeTalk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
@@ -3404,15 +3403,17 @@ setInterval(function(){{
   }}).catch(function(){{}});
 }}, 5000);
 (function(){{
-  var ar=document.getElementById('autorefresh');
+  var _rt=setTimeout(()=>location.reload(),10000);
+  function _cancelReload(){{clearTimeout(_rt);}}
+  function _scheduleReload(){{_rt=setTimeout(()=>location.reload(),10000);}}
   document.querySelectorAll('.btn[data-hint]').forEach(function(b){{
     b.addEventListener('mouseenter',function(){{
-      if(ar) ar.removeAttribute('content');
+      _cancelReload();
       var h=document.getElementById('dbanner');
       if(h&&!h.style.background){{h.textContent=b.dataset.hint;h.style.color='#64748b';}}
     }});
     b.addEventListener('mouseleave',function(){{
-      if(ar) ar.setAttribute('content','3');
+      _scheduleReload();
       var h=document.getElementById('dbanner');
       if(h&&!h.style.background){{h.textContent='';h.style.color='';}}
     }});
