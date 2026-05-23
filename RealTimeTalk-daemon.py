@@ -3388,7 +3388,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}">&#128065; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
