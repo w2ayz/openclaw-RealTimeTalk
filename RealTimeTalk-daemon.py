@@ -85,6 +85,11 @@ DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
 IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
+
+# Languages accepted in multi-lang WHITELIST mode.
+# Add/remove langdetect codes as needed.  Special tokens used for script matching:
+#   "ko"="ko"  "ja"="ja"  "zh"=any CJK  "ar"=Arabic script  "ru"=Cyrillic  "hi"=Devanagari
+MULTILANG_WHITELIST_LANGS: list[str] = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
 AGENT_TIMEOUT_S   = 45
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
@@ -356,7 +361,7 @@ _persist_monitoring:  list = [False]  # monitoring state persisted across sessio
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
-_persist_multilang:   list = [False]  # multilang state persisted across session reconnects
+_persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -722,6 +727,41 @@ def _is_english_or_chinese(text: str) -> bool:
                 return False
         except _LangDetectException:
             pass  # inconclusive — let it through
+    return True
+
+def _is_in_multilang_whitelist(text: str) -> bool:
+    """Return True if text appears to be in a MULTILANG_WHITELIST_LANGS language.
+
+    Script ranges are checked first (fast, unambiguous); langdetect is used for
+    Latin-script text.  Inconclusive → let through.  To add a language, append
+    its langdetect code to MULTILANG_WHITELIST_LANGS.
+    """
+    has_hangul = has_kana = has_arabic = has_cyril = has_deva = has_cjk = False
+    for ch in text:
+        cp = ord(ch)
+        if   0xAC00 <= cp <= 0xD7AF:                             has_hangul = True
+        elif 0x3040 <= cp <= 0x30FF:                             has_kana   = True
+        elif 0x0600 <= cp <= 0x06FF:                             has_arabic = True
+        elif 0x0400 <= cp <= 0x04FF:                             has_cyril  = True
+        elif 0x0900 <= cp <= 0x097F:                             has_deva   = True
+        elif 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:  has_cjk    = True
+
+    if has_hangul: return "ko" in MULTILANG_WHITELIST_LANGS
+    if has_kana:   return "ja" in MULTILANG_WHITELIST_LANGS
+    if has_arabic: return "ar" in MULTILANG_WHITELIST_LANGS
+    if has_cyril:  return any(c in MULTILANG_WHITELIST_LANGS for c in ("ru","uk","bg","sr","mk"))
+    if has_deva:   return any(c in MULTILANG_WHITELIST_LANGS for c in ("hi","mr","ne"))
+    if has_cjk:    return any(c in MULTILANG_WHITELIST_LANGS for c in ("zh","zh-cn","zh-tw"))
+
+    # Pure Latin-script — use langdetect to distinguish EN/ES/MS/FR/etc.
+    if _HAVE_LANGDETECT and len(text.split()) >= 2:
+        try:
+            lang = _langdetect(text)
+            if lang not in MULTILANG_WHITELIST_LANGS:
+                log.info("whitelist rejected %r as %r", text[:60], lang)
+                return False
+        except _LangDetectException:
+            pass  # inconclusive → let through
     return True
 
 def _normalize(text: str) -> str:
@@ -1876,11 +1916,17 @@ class RealtimeSession:
                     self._busy.clear()
             return
 
-        # Language gate: drop non-EN/ZH transcripts (noise hallucinations in
-        # other scripts). Control phrases above are already handled and exempt.
-        if not self._multilang and not _is_english_or_chinese(transcript):
-            log.debug("Dropped non-EN/ZH (multilang off): %r", transcript)
-            return
+        # Language gate — behaviour depends on multi-lang mode:
+        #   "off" / "en-zh" → EN/ZH only   "whitelist" → MULTILANG_WHITELIST_LANGS
+        #   "any"           → all languages pass through
+        if self._multilang in ("off", "en-zh"):
+            if not _is_english_or_chinese(transcript):
+                log.debug("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
+                return
+        elif self._multilang == "whitelist":
+            if not _is_in_multilang_whitelist(transcript):
+                log.debug("Dropped off-whitelist: %r", transcript)
+                return
 
         # Monitoring-only mode: passively log captured segments (no Five/TTS).
         if self._monitoring:
@@ -2007,8 +2053,8 @@ class RealtimeSession:
         import time as _ti
         while not self.stop_event.is_set():
             await asyncio.sleep(30)
-            if self._multilang:
-                continue  # multi-lang mode keeps session alive indefinitely
+            if self._multilang != "off":
+                continue  # any non-off state keeps session alive indefinitely
             idle = _ti.time() - _last_activity[0]
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
@@ -2018,10 +2064,10 @@ class RealtimeSession:
                     self._monitoring = False
                     _persist_monitoring[0] = False
                     log.info("Auto-sleep: monitoring turned off")
-                if self._multilang:
-                    self._multilang = False
-                    _persist_multilang[0] = False
-                    log.info("Auto-sleep: multi-lang turned off")
+                if self._multilang != "off":
+                    self._multilang = "off"
+                    _persist_multilang[0] = "off"
+                    log.info("Auto-sleep: multi-lang reset to off")
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Going to sleep. Say hey Jarvis to wake me up.", self.alsa_output
                 )
@@ -2165,17 +2211,23 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path == "/multilang":
-                # Toggle multi-language mode. Off (default) = only English/
-                # Chinese shown/processed; other languages dropped.
+                # Cycle: off → en-zh → whitelist → any → off
+                _MULTILANG_CYCLE = ("off", "en-zh", "whitelist", "any")
+                _MULTILANG_LABELS = {
+                    "off":      "OFF (EN/ZH, auto-sleep on)",
+                    "en-zh":    "EN/ZH (auto-sleep off)",
+                    "whitelist": f"Whitelist ({', '.join(MULTILANG_WHITELIST_LANGS[:4])}…)",
+                    "any":      "Any language",
+                }
                 if sess:
-                    sess._multilang = not sess._multilang
-                    _persist_multilang[0] = sess._multilang
-                    state_txt = "ON (all languages)" if sess._multilang else "OFF (EN/ZH only)"
-                    log.info("HTTP multilang %s", state_txt)
-                    _log_entry("system", f"Multi-language mode: {state_txt}")
-                    if not sess._multilang:
-                        # Reset idle clock so auto-sleep doesn't fire immediately
-                        # after turning off multi-lang (could have been ON for hours).
+                    cur = sess._multilang
+                    nxt = _MULTILANG_CYCLE[(_MULTILANG_CYCLE.index(cur) + 1) % len(_MULTILANG_CYCLE)]
+                    sess._multilang = nxt
+                    _persist_multilang[0] = nxt
+                    log.info("HTTP multilang: %s → %s", cur, nxt)
+                    _log_entry("system", f"Multi-language: {_MULTILANG_LABELS[nxt]}")
+                    if nxt == "off":
+                        # Reset idle clock so auto-sleep starts fresh, not immediately.
                         import time as _tms; _last_activity[0] = _tms.time()
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
@@ -3222,7 +3274,7 @@ setInterval(upd, 2000);
 
                 active     = sess._active if sess else False
                 monitoring = sess._monitoring if sess else False
-                multilang  = sess._multilang if sess else False
+                multilang  = sess._multilang if sess else "off"
                 paused     = _paused_speech[0] is not None
                 speaking   = _is_speaking[0]
                 thinking   = _current_think_task[0] is not None
@@ -3336,7 +3388,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang else ''}">&#127760; {'ON' if multilang else 'OFF'} Multi-lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn">&#9889; Wake</a><a href="/sleep" class="btn">&#128276; Sleep</a><a href="/monitor/start" class="btn {'on' if monitoring else ''}">&#128065; Monitor On</a><a href="/monitor/stop" class="btn">Monitor Off</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}">&#127760; {'OFF' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Wlist' if multilang == 'whitelist' else 'Any'} Lang</a><a href="/reset" class="btn danger">&#10006; Clear Log</a><a href="/restart" class="btn">&#8635; Restart</a><a href="/gateway-reset" class="btn danger">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
