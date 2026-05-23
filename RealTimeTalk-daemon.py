@@ -355,6 +355,7 @@ _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listen
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
+_clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -1286,6 +1287,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                         log.info("Speech interrupt — stopping TTS (peak=%d thr=%d)",
                                  p, interrupt_threshold[0])
                         _interrupted[0] = True
+                        _clear_audio_buffer[0] = True
                         try: proc.kill()
                         except Exception: pass
                         break
@@ -1353,10 +1355,10 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         log.error("speak() error: %s", e)
     finally:
         _is_speaking[0] = False
-        # Always gate the mic after TTS so room echo doesn't get transcribed,
-        # regardless of whether _busy is managed by the caller.
+        # Short gate when interrupted (speaker stops instantly, no echo tail).
+        # Full 600 ms gate when TTS completes normally (speaker rings down).
         import time as _t_sp
-        _post_busy_until[0] = _t_sp.time() + 0.6
+        _post_busy_until[0] = _t_sp.time() + (0.15 if _interrupted[0] else 0.6)
         for p in wav_parts:
             try: os.unlink(p)
             except FileNotFoundError: pass
@@ -1768,6 +1770,11 @@ class RealtimeSession:
                 continue
             if self._busy.is_set():
                 continue
+            # After TTS interrupt, clear OpenAI's audio buffer so stale data
+            # doesn't confuse VAD — let the user start fresh.
+            if _clear_audio_buffer[0]:
+                _clear_audio_buffer[0] = False
+                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
             await ws.send(json.dumps({
                 "type":  "input_audio_buffer.append",
                 "audio": base64.b64encode(chunk).decode(),
@@ -1950,9 +1957,10 @@ class RealtimeSession:
             log.error("Error routing transcript: %s", e)
             _log_entry("five", "")   # clears the thinking counter on dashboard
         finally:
-            # Set echo gate: mic_cb discards audio until this timestamp expires
+            # Short gate when TTS was interrupted (speaker stops instantly — 150 ms
+            # is enough for room echo to clear).  Full gate after normal completion.
             import time as _t_gate3
-            _post_busy_until[0] = _t_gate3.time() + 0.6
+            _post_busy_until[0] = _t_gate3.time() + (0.15 if _paused_speech[0] is not None else 0.6)
             self._busy.clear()
 
     async def _recv_ws(self, ws):
