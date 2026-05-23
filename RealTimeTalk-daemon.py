@@ -3296,7 +3296,7 @@ setInterval(upd, 2000);
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
 
                 speaking_banner = (
-                    '<div class="spkbanner">&#128266; Five is speaking&hellip;'
+                    '<div class="spkbanner">&#9834; Five is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if speaking else
                     '<div class="spkbanner paused">&#9646;&#9646; Paused'
@@ -3342,8 +3342,8 @@ setInterval(upd, 2000);
 
                 _ds = _get_device_status()
                 device_panel = (
-                    f'<div id="dp">&#127908; {_ds["mic"]} &ensp;'
-                    f'&#128266; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
+                    f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
+                    f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
                     f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x</div>'
                 )
 
@@ -3391,7 +3391,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#128276; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#128066; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#127760; {'OFF-Sleep' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Whitelist' if multilang == 'whitelist' else 'Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'OFF-Sleep' if multilang == 'off' else 'EN/ZH' if multilang == 'en-zh' else 'Whitelist' if multilang == 'whitelist' else 'Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -3404,7 +3404,7 @@ setInterval(function(){{
 setInterval(function(){{
   fetch('/speaker-cal/vol').then(function(r){{return r.json();}}).then(function(d){{
     var dp=document.getElementById('dp');
-    if(dp) dp.innerHTML='&#127908; '+d.mic+' &ensp;&#128266; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
+    if(dp) dp.innerHTML='&#9673; '+d.mic+' &ensp;&#9834; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
   }}).catch(function(){{}});
 }}, 5000);
 (function(){{

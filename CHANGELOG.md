@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.0.1 — 2026-05-23
+
+### Fixed
+
+- **Emoji rendering on Pi/Chromium.** Replaced all SMP-range emoji (U+1F000+) in the dashboard HTML with BMP Unicode symbols that render on Chromium without a color emoji font installed: 🔔→☾ (Sleep), 👂→◎ (Monitor), 🌐→⊕ (Language), 🎤→◉ (mic), 🔊→♪ (speaker).
+
+---
+
 ## v2.0.0 — 2026-05-22
 
 Multi-language whitelist, monitoring UX overhaul, PAUSED-state listening fix, dashboard button hints, and a round of reliability fixes.
