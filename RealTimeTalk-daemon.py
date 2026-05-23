@@ -2206,6 +2206,11 @@ def start_http_server(port: int, on_stop, session_ref: list):
                         sess._active = False  # ensure fully silent
                         log.info("HTTP monitor START — capture-only")
                         _log_entry("system", "Monitoring only - capture display, silent")
+                        # Wake from sleep if needed — monitoring requires OpenAI connection
+                        if _idle_disconnected[0] and _wake_event[0]:
+                            import time as _tmon_w; _last_activity[0] = _tmon_w.time()
+                            _wake_event[0].set()
+                            log.info("HTTP monitor START — waking from sleep")
                     elif not new_state and sess._monitoring:
                         sess._monitoring = False
                         _persist_monitoring[0] = False
