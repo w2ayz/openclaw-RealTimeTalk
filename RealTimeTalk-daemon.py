@@ -1267,7 +1267,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _output_peak   = int(np.max(np.abs(_final_pcm))) if len(_final_pcm) else 0
         _TICK_SAMPLES  = max(1, _sr * 50 // 1000)   # samples per 50ms tick
         _GUARD_TICKS   = 20                          # 1s guard: 300ms silence + 700ms audio
-        _SAFETY        = 1.8                         # threshold = echo × 1.8
+        _SAFETY        = 3.5                         # threshold = echo × 3.5 (reverb can be 3-4× guard measurement)
 
         mic_peaks_during: list[int] = []
         _interrupted   = [False]
