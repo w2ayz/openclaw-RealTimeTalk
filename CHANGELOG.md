@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.0.2 — 2026-05-24
+
+### Fixed
+
+- **Self-waking from sleep.** The "Going to sleep" TTS announcement said "hey Jarvis" out loud, which the wake-word detector heard through the mic and immediately re-triggered. Shortened announcement to "Going to sleep."
+- **Stuck SLEEPING state after wake word during shutdown.** Wake word fired while auto-sleep was still closing the OpenAI WebSocket; `_idle_disconnected` wasn't set yet so the wake event was silently dropped and the system got stuck waiting. Fixed by setting `_idle_disconnected = True` before the TTS, so any wake word during the announcement correctly triggers reconnect.
+- **Stuck "Resuming…" banner.** `_handle_transcript` runs as concurrent `create_task` instances. Repeated "I said continue" phrases each found `_paused_speech[0]` still set and launched another `speak()` in the executor, deadlocking sounddevice. Fixed by clearing `_paused_speech[0]` immediately on entry and guarding with `_busy.is_set()`. Same fix applied to HTTP `/continue`.
+- **Foreign language hallucinations with multilang OFF.** Single-word pure-ASCII foreign words ("Esquece", "Senhores", "Legjeni", "Adineu") bypassed the character-level filter and the langdetect check (which only ran on ≥2-word texts). Extended the short-word noise guard from `< 6` to `< 9` chars; whitelisted useful English single-word responses (thanks, please, repeat, exactly, correct, alright, right, great).
+- **Five interrupting itself during TTS.** Two-part fix: (1) raised `SPEAK_INTERRUPT_PEAK` floor from 1200 → 4000 to clear AGC-boosted ambient noise on the Pi/headset; (2) raised interrupt safety margin `_SAFETY` from 1.8× → 3.5× to account for reverb building after the guard period.
+- **Garbled/wavering Bluetooth audio.** TTS was played via `aplay -D default` which routes through the ALSA→PipeWire compat layer with poor resampling (Piper 22050 Hz mono → Bluetooth 48000 Hz stereo via SBC). Switched to `paplay` for `default`/`pulse` output — PipeWire-native, handles resampling and Bluetooth codec path correctly.
+- **Multi-lang button label.** Button now shows active mode in the label: "Multi-lang" (off), "Lang: EN/ZH", "Lang: List", "Lang: Any" — consistent with Monitor button pattern.
+
+### Changed
+
+- **SLEEP → SLEEPING.** State pill label renamed for clarity.
+- **SLEEPING banner.** When sleeping, the device banner shows `Say "Hey Jarvis" or press Wake to resume.` instead of being blank.
+- **TTS interrupt floor and safety margin.** `SPEAK_INTERRUPT_PEAK` 1200 → 4000; `_SAFETY` 1.8 → 3.5.
+
+---
+
 ## v2.0.1 — 2026-05-23
 
 ### Fixed
