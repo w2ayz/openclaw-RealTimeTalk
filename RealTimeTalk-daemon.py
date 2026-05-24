@@ -1337,23 +1337,28 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 else:
                     consec = 0
 
+        # Use paplay (PipeWire-native) for default sink — better resampling and
+        # Bluetooth handling than aplay -D default (ALSA compat layer).
+        _play_cmd = (["paplay", final_wav]
+                     if alsa_output in ("default", "pulse")
+                     else ["aplay", "-D", alsa_output, "-q", final_wav])
+        _play_fallback = ["paplay", final_wav]
+
         _is_speaking[0] = True
         if interruptible:
             _m = _threading.Thread(daemon=True, target=_monitor_and_play,
-                                   args=(["aplay", "-D", alsa_output, "-q", final_wav],))
+                                   args=(_play_cmd,))
             _m.start(); _m.join()
-            if not _interrupted[0] and _aplay_rc[0] != 0 and alsa_output != "pulse":
-                log.warning("aplay failed on %s, retrying via pulse", alsa_output)
+            if not _interrupted[0] and _aplay_rc[0] != 0 and _play_cmd != _play_fallback:
+                log.warning("playback failed on %s, retrying via paplay", alsa_output)
                 _m2 = _threading.Thread(daemon=True, target=_monitor_and_play,
-                                        args=(["aplay", "-D", "pulse", "-q", final_wav],))
+                                        args=(_play_fallback,))
                 _m2.start(); _m2.join()
         else:
             # Non-interruptible: play to completion, no interrupt monitor
-            rc = subprocess.call(["aplay", "-D", alsa_output, "-q", final_wav],
-                                 stderr=subprocess.DEVNULL)
-            if rc != 0 and alsa_output != "pulse":
-                subprocess.call(["aplay", "-D", "pulse", "-q", final_wav],
-                                stderr=subprocess.DEVNULL)
+            rc = subprocess.call(_play_cmd, stderr=subprocess.DEVNULL)
+            if rc != 0 and _play_cmd != _play_fallback:
+                subprocess.call(_play_fallback, stderr=subprocess.DEVNULL)
         _is_speaking[0] = False
 
         # Save text for /continue if interrupted mid-sentence; clear on normal finish.
