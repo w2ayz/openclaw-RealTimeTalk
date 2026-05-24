@@ -3295,7 +3295,7 @@ setInterval(upd, 2000);
                 speaking   = _is_speaking[0]
                 thinking   = _current_think_task[0] is not None
 
-                state = ("SLEEP"      if _idle_disconnected[0]
+                state = ("SLEEPING"   if _idle_disconnected[0]
                          else "MONITORING" if monitoring
                          else "SPEAKING"   if speaking
                          else "THINKING"   if thinking
@@ -3304,7 +3304,7 @@ setInterval(upd, 2000);
                 _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
                        "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
                        "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
-                       "SLEEP":("#0e0e14","#475569"),
+                       "SLEEPING":("#0e0e14","#475569"),
                        }.get(state,("#141d2b","#64748b"))
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
 
