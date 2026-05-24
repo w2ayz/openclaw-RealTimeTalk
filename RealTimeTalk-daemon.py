@@ -2068,10 +2068,10 @@ class RealtimeSession:
                     self._multilang = "off"
                     _persist_multilang[0] = "off"
                     log.info("Auto-sleep: multi-lang reset to off")
+                _idle_disconnected[0] = True
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Going to sleep. Say hey Jarvis to wake me up.", self.alsa_output
                 )
-                _idle_disconnected[0] = True
                 await ws.close()
                 return
 
