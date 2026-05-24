@@ -144,7 +144,7 @@ CAL_NEW_DEV_PW    = 1      # PipeWire % for unknown device (minimum safe)
 CAL_NEW_DEV_SW    = 0.10   # SW for unknown device (10% — clearly audible but not loud)
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Five is speaking, kill TTS immediately.
-SPEAK_INTERRUPT_PEAK   = 1200  # raw mic peak to trigger interrupt (AGC speech >> background)
+SPEAK_INTERRUPT_PEAK   = 4000  # raw mic peak to trigger interrupt (AGC speech >> background)
 SPEAK_INTERRUPT_BLOCKS = 6     # × 50 ms = 300 ms sustained speech → interrupt
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
