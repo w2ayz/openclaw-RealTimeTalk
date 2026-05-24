@@ -1901,7 +1901,8 @@ class RealtimeSession:
         # Continue phrase — resume paused TTS without asking Five again
         if _matches_phrase(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
-            if saved:
+            if saved and not self._busy.is_set():
+                _paused_speech[0] = None  # clear immediately so concurrent tasks don't re-enter
                 saved_text, saved_dev = saved
                 log.info("Voice continue — resuming %d chars", len(saved_text))
                 _log_entry("system", "Resuming…")
@@ -2244,6 +2245,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
             elif self.path == "/continue":
                 saved = _paused_speech[0]
                 if saved and sess and sess.loop:
+                    _paused_speech[0] = None  # clear immediately so double-clicks don't re-enter
                     saved_text, saved_dev = saved
                     def _resume():
                         asyncio.run_coroutine_threadsafe(
