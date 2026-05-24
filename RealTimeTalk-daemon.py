@@ -3285,6 +3285,11 @@ setInterval(upd, 2000);
                         f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
+                elif _idle_disconnected[0]:
+                    device_banner = (
+                        '<div id="dbanner" style="color:#475569;font-style:italic;">'
+                        'Say &#8220;Hey Jarvis&#8221; or press Wake to resume.</div>'
+                    )
                 else:
                     device_banner = '<div id="dbanner"></div>'
 
