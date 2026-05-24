@@ -718,7 +718,9 @@ def _is_english_or_chinese(text: str) -> bool:
         return False
     # Pure ASCII — use langdetect on ≥2-word texts to catch other Latin-script
     # languages (French, Dutch, German, etc.) that GPT-4o hallucinates.
-    # Threshold is 2 (not 3) so short phrases like "naar voren" are still caught.
+    # Single words are handled by the extended short-word noise guard downstream
+    # (single words < 9 chars are dropped unless whitelisted).
+    # langdetect is unreliable on single short words so we skip it for them.
     if _HAVE_LANGDETECT and len(text.split()) >= 2:
         try:
             lang = _langdetect(text)
@@ -1948,13 +1950,17 @@ class RealtimeSession:
             log.debug("Silent mode — ignoring: %s", transcript)
             return
 
-        # Short-word noise guard: single words under 6 characters that aren't
-        # known commands are almost always noise hallucinations, not real speech.
+        # Short-word noise guard: single words under 9 characters that aren't
+        # known commands are almost always noise hallucinations or foreign-word
+        # hallucinations (e.g. "Esquece", "Senhores", "Legjeni") that slip past
+        # the character-level language filter. langdetect is unreliable on single
+        # short words so we handle them here instead.
         _SHORT_CMDS = {"ok", "okay", "yes", "no", "sure", "go", "stop", "wait",
-                       "help", "hey", "hi", "bye", "好", "是", "否", "不", "对",
-                       "继续", "再来", "谢谢", "好的"}
+                       "help", "hey", "hi", "bye", "right", "great", "thanks",
+                       "please", "repeat", "exactly", "correct", "alright",
+                       "好", "是", "否", "不", "对", "继续", "再来", "谢谢", "好的"}
         _norm_words = normalized.split()
-        if len(_norm_words) == 1 and len(normalized) < 6 and normalized not in _SHORT_CMDS:
+        if len(_norm_words) == 1 and len(normalized) < 9 and normalized not in _SHORT_CMDS:
             log.info("Short noise guard — dropped single word: %r", transcript)
             return
 
