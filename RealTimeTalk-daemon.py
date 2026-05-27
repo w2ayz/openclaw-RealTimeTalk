@@ -140,6 +140,7 @@ CAL_AUDIBLE_SNR   = 80.0
 # New/unknown devices start at minimum safe levels; known devices restore
 # their previously calibrated settings automatically on connect.
 CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
+SLEEP_STATE_FILE  = os.path.expanduser("~/.openclaw/workspace/rtt_sleep_state.json")
 CAL_NEW_DEV_PW    = 1      # PipeWire % for unknown device (minimum safe)
 CAL_NEW_DEV_SW    = 0.10   # SW for unknown device (10% — clearly audible but not loud)
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
@@ -973,6 +974,23 @@ def _save_cal_store() -> None:
             json.dump(_cal_store, f, indent=2)
     except Exception as e:
         log.warning("Could not save calibration store: %s", e)
+
+def _save_sleep_state(sleeping: bool) -> None:
+    """Persist sleep state to disk so it survives service restarts."""
+    try:
+        os.makedirs(os.path.dirname(SLEEP_STATE_FILE), exist_ok=True)
+        with open(SLEEP_STATE_FILE, "w") as f:
+            json.dump({"sleeping": sleeping}, f)
+    except Exception as e:
+        log.warning("Could not save sleep state: %s", e)
+
+def _load_sleep_state() -> bool:
+    """Return True if the daemon was sleeping when it last stopped."""
+    try:
+        with open(SLEEP_STATE_FILE) as f:
+            return bool(json.load(f).get("sleeping", False))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
 
 def _save_device_cal(sink_name: str, pw_pct: int, sw_vol: float) -> None:
     """Record calibrated levels for a speaker device and persist to disk."""
@@ -2081,6 +2099,7 @@ class RealtimeSession:
                     _persist_multilang[0] = "off"
                     log.info("Auto-sleep: multi-lang reset to off")
                 _idle_disconnected[0] = True
+                _save_sleep_state(True)
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Going to sleep.", self.alsa_output
                 )
@@ -2178,6 +2197,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     # Reconnect from auto-sleep
                     _last_activity[0] = __import__("time").time()
                     _wake_activate[0] = True
+                    _save_sleep_state(False)
                     _wake_event[0].set()
                     log.info("HTTP wake — reconnecting from auto-sleep")
                 elif sess:
@@ -3538,6 +3558,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                             _log_entry("system", "Wake word detected — waking up…")
                             _last_activity[0] = now
                             _wake_activate[0] = True
+                            _save_sleep_state(False)
                             _wake_event[0].set()
                         else:
                             _last_activity[0] = now
@@ -3585,11 +3606,27 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         name="oww-wakeword",
     ).start()
 
+    # Restore sleep state persisted across service restarts (e.g. mic device change)
+    if _load_sleep_state():
+        _idle_disconnected[0] = True
+        log.info("Restored sleep state from disk — waiting for wake signal…")
+
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref)
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or 'Five wake up' to activate)")
 
     while not stop_event.is_set():
+        # If sleeping (restored from disk or just auto-slept), wait for wake before connecting
+        if _idle_disconnected[0]:
+            log.info("Auto-sleep active — waiting for wake signal…")
+            await loop.run_in_executor(None, _wake_event[0].wait)
+            _wake_event[0].clear()
+            _idle_disconnected[0] = False
+            _last_activity[0] = __import__("time").time()
+            log.info("Wake signal received — reconnecting to OpenAI…")
+            if stop_event.is_set():
+                break
+
         session = RealtimeSession(
             api_key=openai_key, loop=loop, gw=gw,
             stop_event=stop_event,
@@ -3612,12 +3649,8 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         if stop_event.is_set():
             break
         if _idle_disconnected[0]:
-            log.info("Auto-sleep active — waiting for wake signal…")
-            await loop.run_in_executor(None, _wake_event[0].wait)
-            _wake_event[0].clear()
-            _idle_disconnected[0] = False
-            _last_activity[0] = __import__("time").time()
-            log.info("Wake signal received — reconnecting to OpenAI…")
+            # loop back to top — sleep check at start of loop handles it
+            continue
         else:
             log.info("Reconnecting in %ds…", RECONNECT_DELAY)
             await asyncio.sleep(RECONNECT_DELAY)
