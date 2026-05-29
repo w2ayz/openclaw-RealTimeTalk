@@ -2492,7 +2492,7 @@ a:hover{{text-decoration:underline;}}
 </div>
 <div id="micresult"></div>
 <div class="row">
-  <button id="micbtn" onclick="startMicCal()">Auto-calibrate (3 sec quiet)</button>
+  <button id="micbtn" onclick="startMicCal()">Mic Auto-calibrate (3 sec quiet)</button>
 </div>
 </div>
 {auto_cal_section}
@@ -2750,34 +2750,31 @@ setInterval(function(){{
                 self.wfile.write(resp)
 
             elif self.path == "/calibrate/run":
-                if sess:
-                    import asyncio as _aio, json as _json, time as _time
-                    # collect 3s of mic samples (audio thread already fills _mic_level_current)
-                    peaks = []
-                    for _ in range(30):
-                        _time.sleep(0.1)
-                        with _mic_level_lock:
-                            peaks.append(_mic_level_current[0])
-                    peaks = peaks[2:]
-                    noise_peak = max(peaks) if peaks else 0
-                    new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
-                    _mic_gate_ref[0] = new_gate
-                    MIC_GATE_PEAK = new_gate
-                    log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
-                    _update_service_gate(new_gate)
-                    # speak confirmation in background thread (we're already in HTTP thread)
+                import json as _json, time as _time
+                # _mic_level_current is kept alive by OWW listener even without a session
+                peaks = []
+                for _ in range(30):
+                    _time.sleep(0.1)
+                    with _mic_level_lock:
+                        peaks.append(_mic_level_current[0])
+                peaks = peaks[2:]
+                noise_peak = max(peaks) if peaks else 0
+                new_gate = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
+                _mic_gate_ref[0] = new_gate
+                MIC_GATE_PEAK = new_gate
+                log.info("HTTP calibration: noise_peak=%d → gate=%d", noise_peak, new_gate)
+                _update_service_gate(new_gate)
+                if sess and not _idle_disconnected[0]:
                     import threading as _t
                     _t.Thread(target=speak,
                               args=(f"Noise gate set to {new_gate}.", sess.alsa_output),
                               daemon=True).start()
-                    resp = _json.dumps({"gate": new_gate, "noise_peak": noise_peak}).encode()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(resp)))
-                    self.end_headers()
-                    self.wfile.write(resp)
-                else:
-                    _html(self, 503, "<h2>No active session</h2>")
+                resp = _json.dumps({"gate": new_gate, "noise_peak": noise_peak}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
 
             elif self.path == "/speaker-cal":
                 is_headset = _detect_headset()
