@@ -2601,6 +2601,10 @@ function runCal(){{
     if(btn)btn.disabled=false;
     if(st)st.innerHTML=d.status=='no_mic'?'Mic cannot hear speaker — adjust manually.':
       'Set to PW <b>'+d.safe_vol+'%</b> SW <b>'+Math.round(d.safe_sw_vol*100)+'%</b>';
+    const vv=document.getElementById('volval');
+    const sv=document.getElementById('swval');
+    if(vv) vv.textContent=d.safe_vol+'%';
+    if(sv) sv.textContent=Math.round(d.safe_sw_vol*100)+'%';
     setTimeout(()=>location.reload(),4000);
   }}).catch(e=>{{if(btn)btn.disabled=false;if(st)st.textContent='Error: '+e;}});
 }}
