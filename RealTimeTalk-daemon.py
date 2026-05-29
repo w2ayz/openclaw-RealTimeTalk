@@ -2945,38 +2945,42 @@ setInterval(upd, 2000);
                 # Announce result ALWAYS at a guaranteed-audible level (the
                 # calibrated level may be near-silent), then drop the speaker
                 # to the calibrated operating level for normal use.
-                if sess:
-                    import threading as _t
-                    sw  = result.get("safe_sw_vol", _cal_sw_volume)
-                    pw  = result.get("safe_vol", CAL_FALLBACK_PW)
-                    snk = _find_usb_speaker_sink()
-                    def _cal_announce(sw=sw, pw=pw, snk=snk,
-                                      alsa=sess.alsa_output,
-                                      st=result.get("status", "ok")):
-                        if st == "no_mic":
-                            msg = ("Auto calibration could not measure the speaker — "
-                                   "the microphone and speaker are not acoustically coupled. "
-                                   f"Speaker set to {pw} percent. Use Manual adjustment to fine-tune.")
-                        elif st == "ok":
-                            msg = (f"Calibration done. Speaker set to {pw} percent.")
-                        else:
-                            msg = ("Calibration had a problem. Speaker set to a "
-                                   "safe default. Use Manual adjustment.")
-                        speak.__globals__["_skip_auto_reduce"] = True
-                        try:
-                            # Force an audible level for the announcement itself
-                            if snk:
-                                subprocess.run(["pactl", "set-sink-volume", snk,
-                                                f"{CAL_ANNOUNCE_PW}%"],
-                                               capture_output=True)
+                # Run even when sleeping — volume restore must happen regardless.
+                import threading as _t
+                sw  = result.get("safe_sw_vol", _cal_sw_volume)
+                pw  = result.get("safe_vol", CAL_FALLBACK_PW)
+                snk = _find_usb_speaker_sink()
+                _alsa = sess.alsa_output if sess else ALSA_OUTPUT
+                _sleeping = _idle_disconnected[0]
+                def _cal_announce(sw=sw, pw=pw, snk=snk,
+                                  alsa=_alsa,
+                                  st=result.get("status", "ok"),
+                                  sleeping=_sleeping):
+                    if st == "no_mic":
+                        msg = ("Auto calibration could not measure the speaker — "
+                               "the microphone and speaker are not acoustically coupled. "
+                               f"Speaker set to {pw} percent. Use Manual adjustment to fine-tune.")
+                    elif st == "ok":
+                        msg = (f"Calibration done. Speaker set to {pw} percent.")
+                    else:
+                        msg = ("Calibration had a problem. Speaker set to a "
+                               "safe default. Use Manual adjustment.")
+                    speak.__globals__["_skip_auto_reduce"] = True
+                    try:
+                        # Force an audible level for the announcement itself
+                        if snk:
+                            subprocess.run(["pactl", "set-sink-volume", snk,
+                                            f"{CAL_ANNOUNCE_PW}%"],
+                                           capture_output=True)
+                        if not sleeping:
                             speak(msg, alsa, volume=CAL_ANNOUNCE_SW)
-                            # Settle to the calibrated operating level
-                            if snk:
-                                subprocess.run(["pactl", "set-sink-volume", snk,
-                                                f"{pw}%"], capture_output=True)
-                        finally:
-                            speak.__globals__["_skip_auto_reduce"] = False
-                    _t.Thread(target=_cal_announce, daemon=True).start()
+                        # Settle to the calibrated operating level
+                        if snk:
+                            subprocess.run(["pactl", "set-sink-volume", snk,
+                                            f"{pw}%"], capture_output=True)
+                    finally:
+                        speak.__globals__["_skip_auto_reduce"] = False
+                _t.Thread(target=_cal_announce, daemon=True).start()
                 resp = _json.dumps(result).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
