@@ -1955,12 +1955,13 @@ class RealtimeSession:
                 return
 
         # Monitoring-only mode: passively log captured segments (no Five/TTS).
+        # Intentionally does NOT update _last_activity — monitoring is passive
+        # and must not prevent auto-sleep from firing.
         if self._monitoring:
             t = transcript.strip()
             if t:
                 log.info("Monitor: %s", t)
                 _log_entry("monitor", t)
-                import time as _tmon; _last_activity[0] = _tmon.time()
             return
 
         # Noise hallucination filter: drop consonant-heavy gibberish.
