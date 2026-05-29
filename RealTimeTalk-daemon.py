@@ -3528,6 +3528,10 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     def _cb(indata, frames, t, status):
         if not audio_q.full():
             audio_q.put_nowait(indata[:, 0].copy())
+        # Feed mic level meter so calibration page stays alive during sleep
+        raw_peak = int(np.max(np.abs(indata[:, 0])))
+        with _mic_level_lock:
+            _mic_level_current[0] = raw_peak
 
     last_trigger = 0.0
     buf = np.array([], dtype=np.int16)
