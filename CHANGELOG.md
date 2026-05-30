@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.0.3 — 2026-05-30
+
+### Fixed
+
+- **SLEEPING state lost on service restart.** Changing the mic input device triggers `systemctl restart`, which reset all in-memory state including `_idle_disconnected`. Sleep state is now persisted to `~/.openclaw/workspace/rtt_sleep_state.json` and restored on startup. The main loop now checks for sleeping state at the top of the session loop, so a restart while sleeping never makes an unwanted OpenAI connection before the wake signal arrives.
+
+- **Mic level meter flat while sleeping.** During auto-sleep the session `sd.InputStream` is closed, so `_mic_level_current` stayed at 0 and the calibration page mic meter appeared dead. The OWW wake-word listener (which runs its own audio stream continuously) now also writes the raw peak to `_mic_level_current`, keeping the meter live regardless of sleep state.
+
+- **Auto-calibration left speaker muted after running while sleeping.** The `_cal_announce` block that restores PipeWire volume after the calibration sweep was gated on `if sess:`, which is `None` during SLEEPING. The sweep finished, set the sink to PW=1% (the minimum test level), and never restored it. The announce thread now always runs; only the TTS confirmation is skipped when sleeping.
+
+- **Auto-calibration result not reflected in Manual Adjustment fields.** After calibration, `#volval` and `#swval` only updated on the next `setInterval(upd, 2000)` tick — up to 2 seconds late — and could briefly show the wrong value (45%) because `_cal_announce` temporarily boosts PipeWire volume for the TTS announcement. The `runCal()` fetch callback now writes `safe_vol` and `safe_sw_vol` directly to those fields immediately when the JSON response arrives.
+
+- **Mic Auto-calibrate returning 503 during session reconnects.** `/calibrate/run` was gated on `if sess:` and returned "No active session" whenever the OpenAI WebSocket was reconnecting. Since the OWW listener now keeps `_mic_level_current` alive at all times, the session guard was unnecessary. The handler now always measures noise from `_mic_level_current`; TTS confirmation is skipped only when sleeping.
+
+- **Monitoring mode blocking auto-sleep.** Every transcript logged in monitoring mode called `_last_activity[0] = time()`, resetting the idle timer indefinitely — even single-word ambient words picked up from a nearby conversation. Monitoring is passive capture and must not prevent idle sleep. Removed the `_last_activity` update from the monitoring branch (`_idle_watcher` already turns monitoring off when sleep fires).
+
+- **Wake word false positives at threshold 0.50.** Score 0.50 (floor of threshold) triggered spurious wakes from ambient conversation. Raised `OWW_THRESHOLD` from 0.50 → 0.60. Extracted as a named top-level constant for easy tuning. The genuine detection at score 0.91 recorded the same day would still fire at any reasonable threshold.
+
+### Changed
+
+- **Mic Auto-calibrate button label.** Renamed from "Auto-calibrate (3 sec quiet)" to "Mic Auto-calibrate (3 sec quiet)" to distinguish it from the speaker auto-calibration button.
+
+---
+
 ## v2.0.2 — 2026-05-24
 
 ### Fixed
