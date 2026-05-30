@@ -85,6 +85,7 @@ DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
 IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
+OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
 # Languages accepted in multi-lang WHITELIST mode.
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
@@ -3526,7 +3527,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
 
     OWW_RATE  = 16000
     OWW_CHUNK = 1280   # 80 ms at 16 kHz — openwakeword's native frame size
-    _THRESHOLD = 0.5
+    _THRESHOLD = OWW_THRESHOLD
     _DEBOUNCE  = 3.0   # seconds to ignore detections after a trigger
 
     audio_q: _q.Queue = _q.Queue(maxsize=50)
