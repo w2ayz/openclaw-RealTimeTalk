@@ -476,9 +476,12 @@ def _ptt_open() -> None:
 
 def _ptt_alive() -> bool:
     """Return True if the AIOC serial port is open and the device is still connected.
-    Closes and clears the stale handle if the device has been unplugged."""
+    Auto-opens on hotplug; closes and clears stale handle on unplug."""
     if not _ptt_serial[0]:
-        return False
+        # Device may have been plugged in after startup — try to open now
+        if os.path.exists(AIOC_PTT_PORT):
+            _ptt_open()
+        return _ptt_serial[0] is not None
     if not os.path.exists(AIOC_PTT_PORT):
         try:
             _ptt_serial[0].close()
