@@ -87,10 +87,11 @@ RECONNECT_DELAY   = 5
 IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
 OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
-# AIOC ham radio interface — PTT control via serial DTR on /dev/ttyACM0.
-# When the AIOC is connected and detected as the active output sink, speak()
-# asserts DTR before playback and releases it after the tail delay.
-AIOC_PTT_PORT      = "/dev/ttyACM0"
+# AIOC ham radio interface — PTT control via serial DTR.
+# Port is found dynamically by USB VID:PID (1209:7388) so the ttyACM number
+# does not need to be hardcoded (it changes across plug/unplug cycles).
+AIOC_USB_VID       = 0x1209
+AIOC_USB_PID       = 0x7388
 AIOC_PTT_PREKEY_MS = 250   # ms to hold PTT before audio starts (radio key-up time)
 AIOC_PTT_TAIL_MS   = 400   # ms to hold PTT after audio ends (prevents TX clipping)
 
@@ -373,6 +374,7 @@ _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mi
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
+_pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -460,15 +462,47 @@ def _find_aioc_sink() -> str | None:
     return None
 
 
+def _find_aioc_source() -> str | None:
+    """Return the PipeWire source name for the AIOC mic if currently connected, else None."""
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sources"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if ("AIOC" in line or "All-In-One-Cable" in line) and "monitor" not in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    return parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def _find_aioc_port() -> str | None:
+    """Return the ttyACM device path for the AIOC by USB VID:PID, or None if absent."""
+    try:
+        from serial.tools import list_ports as _lp
+        for p in _lp.comports():
+            if p.vid == AIOC_USB_VID and p.pid == AIOC_USB_PID:
+                return p.device
+    except Exception:
+        pass
+    return None
+
+
 def _ptt_open() -> None:
     """Open AIOC serial port for PTT. Non-fatal — logs warning if unavailable."""
     import serial as _ser
+    port = _find_aioc_port()
+    if not port:
+        log.warning("AIOC PTT unavailable (device 1209:7388 not found) — PTT disabled")
+        _ptt_serial[0] = None
+        return
     try:
-        s = _ser.Serial(AIOC_PTT_PORT, timeout=0)
+        s = _ser.Serial(port, timeout=0)
         s.dtr = False   # PTT released at open
         s.rts = False
         _ptt_serial[0] = s
-        log.info("AIOC PTT ready on %s — audio output will transmit over the air", AIOC_PTT_PORT)
+        log.info("AIOC PTT ready on %s — audio output will transmit over the air", port)
     except Exception as exc:
         log.warning("AIOC PTT unavailable (%s) — PTT disabled", exc)
         _ptt_serial[0] = None
@@ -476,20 +510,35 @@ def _ptt_open() -> None:
 
 def _ptt_alive() -> bool:
     """Return True if the AIOC serial port is open and the device is still connected.
-    Auto-opens on hotplug; closes and clears stale handle on unplug."""
+    Auto-opens and switches AGC mic to AIOC on hotplug; restores previous mic on unplug."""
     if not _ptt_serial[0]:
-        # Device may have been plugged in after startup — try to open now
-        if os.path.exists(AIOC_PTT_PORT):
+        if _find_aioc_port():
             _ptt_open()
+            if _ptt_serial[0]:
+                # AIOC just appeared — save current mic and switch AGC to AIOC input
+                _pre_aioc_mic[0] = globals().get("RAW_MIC_SOURCE")
+                aioc_src = _find_aioc_source()
+                if aioc_src:
+                    import threading as _tptt
+                    _tptt.Thread(target=_update_agc_capture_source,
+                                 args=(aioc_src,), daemon=True).start()
         return _ptt_serial[0] is not None
-    if not os.path.exists(AIOC_PTT_PORT):
+    if not _find_aioc_port():
         try:
             _ptt_serial[0].close()
         except Exception:
             pass
         _ptt_serial[0] = None
         _is_tx[0] = False
-        log.info("AIOC disconnected — PTT disabled")
+        log.info("AIOC disconnected — PTT disabled, restoring previous mic")
+        prev = _pre_aioc_mic[0]
+        if not prev:
+            prev = _find_always_on_mic_source()
+        if prev:
+            import threading as _tptt2
+            _tptt2.Thread(target=_update_agc_capture_source,
+                          args=(prev,), daemon=True).start()
+        _pre_aioc_mic[0] = None
         return False
     return True
 
