@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.0.4 — 2026-06-01
+
+### Fixed
+
+- **OWW false-positive wakes activating Five unintentionally.** When the wake-word detector fired (e.g. from ambient TV or background speech), the session started in Active mode — Five would listen and route transcripts for 10 minutes before auto-sleeping. OWW wakes now enter **Silent mode** instead; the user must explicitly say "Five wake up" to go Active. The HTTP Wake button retains its direct-to-Active behaviour.
+
+- **Play test silent during SLEEPING state.** The `/speaker-cal/loop-start` handler used `ALSA_OUTPUT` (hardcoded `"plughw:3,0"`) when no session was active. PipeWire holds exclusive ownership of the hardware device, so `aplay -D plughw:3,0` failed silently. `main()` now updates the global `ALSA_OUTPUT` to the CLI `--alsa-output` value at startup so all HTTP handlers always use the correct device path.
+
+### Changed
+
+- **OpenClaw agent timeout doubled from 45 s to 90 s.** Gives Five more time to complete longer tool calls or multi-step responses before RTT gives up waiting.
+
+---
+
 ## v2.0.3 — 2026-05-30
 
 ### Fixed
