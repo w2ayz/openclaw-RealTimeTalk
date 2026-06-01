@@ -87,6 +87,13 @@ RECONNECT_DELAY   = 5
 IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
 OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
+# AIOC ham radio interface — PTT control via serial DTR on /dev/ttyACM0.
+# When the AIOC is connected and detected as the active output sink, speak()
+# asserts DTR before playback and releases it after the tail delay.
+AIOC_PTT_PORT      = "/dev/ttyACM0"
+AIOC_PTT_PREKEY_MS = 250   # ms to hold PTT before audio starts (radio key-up time)
+AIOC_PTT_TAIL_MS   = 400   # ms to hold PTT after audio ends (prevents TX clipping)
+
 # Languages accepted in multi-lang WHITELIST mode.
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
 #   "ko"="ko"  "ja"="ja"  "zh"=any CJK  "ar"=Arabic script  "ru"=Cyrillic  "hi"=Devanagari
@@ -364,6 +371,8 @@ _last_five_reply:     list = [""]     # last reply returned from Five — used t
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
+_ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
+_is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -434,6 +443,58 @@ def _cal_capture(n_samples: int, sample_rate: int) -> "np.ndarray":
     except Exception as e:
         log.warning("Cal capture error: %s", e)
         return np.zeros(n_samples, dtype=np.int16)
+
+
+def _find_aioc_sink() -> str | None:
+    """Return the PipeWire sink name for the AIOC if currently connected, else None."""
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sinks"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if "AIOC" in line or "All-In-One-Cable" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    return parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def _ptt_open() -> None:
+    """Open AIOC serial port for PTT. Non-fatal — logs warning if unavailable."""
+    import serial as _ser
+    try:
+        s = _ser.Serial(AIOC_PTT_PORT, timeout=0)
+        s.dtr = False   # PTT released at open
+        s.rts = False
+        _ptt_serial[0] = s
+        log.info("AIOC PTT ready on %s — audio output will transmit over the air", AIOC_PTT_PORT)
+    except Exception as exc:
+        log.warning("AIOC PTT unavailable (%s) — PTT disabled", exc)
+        _ptt_serial[0] = None
+
+
+def _ptt_key() -> None:
+    """Assert PTT via AIOC serial DTR. Sets _is_tx so transcripts are suppressed."""
+    s = _ptt_serial[0]
+    if s:
+        try:
+            s.dtr = True
+            s.rts = False
+        except Exception as exc:
+            log.warning("PTT key failed: %s", exc)
+    _is_tx[0] = True
+
+
+def _ptt_release() -> None:
+    """Release PTT via AIOC serial DTR."""
+    s = _ptt_serial[0]
+    if s:
+        try:
+            s.dtr = False
+        except Exception as exc:
+            log.warning("PTT release failed: %s", exc)
+    _is_tx[0] = False
 
 
 def run_speaker_calibration(alsa_output: str = None,
@@ -1356,12 +1417,26 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 else:
                     consec = 0
 
-        # Use paplay (PipeWire-native) for default sink — better resampling and
+        # If AIOC PTT is available, route audio to the AIOC sink and key the radio.
+        import time as _ptt_t
+        _aioc_sink = _find_aioc_sink() if _ptt_serial[0] else None
+        _use_ptt   = bool(_ptt_serial[0] and _aioc_sink)
+
+        # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
         # Bluetooth handling than aplay -D default (ALSA compat layer).
-        _play_cmd = (["paplay", final_wav]
-                     if alsa_output in ("default", "pulse")
-                     else ["aplay", "-D", alsa_output, "-q", final_wav])
+        # When AIOC is active, always route through its PipeWire sink via paplay.
+        if _use_ptt:
+            _play_cmd = ["paplay", f"--device={_aioc_sink}", final_wav]
+        elif alsa_output in ("default", "pulse"):
+            _play_cmd = ["paplay", final_wav]
+        else:
+            _play_cmd = ["aplay", "-D", alsa_output, "-q", final_wav]
         _play_fallback = ["paplay", final_wav]
+
+        if _use_ptt:
+            _ptt_key()
+            _ptt_t.sleep(AIOC_PTT_PREKEY_MS / 1000)
+            log.info("PTT keyed — transmitting")
 
         _is_speaking[0] = True
         if interruptible:
@@ -1379,6 +1454,11 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             if rc != 0 and _play_cmd != _play_fallback:
                 subprocess.call(_play_fallback, stderr=subprocess.DEVNULL)
         _is_speaking[0] = False
+
+        if _use_ptt:
+            _ptt_t.sleep(AIOC_PTT_TAIL_MS / 1000)
+            _ptt_release()
+            log.info("PTT released")
 
         # Save text for /continue if interrupted mid-sentence; clear on normal finish.
         if _interrupted[0] and resumable:
@@ -1963,6 +2043,12 @@ class RealtimeSession:
             if t:
                 log.info("Monitor: %s", t)
                 _log_entry("monitor", t)
+            return
+
+        # Suppress transcripts while PTT is asserted — prevents Five's own
+        # transmitted voice from being picked up and re-routed as a new command.
+        if _is_tx[0]:
+            log.debug("PTT TX active — suppressing transcript: %r", transcript)
             return
 
         # Noise hallucination filter: drop consonant-heavy gibberish.
@@ -3312,6 +3398,14 @@ setInterval(upd, 2000);
                         f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
+                elif _ptt_serial[0] is not None:
+                    # Persistent warning while AIOC PTT is active
+                    device_banner = (
+                        '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
+                        'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
+                        '&#128225; AIOC ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
+                        '</div>'
+                    )
                 elif _idle_disconnected[0]:
                     device_banner = (
                         '<div id="dbanner" style="color:#475569;font-style:italic;">'
@@ -3341,6 +3435,10 @@ setInterval(upd, 2000);
                 state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
 
                 speaking_banner = (
+                    '<div class="spkbanner" style="background:#3b0000;border-color:#dc2626;color:#fca5a5;">'
+                    '&#128225; TRANSMITTING&hellip;'
+                    ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
+                    if (_is_tx[0] and speaking) else
                     '<div class="spkbanner">&#9834; Five is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if speaking else
@@ -3584,6 +3682,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                session_key: str = OPENCLAW_SESSION):
     global ALSA_OUTPUT
     ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
+    _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 

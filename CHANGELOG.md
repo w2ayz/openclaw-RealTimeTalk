@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.1.0 — 2026-06-01
+
+### Added
+
+- **AIOC ham radio integration — full TX/RX over the air.** When an AIOC (All-In-One-Cable, USB ID 1209:7388) is connected, the daemon automatically opens `/dev/ttyACM0` and enables PTT mode. On every TTS reply, it asserts serial DTR (keying the radio's PTT) for a 250 ms pre-key delay, plays audio through the AIOC's PipeWire sink, holds PTT for a 400 ms tail, then releases. Audio is routed dynamically via `paplay --device=<aioc_sink>` so the AIOC sink is found at runtime — no hard-coded card numbers. If the AIOC is absent the daemon starts normally with PTT silently disabled.
+
+- **TX transcript gate.** While PTT is asserted (`_is_tx = True`), all incoming transcripts from the mic are suppressed. This prevents Five's own transmitted voice (or radio sidetone) from being picked up and re-routed as a new command.
+
+- **AIOC warning banner on dashboard.** When the AIOC serial port is open (PTT mode active), the announcement bar shows a persistent highlighted red banner: **📡 AIOC ACTIVE — audio output transmits LIVE OVER THE AIR**. This replaces the normal idle/device-change messages for as long as the AIOC is connected.
+
+- **TRANSMITTING speaking banner.** While PTT is keyed and Five is speaking, the SPEAKING banner changes from the normal green "♩ Five is speaking…" to a red "📡 TRANSMITTING…" banner so the dashboard clearly shows on-air state.
+
+### Notes
+
+- Requires `pyserial` in the RTT venv (`pip install pyserial`).
+- AIOC provides line-level radio audio on input (~10–30× higher than a microphone). Lower `--mic-gain` to `2` and re-run mic auto-calibration after connecting AIOC as the mic source.
+- AIOC default PTT mapping: `SERIALDTRNRTS` (DTR=True, RTS=False keys PTT). This matches the AIOC firmware default and requires no HID configuration.
+
+---
+
 ## v2.0.4 — 2026-06-01
 
 ### Fixed
