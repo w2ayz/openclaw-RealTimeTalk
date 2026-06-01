@@ -474,6 +474,23 @@ def _ptt_open() -> None:
         _ptt_serial[0] = None
 
 
+def _ptt_alive() -> bool:
+    """Return True if the AIOC serial port is open and the device is still connected.
+    Closes and clears the stale handle if the device has been unplugged."""
+    if not _ptt_serial[0]:
+        return False
+    if not os.path.exists(AIOC_PTT_PORT):
+        try:
+            _ptt_serial[0].close()
+        except Exception:
+            pass
+        _ptt_serial[0] = None
+        _is_tx[0] = False
+        log.info("AIOC disconnected — PTT disabled")
+        return False
+    return True
+
+
 def _ptt_key() -> None:
     """Assert PTT via AIOC serial DTR. Sets _is_tx so transcripts are suppressed."""
     s = _ptt_serial[0]
@@ -1419,8 +1436,8 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
 
         # If AIOC PTT is available, route audio to the AIOC sink and key the radio.
         import time as _ptt_t
-        _aioc_sink = _find_aioc_sink() if _ptt_serial[0] else None
-        _use_ptt   = bool(_ptt_serial[0] and _aioc_sink)
+        _aioc_sink = _find_aioc_sink() if _ptt_alive() else None
+        _use_ptt   = bool(_aioc_sink)
 
         # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
         # Bluetooth handling than aplay -D default (ALSA compat layer).
@@ -3398,7 +3415,7 @@ setInterval(upd, 2000);
                         f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
-                elif _ptt_serial[0] is not None:
+                elif _ptt_alive():
                     # Persistent warning while AIOC PTT is active
                     device_banner = (
                         '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
