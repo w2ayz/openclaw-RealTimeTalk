@@ -3566,9 +3566,10 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                         last_trigger = now
                         log.info("Wake word detected (score=%.2f)", score)
                         if _idle_disconnected[0] and _wake_event[0]:
-                            _log_entry("system", "Wake word detected — waking up…")
+                            _log_entry("system", "Wake word detected — entering silent mode. Say 'Five wake up' to activate.")
                             _last_activity[0] = now
-                            _wake_activate[0] = True
+                            # Intentionally NOT setting _wake_activate — OWW wakes to Silent,
+                            # not Active. User must say the wake phrase to go Active.
                             _save_sleep_state(False)
                             _wake_event[0].set()
                         else:
@@ -3628,6 +3629,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
 
     while not stop_event.is_set():
         # If sleeping (restored from disk or just auto-slept), wait for wake before connecting
+        _woke_from_sleep = False
         if _idle_disconnected[0]:
             log.info("Auto-sleep active — waiting for wake signal…")
             await loop.run_in_executor(None, _wake_event[0].wait)
@@ -3635,6 +3637,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             _idle_disconnected[0] = False
             _last_activity[0] = __import__("time").time()
             log.info("Wake signal received — reconnecting to OpenAI…")
+            _woke_from_sleep = True
             if stop_event.is_set():
                 break
 
@@ -3647,7 +3650,9 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         if _wake_activate[0]:
             session._active = True
             _wake_activate[0] = False
-            log.info("Wake-from-sleep: session started active")
+            log.info("Wake-from-sleep: session started active (HTTP wake)")
+        elif _woke_from_sleep:
+            log.info("Wake-from-sleep: session started silent (OWW wake) — say 'Five wake up' to activate")
         session_ref[0] = session
         try:
             await session.run()
