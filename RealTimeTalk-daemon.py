@@ -3582,6 +3582,8 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
 
 async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT,
                session_key: str = OPENCLAW_SESSION):
+    global ALSA_OUTPUT
+    ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
