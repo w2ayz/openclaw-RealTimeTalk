@@ -3445,6 +3445,10 @@ setInterval(upd, 2000);
                     msg = "Audio devices changed."
                     _device_change_msg[0] = msg
                     log.info("Device change detected%s", " (HDMI only — silent)" if hdmi_only else "")
+                    # Check AIOC connect/disconnect immediately on device change —
+                    # don't wait for the elif _ptt_alive() branch which is skipped
+                    # when _device_change_msg is set.
+                    _ptt_alive()
                     if sess and not hdmi_only:
                         import threading as _t
                         def _announce_change():
