@@ -91,7 +91,7 @@ OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); ra
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
 #   "ko"="ko"  "ja"="ja"  "zh"=any CJK  "ar"=Arabic script  "ru"=Cyrillic  "hi"=Devanagari
 MULTILANG_WHITELIST_LANGS: list[str] = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
-AGENT_TIMEOUT_S   = 45
+AGENT_TIMEOUT_S   = 90
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
                                  # (lets OpenAI's VAD see real silence between words)
