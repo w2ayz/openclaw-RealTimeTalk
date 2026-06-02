@@ -3006,7 +3006,8 @@ function loadDevices(){{
         +'>'+(active?'Active':'Use')+'</button></td>'
         +(aiocAvail?'<td style="text-align:center">'
           +'<button class="use-btn'+(monitoring?' active':'')+'"'
-          +' onclick="setAiocMonitor(\''+s.name+'\')" style="padding:3px 10px;'
+          +' data-sink="'+s.name+'"'
+          +' onclick="setAiocMonitor(this.dataset.sink)" style="padding:3px 10px;'
           +(monitoring?'color:#34d399;border-color:#34d399;background:#021a0e;':'')
           +'">'+(monitoring?'&#10003; On':'Off')+'</button>'
           +'</td>':'')
