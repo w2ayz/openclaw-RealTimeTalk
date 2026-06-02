@@ -3617,8 +3617,8 @@ setInterval(upd, 2000);
                         f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
                     )
                     _device_change_msg[0] = ""
-                elif _ptt_alive():
-                    # Persistent warning while AIOC PTT is active
+                elif _radio_profile_active[0]:
+                    # Persistent warning only when Radio profile is active (not just AIOC connected)
                     device_banner = (
                         '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
                         'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
