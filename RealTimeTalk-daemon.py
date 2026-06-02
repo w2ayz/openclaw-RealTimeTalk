@@ -557,11 +557,17 @@ def _apply_agc_profile(radio: bool) -> None:
     and mic mode (gain_control=true), then hot-reload the echo-cancel module."""
     import time as _ta
     try:
+        # Reliable fallback sources — physical device names are stable across reboots
+        _FALLBACK_MIC  = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
+        _FALLBACK_AIOC = "alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback"
         if radio:
-            aioc_src = _find_aioc_source() or "alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback"
+            aioc_src = _find_aioc_source() or _FALLBACK_AIOC
             content = _AGC_PROFILE_RADIO.format(aioc_src=aioc_src)
         else:
-            mic_src = _pre_aioc_mic[0] or _find_always_on_mic_source() or RAW_MIC_SOURCE
+            # Prefer: saved pre-AIOC source → any running physical mic → known C-Media fallback
+            mic_src = (_pre_aioc_mic[0]
+                       or _find_always_on_mic_source()
+                       or _FALLBACK_MIC)
             content = _AGC_PROFILE_MIC.format(mic_src=mic_src)
 
         with open(_AGC_CONF, "w") as f:
@@ -587,6 +593,22 @@ def _apply_agc_profile(radio: bool) -> None:
                        ], capture_output=True)
         _ta.sleep(0.3)
         subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
+        # Restore default sink: AIOC when radio, USB speaker when mic
+        if radio:
+            aioc_sink = _find_aioc_sink()
+            if aioc_sink:
+                subprocess.run(["pactl", "set-default-sink", aioc_sink], capture_output=True)
+                _apply_device_cal(aioc_sink)
+        else:
+            usb_spk = next((
+                l.split()[1] for l in subprocess.run(
+                    ["pactl", "list", "short", "sinks"], capture_output=True, text=True
+                ).stdout.splitlines()
+                if "Generic_USB2.0" in l or ("USB2.0" in l and "AIOC" not in l)
+            ), None)
+            if usb_spk:
+                subprocess.run(["pactl", "set-default-sink", usb_spk], capture_output=True)
+                _apply_device_cal(usb_spk)
         globals()['RAW_MIC_SOURCE'] = aioc_src if radio else mic_src
         _radio_profile_active[0] = radio
         log.info("AGC profile → %s (gain_control=%s)", "radio" if radio else "mic", not radio)
