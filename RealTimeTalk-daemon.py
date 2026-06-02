@@ -509,6 +509,44 @@ def _ptt_open() -> None:
         _ptt_serial[0] = None
 
 
+_AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
+_AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
+
+def _apply_agc_profile(radio: bool) -> None:
+    """Swap the PipeWire AGC config between radio mode (gain_control=false)
+    and mic mode (gain_control=true), then hot-reload the echo-cancel module."""
+    import shutil as _sh
+    src = _AGC_CONF_RADIO if radio else _AGC_CONF
+    dst = _AGC_CONF_RADIO if not radio else _AGC_CONF
+    try:
+        # Read the appropriate profile and write it into the active config
+        with open(src) as f:
+            content = f.read()
+        # Update the active config target to match current source
+        with open(_AGC_CONF, "w") as f:
+            f.write(content)
+        # Hot-swap the echo-cancel module
+        mods = subprocess.run(["pactl", "list", "short", "modules"],
+                              capture_output=True, text=True).stdout
+        for line in mods.splitlines():
+            if "echo-cancel" in line:
+                subprocess.run(["pactl", "unload-module", line.split()[0]],
+                               capture_output=True)
+        import time as _ta; _ta.sleep(0.5)
+        subprocess.run(["pactl", "load-module", "module-echo-cancel",
+                        "aec_method=webrtc",
+                        f"source_name={AGC_SOURCE_NAME}",
+                        f"source_master={'alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback' if radio else (globals().get('RAW_MIC_SOURCE') or '')}",
+                        "sink_name=rtt_agc_sink",
+                        f"aec_args=webrtc.gain_control={'0' if radio else '1'} webrtc.noise_suppression=1 webrtc.high_pass_filter=1 webrtc.voice_detection=1 webrtc.extended_filter=1 webrtc.transient_suppression=1",
+                       ], capture_output=True)
+        _ta.sleep(0.3)
+        subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
+        log.info("AGC profile → %s (gain_control=%s)", "radio" if radio else "mic", not radio)
+    except Exception as exc:
+        log.warning("AGC profile switch failed: %s", exc)
+
+
 def _ptt_alive() -> bool:
     """Return True if the AIOC serial port is open and the device is still connected.
     Auto-opens and switches AGC mic to AIOC on hotplug; restores previous mic on unplug."""
@@ -516,13 +554,12 @@ def _ptt_alive() -> bool:
         if _find_aioc_port():
             _ptt_open()
             if _ptt_serial[0]:
-                # AIOC just appeared — save current mic and switch AGC to AIOC input
+                # AIOC just appeared — save current mic, switch AGC to AIOC + radio profile
                 _pre_aioc_mic[0] = globals().get("RAW_MIC_SOURCE")
                 aioc_src = _find_aioc_source()
                 if aioc_src:
                     import threading as _tptt
-                    _tptt.Thread(target=_update_agc_capture_source,
-                                 args=(aioc_src,), daemon=True).start()
+                    _tptt.Thread(target=_apply_agc_profile, args=(True,), daemon=True).start()
         return _ptt_serial[0] is not None
     if not _find_aioc_port():
         try:
@@ -531,14 +568,9 @@ def _ptt_alive() -> bool:
             pass
         _ptt_serial[0] = None
         _is_tx[0] = False
-        log.info("AIOC disconnected — PTT disabled, restoring previous mic")
-        prev = _pre_aioc_mic[0]
-        if not prev:
-            prev = _find_always_on_mic_source()
-        if prev:
-            import threading as _tptt2
-            _tptt2.Thread(target=_update_agc_capture_source,
-                          args=(prev,), daemon=True).start()
+        log.info("AIOC disconnected — PTT disabled, restoring mic AGC profile")
+        import threading as _tptt2
+        _tptt2.Thread(target=_apply_agc_profile, args=(False,), daemon=True).start()
         _pre_aioc_mic[0] = None
         return False
     return True
