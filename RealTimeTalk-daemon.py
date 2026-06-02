@@ -104,7 +104,7 @@ MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× wa
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
                                  # (lets OpenAI's VAD see real silence between words)
 MIC_GATE_MIN      = 300          # calibration clamp — quietest usable room
-MIC_GATE_MAX      = 3000         # calibration clamp — above this, use a headset
+MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-level input
 # WebRTC AGC virtual source (PipeWire module-echo-cancel). When present it
 # normalizes speech level + suppresses noise upstream, so the daemon needs
 # only a light trim and a minimal gate. Falls back to the static --mic-gain
