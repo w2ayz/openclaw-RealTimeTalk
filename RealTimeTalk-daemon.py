@@ -378,6 +378,7 @@ _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None wh
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
+_aioc_monitor_module: list = [None]  # PipeWire loopback module ID when AIOC monitor is active
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -2777,6 +2778,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
+  <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -2891,6 +2893,19 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
 function adj(d){{adjVol(d);}}
+function toggleAiocMonitor(){{
+  fetch('/aioc-monitor').then(r=>r.json()).then(d=>{{
+    const mb=document.getElementById('monitorbtn');
+    if(!mb) return;
+    if(d.active){{
+      mb.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+      mb.style.color='#34d399';mb.style.borderColor='#34d399';mb.style.background='#021a0e';
+    }} else {{
+      mb.innerHTML='&#128266; Monitor';
+      mb.style.color='#475569';mb.style.borderColor='#334155';mb.style.background='';
+    }}
+  }});
+}}
 function toggleRadio(){{
   fetch('/radio/profile').then(r=>r.json()).then(d=>{{
     const rb=document.getElementById('radiobtn');
@@ -3422,6 +3437,52 @@ setInterval(upd, 2000);
                     "profile": "radio" if go_radio else "mic",
                     "aioc_connected": _ptt_serial[0] is not None,
                 }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/aioc-monitor":
+                import json as _json
+                if _aioc_monitor_module[0] is not None:
+                    # Stop — unload loopback module
+                    subprocess.run(["pactl", "unload-module",
+                                    str(_aioc_monitor_module[0])], capture_output=True)
+                    _aioc_monitor_module[0] = None
+                    log.info("AIOC monitor loopback stopped")
+                    active = False
+                else:
+                    # Start — loopback AIOC source → default local sink
+                    aioc_src  = _find_aioc_source()
+                    local_snk = subprocess.run(["pactl","get-default-sink"],
+                                               capture_output=True, text=True).stdout.strip()
+                    # If default sink IS AIOC, use USB speaker for local monitoring
+                    if local_snk and ("AIOC" in local_snk or "All-In-One" in local_snk):
+                        local_snk = next(
+                            (l.split()[1] for l in subprocess.run(
+                                ["pactl","list","short","sinks"],
+                                capture_output=True, text=True).stdout.splitlines()
+                             if "Generic_USB2.0" in l or ("USB2.0" in l and "AIOC" not in l)),
+                            local_snk
+                        )
+                    if aioc_src and local_snk:
+                        result = subprocess.run(
+                            ["pactl", "load-module", "module-loopback",
+                             f"source={aioc_src}", f"sink={local_snk}",
+                             "latency_msec=20"],
+                            capture_output=True, text=True)
+                        mod_id = result.stdout.strip()
+                        if mod_id.isdigit():
+                            _aioc_monitor_module[0] = int(mod_id)
+                            log.info("AIOC monitor loopback started → %s (module %s)",
+                                     local_snk.split(".")[-1], mod_id)
+                            active = True
+                        else:
+                            active = False
+                    else:
+                        active = False
+                resp = _json.dumps({"active": active}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
