@@ -376,6 +376,7 @@ _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelis
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
+_radio_profile_active: list = [False] # True when AGC is in radio mode (gain_control=false)
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -587,6 +588,7 @@ def _apply_agc_profile(radio: bool) -> None:
         _ta.sleep(0.3)
         subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
         globals()['RAW_MIC_SOURCE'] = aioc_src if radio else mic_src
+        _radio_profile_active[0] = radio
         log.info("AGC profile → %s (gain_control=%s)", "radio" if radio else "mic", not radio)
     except Exception as exc:
         log.warning("AGC profile switch failed: %s", exc)
@@ -601,6 +603,7 @@ def _ptt_alive() -> bool:
             if _ptt_serial[0]:
                 # AIOC just appeared — save current mic, switch AGC to AIOC + radio profile
                 _pre_aioc_mic[0] = globals().get("RAW_MIC_SOURCE")
+                _radio_profile_active[0] = True
                 aioc_src = _find_aioc_source()
                 if aioc_src:
                     import threading as _tptt
@@ -614,6 +617,7 @@ def _ptt_alive() -> bool:
         _ptt_serial[0] = None
         _is_tx[0] = False
         log.info("AIOC disconnected — PTT disabled, restoring mic AGC profile")
+        _radio_profile_active[0] = False
         import threading as _tptt2
         _tptt2.Thread(target=_apply_agc_profile, args=(False,), daemon=True).start()
         _pre_aioc_mic[0] = None
@@ -2707,7 +2711,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
-  <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _ptt_alive() else 'color:#475569;border-color:#334155;'}">&#128225; Radio</button>
+  <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -2824,14 +2828,14 @@ function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd())
 function adj(d){{adjVol(d);}}
 function toggleRadio(){{
   fetch('/radio/profile').then(r=>r.json()).then(d=>{{
-    const rm=document.getElementById('radiomode');
     const rb=document.getElementById('radiobtn');
+    if(!rb) return;
     if(d.profile==='radio'){{
-      if(rm){{rm.textContent='📡 Radio — AGC gain off, gate active';rm.style.color='#dc2626';}}
-      if(rb){{rb.textContent='Switch to Mic';rb.style.color='#dc2626';rb.style.borderColor='#dc2626';rb.style.background='#3b0000';}}
+      rb.innerHTML='&#128225; Radio&nbsp;&#10003;';
+      rb.style.color='#dc2626';rb.style.borderColor='#dc2626';rb.style.background='#3b0000';
     }} else {{
-      if(rm){{rm.textContent='Mic — AGC gain on';rm.style.color='#64748b';}}
-      if(rb){{rb.textContent='Switch to Radio';rb.style.color='#64748b';rb.style.borderColor='#334155';rb.style.background='';}}
+      rb.innerHTML='&#128225; Radio';
+      rb.style.color='#475569';rb.style.borderColor='#334155';rb.style.background='';
     }}
   }});
 }}
