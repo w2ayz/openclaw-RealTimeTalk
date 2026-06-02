@@ -367,6 +367,7 @@ _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded i
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
+_persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
@@ -1860,7 +1861,7 @@ class RealtimeSession:
         self._busy        = asyncio.Event()   # set while Five is speaking
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
-        self._active      = False                      # start silent; wake phrase enables voice
+        self._active      = _persist_active[0]           # restored from last session
         self._monitoring  = _persist_monitoring[0]     # restored from last session
         self._multilang   = _persist_multilang[0]  # restored from last session
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
@@ -2015,6 +2016,7 @@ class RealtimeSession:
                     log.info("Wake phrase detected — exiting monitoring, voice active")
                 if not self._active:
                     self._active = True
+                    _persist_active[0] = True
                     import time as _tact; _last_activity[0] = _tact.time()
                     log.info("Wake phrase detected — voice active")
                     _log_entry("system", "Voice activated")
@@ -2034,6 +2036,7 @@ class RealtimeSession:
         if _matches_phrase(normalized, SLEEP_PHRASES):
             if self._active:
                 self._active = False
+                _persist_active[0] = False
                 log.info("Sleep phrase detected — going silent")
                 _log_entry("system", "Voice silenced")
                 self._busy.set()
@@ -2255,6 +2258,7 @@ class RealtimeSession:
                     self._multilang = "off"
                     _persist_multilang[0] = "off"
                     log.info("Auto-sleep: multi-lang reset to off")
+                _persist_active[0] = False
                 _idle_disconnected[0] = True
                 _save_sleep_state(True)
                 await asyncio.get_running_loop().run_in_executor(
@@ -2359,6 +2363,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     log.info("HTTP wake — reconnecting from auto-sleep")
                 elif sess:
                     sess._active = True
+                    _persist_active[0] = True
                     if sess._monitoring:
                         sess._monitoring = False
                         _persist_monitoring[0] = False
