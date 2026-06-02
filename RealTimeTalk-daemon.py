@@ -630,9 +630,18 @@ def _apply_agc_profile(radio: bool) -> None:
 
 def _ptt_alive() -> bool:
     """Return True if the AIOC serial port is open and the device is still connected.
-    Auto-opens and switches AGC mic to AIOC on hotplug; restores previous mic on unplug."""
+    Auto-opens and switches AGC mic to AIOC on hotplug; restores previous mic on unplug.
+    Reopens if the ttyACM port number changed after a reconnect."""
+    current_port = _find_aioc_port()
+    if _ptt_serial[0]:
+        # Check if port path changed (e.g. ttyACM0 → ttyACM1 after replug)
+        if current_port and _ptt_serial[0].port != current_port:
+            log.info("AIOC port changed %s → %s — reopening", _ptt_serial[0].port, current_port)
+            try: _ptt_serial[0].close()
+            except Exception: pass
+            _ptt_serial[0] = None
     if not _ptt_serial[0]:
-        if _find_aioc_port():
+        if current_port:
             _ptt_open()
             if _ptt_serial[0]:
                 # AIOC just appeared — save current mic, switch AGC to AIOC + radio profile
@@ -667,7 +676,15 @@ def _ptt_key() -> None:
             s.dtr = True
             s.rts = False
         except Exception as exc:
-            log.warning("PTT key failed: %s", exc)
+            log.warning("PTT key failed: %s — reopening port", exc)
+            try: s.close()
+            except Exception: pass
+            _ptt_serial[0] = None
+            _ptt_open()   # reopen on new port number
+            s2 = _ptt_serial[0]
+            if s2:
+                try: s2.dtr = True; s2.rts = False
+                except Exception as exc2: log.warning("PTT key retry failed: %s", exc2)
     _is_tx[0] = True
 
 
