@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.2.0 — 2026-06-02
+
+### Added
+
+- **Radio mode toggle on calibration page.** A `📡 Radio` button is now appended to the Cal mode row (after Auto). Clicking it toggles the AGC profile between radio mode and mic mode. Button shows grey `📡 Radio` when inactive and red `📡 Radio ✓` when active. State is tracked server-side so it survives page reloads.
+
+- **TX volume above 100%.** When AIOC is connected, the existing Manual Adjustment Vol `− Quieter` / `+ Louder` buttons allow PipeWire volume up to 500%. No additional buttons needed.
+
+- **AIOC TX boost (line-level output).** AIOC hardware TX boost register (`0x78`, bit 8) is enabled via HID feature report, switching output from mic-level to line-level. Setting is stored in AIOC flash and persists across power cycles.
+
+- **AIOC TX calibration.** AIOC speaker calibrated to PW=300%, SW=0.80 and saved to cal store.
+
+- **Active state persists across session reconnects.** When the OpenAI session ends and reconnects (60-min limit, network drop), the daemon now restores the previous Active/Silent state via `_persist_active`. Five stays Active across reconnects until explicitly told to sleep.
+
+### Fixed
+
+- **AGC gain_control defeats noise gate when radio is silent.** WebRTC `gain_control=true` adaptively amplifies quiet signals toward a target level, so even tiny cross-coupling from the radio's built-in mic exceeded the gate threshold. Disabled `gain_control` in radio mode; kept noise suppression and high-pass filter. Two AGC profile templates (`radio` / `mic`) are hot-swapped via `_apply_agc_profile()`.
+
+- **Radio→Mic profile switch left wrong AGC source and default sink.** When switching off Radio mode, `_apply_agc_profile(False)` fell back to `rtt_agc_source` as `source_master` (C-Media was SUSPENDED, `_pre_aioc_mic` was None after restart). Added hardcoded C-Media fallback. Profile switch now also restores the default PipeWire sink (USB speaker on mic, AIOC on radio) and applies saved calibration levels in both directions.
+
+- **Radio profile toggle was a no-op.** `/radio/profile` toggle computed `go_radio = not (AIOC connected)` instead of `not _radio_profile_active`. When AIOC was connected but profile was Mic, clicking always toggled to Mic again. Fixed to use `_radio_profile_active` for the toggle decision.
+
+- **MIC_GATE_MAX too low for AIOC line-level.** Previous ceiling of 3000 was appropriate for close-talking microphones but clipped calibration for AIOC radio RX audio. Raised to 15000.
+
+- **MIC_GATE_MIN too high without AGC gain.** With `gain_control` off, the noise floor drops to near zero. The old minimum of 300 was blocking quiet radio transmissions. Lowered to 30; gate now calibrates to the true floor (~30 from noise peak of 3).
+
+- **AIOC capture volume and mic gain.** Set AIOC capture volume to 100% (safe with gain_control off), `AGC_MIC_GAIN` raised from 2× to 16× to compensate for the missing adaptive amplification.
+
+### Notes
+
+- udev rule added at `/etc/udev/rules.d/99-aioc.rules` to grant `plugdev` group access to AIOC hidraw device (required for TX boost HID write).
+- AIOC TX boost register write persists in AIOC flash — no need to re-enable after power cycle.
+
+---
+
 ## v2.1.0 — 2026-06-02
 
 ### Added
