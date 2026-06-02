@@ -3928,6 +3928,11 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     global ALSA_OUTPUT
     ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
     _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
+    if _ptt_serial[0] is not None:
+        # AIOC connected at startup — apply radio-mode gain immediately
+        globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO
+        _radio_profile_active[0] = True
+        log.info("AIOC present at startup — MIC_GAIN=%.0fx (radio mode)", AGC_MIC_GAIN_RADIO)
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
