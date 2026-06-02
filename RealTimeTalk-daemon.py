@@ -2701,31 +2701,13 @@ a:hover{{text-decoration:underline;}}
   <b>Mic:</b> <span id="panelmic">{ds["mic"]}</span> &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: <span id="panelgain">{ds["gain"]}</span>x<br>
   <b>Speaker:</b> <span id="panelspk">{ds["speaker_name"]}</span> &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
-<div class="sect" style="margin-top:10px;padding-top:10px;" id="radiosect">
-  <h4>&#128225; Radio Mode (AIOC)</h4>
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0;">
-    <span style="font-size:13px;color:var(--mu);">Profile:</span>
-    <b id="radiomode" style="color:{'#dc2626' if _ptt_alive() else '#64748b'};">{'&#128225; Radio — AGC gain off, gate active' if _ptt_alive() else 'Mic — AGC gain on'}</b>
-    <button id="radiobtn" onclick="toggleRadio()"
-      style="padding:4px 12px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _ptt_alive() else 'color:#64748b;border-color:#334155;'}">
-      {'Switch to Mic' if _ptt_alive() else 'Switch to Radio'}</button>
-  </div>
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0;">
-    <span style="font-size:13px;color:var(--mu);">TX Volume:</span>
-    <b id="txvol" style="font-size:1.1em;min-width:52px;">{ds["spk_vol"]}</b>
-    <div style="display:flex;gap:5px;">
-      <button class="bQ" onclick="adjTX(-25)">&#8722; Lower</button>
-      <button class="bL" onclick="adjTX(+25)">+ Higher</button>
-    </div>
-  </div>
-  {'<p style="font-size:12px;color:#dc2626;margin:4px 0;">&#9888; AIOC connected — TX transmits over the air</p>' if _ptt_alive() else '<p style="font-size:12px;color:var(--mu);margin:4px 0;">AIOC not connected — plug in to enable Radio mode.</p>'}
-</div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
   <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
   <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
+  <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _ptt_alive() else 'color:#475569;border-color:#334155;'}">&#128225; Radio</button>
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -2840,15 +2822,6 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
 function adj(d){{adjVol(d);}}
-function adjTX(d){{
-  fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>{{
-    upd();
-    fetch('/speaker-cal/vol').then(r=>r.json()).then(dv=>{{
-      const tv=document.getElementById('txvol');
-      if(tv) tv.textContent=dv.spk_vol;
-    }});
-  }});
-}}
 function toggleRadio(){{
   fetch('/radio/profile').then(r=>r.json()).then(d=>{{
     const rm=document.getElementById('radiomode');
