@@ -110,8 +110,9 @@ MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-le
 # only a light trim and a minimal gate. Falls back to the static --mic-gain
 # / --mic-gate values when the AGC source is unavailable.
 AGC_SOURCE_NAME   = "rtt_agc_source"
-AGC_MIC_GAIN      = 16.0         # gain_control off — need more software gain to compensate
-AGC_MIC_GATE      = 60           # AGC+NS clean the signal; gate only residual
+AGC_MIC_GAIN       = 2.0          # mic mode: gain_control ON so WebRTC normalises; light trim only
+AGC_MIC_GAIN_RADIO = 16.0        # radio mode: gain_control OFF; software compensates
+AGC_MIC_GATE       = 60          # AGC+NS clean the signal; gate only residual
 # Raw physical mic that AGC captures from. Read from the PipeWire AGC config
 # so the user's mic selection (via device picker) survives daemon restarts.
 def _read_raw_mic_from_agc_config() -> str:
@@ -610,8 +611,11 @@ def _apply_agc_profile(radio: bool) -> None:
                 subprocess.run(["pactl", "set-default-sink", usb_spk], capture_output=True)
                 _apply_device_cal(usb_spk)
         globals()['RAW_MIC_SOURCE'] = aioc_src if radio else mic_src
+        globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN
         _radio_profile_active[0] = radio
-        log.info("AGC profile → %s (gain_control=%s)", "radio" if radio else "mic", not radio)
+        log.info("AGC profile → %s (gain_control=%s, MIC_GAIN=%.0fx)",
+                 "radio" if radio else "mic", not radio,
+                 AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN)
     except Exception as exc:
         log.warning("AGC profile switch failed: %s", exc)
 
@@ -2490,7 +2494,21 @@ def start_http_server(port: int, on_stop, session_ref: list):
             elif self.path in ("/monitor", "/monitor/start", "/monitor/stop"):
                 # Passive capture-only monitoring (no Five, no TTS).
                 # /monitor toggles; /monitor/start and /monitor/stop are explicit.
-                if sess:
+                _want_monitor = (self.path == "/monitor/start" or
+                                 (self.path == "/monitor" and not _persist_monitoring[0]))
+                if not sess and _idle_disconnected[0] and _wake_event[0]:
+                    # SLEEPING with no session — pre-arm monitoring and wake
+                    if _want_monitor:
+                        _persist_monitoring[0] = True
+                        _persist_active[0] = False   # monitoring is silent, not active
+                        import time as _tmon_w; _last_activity[0] = _tmon_w.time()
+                        _wake_event[0].set()
+                        log.info("HTTP monitor START — waking from sleep into monitoring")
+                        _log_entry("system", "Waking into monitoring mode…")
+                    else:
+                        _persist_monitoring[0] = False
+                        log.info("HTTP monitor STOP (was sleeping)")
+                elif sess:
                     if self.path == "/monitor/start":
                         new_state = True
                     elif self.path == "/monitor/stop":
