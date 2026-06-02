@@ -1,16 +1,26 @@
 # Changelog
 
-## v2.1.0 — 2026-06-01
+## v2.1.0 — 2026-06-02
 
 ### Added
 
-- **AIOC ham radio integration — full TX/RX over the air.** When an AIOC (All-In-One-Cable, USB ID 1209:7388) is connected, the daemon automatically opens `/dev/ttyACM0` and enables PTT mode. On every TTS reply, it asserts serial DTR (keying the radio's PTT) for a 250 ms pre-key delay, plays audio through the AIOC's PipeWire sink, holds PTT for a 400 ms tail, then releases. Audio is routed dynamically via `paplay --device=<aioc_sink>` so the AIOC sink is found at runtime — no hard-coded card numbers. If the AIOC is absent the daemon starts normally with PTT silently disabled.
+- **AIOC ham radio integration — full TX/RX over the air.** When an AIOC (All-In-One-Cable, USB ID 1209:7388) is connected, the daemon automatically opens the serial port and enables PTT mode. On every TTS reply it asserts serial DTR (keying the radio's PTT) for a 250 ms pre-key delay, plays audio through the AIOC's PipeWire sink, holds PTT for a 400 ms tail, then releases. Audio is routed dynamically via `paplay --device=<aioc_sink>` so the AIOC sink is found at runtime — no hard-coded card numbers. If the AIOC is absent the daemon starts normally with PTT silently disabled.
 
 - **TX transcript gate.** While PTT is asserted (`_is_tx = True`), all incoming transcripts from the mic are suppressed. This prevents Five's own transmitted voice (or radio sidetone) from being picked up and re-routed as a new command.
 
 - **AIOC warning banner on dashboard.** When the AIOC serial port is open (PTT mode active), the announcement bar shows a persistent highlighted red banner: **📡 AIOC ACTIVE — audio output transmits LIVE OVER THE AIR**. This replaces the normal idle/device-change messages for as long as the AIOC is connected.
 
 - **TRANSMITTING speaking banner.** While PTT is keyed and Five is speaking, the SPEAKING banner changes from the normal green "♩ Five is speaking…" to a red "📡 TRANSMITTING…" banner so the dashboard clearly shows on-air state.
+
+### Fixed
+
+- **Stale AIOC banner after unplug.** The serial port handle stayed non-None in memory after the physical device was removed, keeping the warning banner visible indefinitely. `_ptt_alive()` now checks device presence on every call and closes the stale handle immediately on unplug.
+
+- **AIOC ttyACM number changes across plug/unplug cycles.** The port was previously hardcoded as `/dev/ttyACM0`, which breaks when the kernel assigns a different number. The port is now found dynamically via `serial.tools.list_ports` matching USB VID:PID `1209:7388`.
+
+- **Mic not switching to AIOC on hotplug.** `_ptt_alive()` was only reached via an `elif` branch that is skipped whenever the device-change message is set (i.e. exactly when a device is plugged in). Added an explicit `_ptt_alive()` call inside the device-change detection block so the serial port opens and the AGC mic redirects on the same page load that detects the AIOC.
+
+- **Mic and speaker not auto-switching on AIOC connection.** On hotplug, `_ptt_alive()` now also calls `_update_agc_capture_source()` in a background thread to redirect the WebRTC AGC to the AIOC mic input, and restores the previous mic source on unplug.
 
 ### Notes
 
