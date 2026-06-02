@@ -3294,12 +3294,14 @@ setInterval(upd, 2000);
                 self.wfile.write(resp)
 
             elif self.path == "/speaker-cal/loop-start":
-                # Headset mode: start looping test speech
+                # Headset mode: start looping test speech.
+                # When Radio profile is active, keys PTT before each playback iteration.
                 _headset_cal_loop[0] = True
+                _use_radio = _radio_profile_active[0]
+                _aioc_sink_name = _find_aioc_sink() if _use_radio else None
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
-                def _loop(alsa=alsa):
-                    import tempfile as _tf, os as _os
-                    # Pre-render WAV once — avoids Piper startup overhead on every iteration
+                def _loop(alsa=alsa, radio=_use_radio, aioc_sink=_aioc_sink_name):
+                    import tempfile as _tf, os as _os, time as _tl
                     _pre = _tf.mktemp(suffix=".wav")
                     try:
                         import subprocess as _sp
@@ -3309,17 +3311,28 @@ setInterval(upd, 2000);
                             capture_output=True, env=PIPER_ENV,
                         )
                         while _headset_cal_loop[0]:
-                            proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
-                                             stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            if radio and aioc_sink:
+                                _ptt_key()
+                                _tl.sleep(AIOC_PTT_PREKEY_MS / 1000)
+                                proc = _sp.Popen(["paplay", f"--device={aioc_sink}", _pre],
+                                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            else:
+                                proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
+                                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             _headset_cal_proc[0] = proc
                             proc.wait()
                             _headset_cal_proc[0] = None
+                            if radio and aioc_sink:
+                                _tl.sleep(AIOC_PTT_TAIL_MS / 1000)
+                                _ptt_release()
+                                _tl.sleep(1.0)   # pause between transmissions
                     finally:
                         try: _os.unlink(_pre)
                         except FileNotFoundError: pass
                 import threading as _t2
                 _t2.Thread(target=_loop, daemon=True).start()
-                _html(self, 200, "<p>Loop started.</p>")
+                via = "radio (PTT)" if _use_radio else "speaker"
+                _html(self, 200, f"<p>Loop started via {via}.</p>")
 
             elif self.path == "/speaker-cal/loop-stop":
                 _headset_cal_loop[0] = False
@@ -3327,6 +3340,7 @@ setInterval(upd, 2000);
                 if proc and proc.poll() is None:
                     proc.kill()
                 _headset_cal_proc[0] = None
+                _ptt_release()   # ensure PTT is released if loop was stopped mid-transmission
                 _html(self, 200, "<p>Loop stopped.</p>")
 
             elif self.path.startswith("/speaker-cal/adjust"):
