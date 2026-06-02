@@ -103,14 +103,14 @@ AGENT_TIMEOUT_S   = 90
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
                                  # (lets OpenAI's VAD see real silence between words)
-MIC_GATE_MIN      = 300          # calibration clamp — quietest usable room
+MIC_GATE_MIN      = 30           # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-level input
 # WebRTC AGC virtual source (PipeWire module-echo-cancel). When present it
 # normalizes speech level + suppresses noise upstream, so the daemon needs
 # only a light trim and a minimal gate. Falls back to the static --mic-gain
 # / --mic-gate values when the AGC source is unavailable.
 AGC_SOURCE_NAME   = "rtt_agc_source"
-AGC_MIC_GAIN      = 2.0          # AGC already normalizes; light trim only
+AGC_MIC_GAIN      = 8.0          # gain_control off — need more software gain to compensate
 AGC_MIC_GATE      = 60           # AGC+NS clean the signal; gate only residual
 # Raw physical mic that AGC captures from. Read from the PipeWire AGC config
 # so the user's mic selection (via device picker) survives daemon restarts.
