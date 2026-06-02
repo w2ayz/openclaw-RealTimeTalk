@@ -4075,6 +4075,16 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                session_key: str = OPENCLAW_SESSION):
     global ALSA_OUTPUT
     ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
+    # Clean up any loopback modules left over from a previous run
+    try:
+        _mods = subprocess.run(["pactl","list","short","modules"],
+                               capture_output=True, text=True).stdout
+        for _ml in _mods.splitlines():
+            if "module-loopback" in _ml:
+                subprocess.run(["pactl","unload-module", _ml.split()[0]], capture_output=True)
+                log.info("Cleaned up stale loopback module %s", _ml.split()[0])
+    except Exception:
+        pass
     _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
     if _ptt_serial[0] is not None:
         # AIOC connected at startup — apply radio-mode gain immediately
