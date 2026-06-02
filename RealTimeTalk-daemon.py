@@ -3330,13 +3330,13 @@ setInterval(upd, 2000);
                 import json as _json, urllib.parse as _up2
                 qs2    = _up2.parse_qs(_up2.urlparse(self.path).query)
                 action = qs2.get("set", [None])[0]   # "radio" | "mic" | None (toggle)
-                currently_radio = _ptt_alive() and _find_aioc_source() is not None
                 if action == "radio":
                     go_radio = True
                 elif action == "mic":
                     go_radio = False
                 else:
-                    go_radio = not currently_radio  # toggle
+                    go_radio = not _radio_profile_active[0]  # toggle based on actual profile state
+                _radio_profile_active[0] = go_radio  # update immediately so page reflects new state
                 import threading as _trad
                 _trad.Thread(target=_apply_agc_profile, args=(go_radio,), daemon=True).start()
                 resp = _json.dumps({
