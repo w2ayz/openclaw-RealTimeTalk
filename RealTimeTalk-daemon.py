@@ -566,9 +566,17 @@ def _apply_agc_profile(radio: bool) -> None:
             content = _AGC_PROFILE_RADIO.format(aioc_src=aioc_src)
         else:
             # Prefer: saved pre-AIOC source → any running physical mic → known C-Media fallback
-            mic_src = (_pre_aioc_mic[0]
-                       or _find_always_on_mic_source()
-                       or _FALLBACK_MIC)
+            # Never allow the virtual AGC source itself as source_master (self-referential loop)
+            _candidates = [
+                _pre_aioc_mic[0],
+                _find_always_on_mic_source(),
+                _FALLBACK_MIC,
+            ]
+            mic_src = next(
+                (s for s in _candidates
+                 if s and "rtt_agc" not in s and "AIOC" not in s and "All-In-One" not in s),
+                _FALLBACK_MIC
+            )
             content = _AGC_PROFILE_MIC.format(mic_src=mic_src)
 
         with open(_AGC_CONF, "w") as f:
