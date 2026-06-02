@@ -3518,11 +3518,14 @@ setInterval(upd, 2000);
                         _stop_loopback()
                         active = False
                     else:
+                        # Use first available non-AIOC, non-monitor, non-agc sink
                         fallback = next(
                             (l.split()[1] for l in subprocess.run(
                                 ["pactl","list","short","sinks"],
                                 capture_output=True, text=True).stdout.splitlines()
-                             if "Generic_USB2.0" in l or ("USB2.0" in l and "AIOC" not in l)),
+                             if l.split()[1:2] and
+                                "AIOC" not in l and "All-In-One" not in l and
+                                "monitor" not in l and "rtt_agc" not in l),
                             None)
                         active = _start_loopback(fallback) if fallback else False
 
