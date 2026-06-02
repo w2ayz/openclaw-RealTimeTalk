@@ -379,6 +379,7 @@ _is_tx:               list = [False]  # True while PTT is asserted (suppresses m
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
 _aioc_monitor_module: list = [None]  # PipeWire loopback module ID when AIOC monitor is active
+_aioc_monitor_sink:   list = [None]  # sink name currently used for AIOC monitor loopback
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -2893,6 +2894,21 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
 function adj(d){{adjVol(d);}}
+function setAiocMonitor(sink){{
+  fetch('/aioc-monitor?sink='+encodeURIComponent(sink)).then(r=>r.json()).then(d=>{{
+    const mb=document.getElementById('monitorbtn');
+    if(mb){{
+      if(d.active){{
+        mb.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+        mb.style.color='#34d399';mb.style.borderColor='#34d399';mb.style.background='#021a0e';
+      }} else {{
+        mb.innerHTML='&#128266; Monitor';
+        mb.style.color='#475569';mb.style.borderColor='#334155';mb.style.background='';
+      }}
+    }}
+    loadDevices();  // refresh table to show updated checkmark
+  }});
+}}
 function toggleAiocMonitor(){{
   fetch('/aioc-monitor').then(r=>r.json()).then(d=>{{
     const mb=document.getElementById('monitorbtn');
@@ -2968,11 +2984,17 @@ function loadDevices(){{
   fetch('/device-status').then(r=>r.json()).then(d=>{{
     if(d.error){{out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>';return;}}
     let h='';
+    const monSink=d.monitor_sink||null;
+    const aiocAvail=!!(d.sinks||[]).find(s=>s.name.includes('AIOC')||s.name.includes('All-In-One'));
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
-    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th></tr>';
+    h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th>'
+      +(aiocAvail?'<th style="color:#34d399;white-space:nowrap">&#128266; Monitor</th>':'')
+      +'</tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
+      if(s.name.includes('AIOC')||s.name.includes('All-In-One')) return; // skip AIOC itself
       const active=(s.name===d.default_sink);
+      const monitoring=(s.name===monSink);
       h+='<tr'+(active?' class="active-row"':'')+'>'
         +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'BT')+'</td>'
@@ -2981,7 +3003,14 @@ function loadDevices(){{
         +' data-dtype="sink" data-dname="'+s.name+'"'
         +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
         +(active?' disabled':'')
-        +'>'+(active?'Active':'Use')+'</button></td></tr>';
+        +'>'+(active?'Active':'Use')+'</button></td>'
+        +(aiocAvail?'<td style="text-align:center">'
+          +'<button class="use-btn'+(monitoring?' active':'')+'"'
+          +' onclick="setAiocMonitor(\''+s.name+'\')" style="padding:3px 10px;'
+          +(monitoring?'color:#34d399;border-color:#34d399;background:#021a0e;':'')
+          +'">'+(monitoring?'&#10003; On':'Off')+'</button>'
+          +'</td>':'')
+        +'</tr>';
     }});
     h+='</table>';
     h+='<p style="margin:12px 0 8px;color:#9cf;font-weight:bold">Microphones</p>';
@@ -3443,46 +3472,63 @@ setInterval(upd, 2000);
                 self.end_headers()
                 self.wfile.write(resp)
 
-            elif self.path == "/aioc-monitor":
-                import json as _json
-                if _aioc_monitor_module[0] is not None:
-                    # Stop — unload loopback module
-                    subprocess.run(["pactl", "unload-module",
-                                    str(_aioc_monitor_module[0])], capture_output=True)
-                    _aioc_monitor_module[0] = None
-                    log.info("AIOC monitor loopback stopped")
-                    active = False
+            elif self.path.startswith("/aioc-monitor"):
+                import json as _json, urllib.parse as _uam
+                _qs_am = _uam.parse_qs(_uam.urlparse(self.path).query)
+                _req_sink = _qs_am.get("sink", [None])[0]  # specific sink or None
+
+                def _start_loopback(target_sink):
+                    aioc_src = _find_aioc_source()
+                    if not aioc_src or not target_sink:
+                        return False
+                    result = subprocess.run(
+                        ["pactl", "load-module", "module-loopback",
+                         f"source={aioc_src}", f"sink={target_sink}",
+                         "latency_msec=20"],
+                        capture_output=True, text=True)
+                    mod_id = result.stdout.strip()
+                    if mod_id.isdigit():
+                        _aioc_monitor_module[0] = int(mod_id)
+                        _aioc_monitor_sink[0]   = target_sink
+                        log.info("AIOC monitor → %s (module %s)",
+                                 target_sink.split(".")[-1][:30], mod_id)
+                        return True
+                    return False
+
+                def _stop_loopback():
+                    if _aioc_monitor_module[0] is not None:
+                        subprocess.run(["pactl", "unload-module",
+                                        str(_aioc_monitor_module[0])], capture_output=True)
+                        _aioc_monitor_module[0] = None
+                        _aioc_monitor_sink[0]   = None
+                        log.info("AIOC monitor loopback stopped")
+
+                if _req_sink:
+                    # Specific sink requested — toggle: if already on this sink, stop; else switch
+                    if _aioc_monitor_sink[0] == _req_sink:
+                        _stop_loopback()
+                        active = False
+                    else:
+                        _stop_loopback()   # unload previous if any
+                        active = _start_loopback(_req_sink)
                 else:
-                    # Start — loopback AIOC source → default local sink
-                    aioc_src  = _find_aioc_source()
-                    local_snk = subprocess.run(["pactl","get-default-sink"],
-                                               capture_output=True, text=True).stdout.strip()
-                    # If default sink IS AIOC, use USB speaker for local monitoring
-                    if local_snk and ("AIOC" in local_snk or "All-In-One" in local_snk):
-                        local_snk = next(
+                    # No sink specified — toggle on/off using last sink or USB speaker fallback
+                    if _aioc_monitor_module[0] is not None:
+                        _stop_loopback()
+                        active = False
+                    else:
+                        fallback = next(
                             (l.split()[1] for l in subprocess.run(
                                 ["pactl","list","short","sinks"],
                                 capture_output=True, text=True).stdout.splitlines()
                              if "Generic_USB2.0" in l or ("USB2.0" in l and "AIOC" not in l)),
-                            local_snk
-                        )
-                    if aioc_src and local_snk:
-                        result = subprocess.run(
-                            ["pactl", "load-module", "module-loopback",
-                             f"source={aioc_src}", f"sink={local_snk}",
-                             "latency_msec=20"],
-                            capture_output=True, text=True)
-                        mod_id = result.stdout.strip()
-                        if mod_id.isdigit():
-                            _aioc_monitor_module[0] = int(mod_id)
-                            log.info("AIOC monitor loopback started → %s (module %s)",
-                                     local_snk.split(".")[-1], mod_id)
-                            active = True
-                        else:
-                            active = False
-                    else:
-                        active = False
-                resp = _json.dumps({"active": active}).encode()
+                            None)
+                        active = _start_loopback(fallback) if fallback else False
+
+                resp = _json.dumps({
+                    "active": _aioc_monitor_module[0] is not None,
+                    "sink":   _aioc_monitor_sink[0],
+                }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
@@ -3541,6 +3587,7 @@ setInterval(upd, 2000);
                         "default_sink":   default_sink,
                         "default_source": default_source,
                         "raw_mic_source": RAW_MIC_SOURCE,  # physical mic behind AGC
+                        "monitor_sink":   _aioc_monitor_sink[0],  # active AIOC loopback sink
                         "agc_source":     AGC_SOURCE_NAME,
                         "sinks":   sinks,
                         "sources": sources,
