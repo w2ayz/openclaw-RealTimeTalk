@@ -2992,24 +2992,29 @@ function loadDevices(){{
       +'</tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
-      if(s.name.includes('AIOC')||s.name.includes('All-In-One')) return; // skip AIOC itself
       const active=(s.name===d.default_sink);
       const monitoring=(s.name===monSink);
+      const isAioc=(s.name.includes('AIOC')||s.name.includes('All-In-One'));
+      const stateLabel=monitoring
+        ?'<span style="color:#34d399;font-weight:bold">Monitoring</span>'
+        :s.state==='SUSPENDED'?'Idle'
+        :s.state==='RUNNING'?'<span style="color:#5f5">Running</span>'
+        :s.state;
       h+='<tr'+(active?' class="active-row"':'')+'>'
         +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'BT')+'</td>'
-        +'<td>'+(s.state==='SUSPENDED'?'Idle':s.state==='RUNNING'?'<span style="color:#5f5">Running</span>':s.state)+'</td>'
-        +'<td><button class="use-btn'+(active?' active':'')+'"'
-        +' data-dtype="sink" data-dname="'+s.name+'"'
-        +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
-        +(active?' disabled':'')
-        +'>'+(active?'Active':'Use')+'</button></td>'
+        +'<td>'+stateLabel+'</td>'
+        +'<td>'+(isAioc?'':('<button class="use-btn'+(active?' active':'')+'"'
+          +' data-dtype="sink" data-dname="'+s.name+'"'
+          +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
+          +(active?' disabled':'')
+          +'>'+(active?'Active':'Use')+'</button>'))+'</td>'
         +(aiocAvail?'<td style="text-align:center">'
-          +'<button class="use-btn'+(monitoring?' active':'')+'"'
-          +' data-sink="'+s.name+'"'
-          +' onclick="setAiocMonitor(this.dataset.sink)" style="padding:3px 10px;'
-          +(monitoring?'color:#34d399;border-color:#34d399;background:#021a0e;':'')
-          +'">'+(monitoring?'&#10003; On':'Off')+'</button>'
+          +(isAioc?'—':('<button class="use-btn'+(monitoring?' active':'')+'"'
+            +' data-sink="'+s.name+'"'
+            +' onclick="setAiocMonitor(this.dataset.sink)" style="padding:3px 10px;'
+            +(monitoring?'color:#34d399;border-color:#34d399;background:#021a0e;':'')
+            +'">'+(monitoring?'&#10003; On':'Off')+'</button>'))
           +'</td>':'')
         +'</tr>';
     }});
