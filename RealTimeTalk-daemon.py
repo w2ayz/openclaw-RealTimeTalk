@@ -110,7 +110,7 @@ MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-le
 # only a light trim and a minimal gate. Falls back to the static --mic-gain
 # / --mic-gate values when the AGC source is unavailable.
 AGC_SOURCE_NAME   = "rtt_agc_source"
-AGC_MIC_GAIN      = 8.0          # gain_control off — need more software gain to compensate
+AGC_MIC_GAIN      = 16.0         # gain_control off — need more software gain to compensate
 AGC_MIC_GATE      = 60           # AGC+NS clean the signal; gate only residual
 # Raw physical mic that AGC captures from. Read from the PipeWire AGC config
 # so the user's mic selection (via device picker) survives daemon restarts.
@@ -512,36 +512,81 @@ def _ptt_open() -> None:
 _AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
 _AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
 
+_AGC_PROFILE_RADIO = """\
+# RealTimeTalk AGC — Radio mode (AIOC). gain_control=false so the noise
+# gate works against true signal levels rather than AGC-amplified noise.
+context.modules = [
+    {{   name = libpipewire-module-echo-cancel
+        args = {{
+            aec.method = webrtc
+            source.props = {{ node.name = "rtt_agc_source" node.description = "RTT AGC Mic (WebRTC)" }}
+            sink.props   = {{ node.name = "rtt_agc_sink"   node.description = "RTT AGC Sink (unused reference)" }}
+            capture.props = {{ target.object = "{aioc_src}" }}
+            aec.args = {{
+                webrtc.gain_control = false webrtc.noise_suppression = true
+                webrtc.high_pass_filter = true webrtc.voice_detection = true
+                webrtc.extended_filter = true webrtc.transient_suppression = true
+            }}
+        }}
+    }}
+]
+"""
+
+_AGC_PROFILE_MIC = """\
+# RealTimeTalk AGC — Mic mode. gain_control=true for adaptive amplification.
+context.modules = [
+    {{   name = libpipewire-module-echo-cancel
+        args = {{
+            aec.method = webrtc
+            source.props = {{ node.name = "rtt_agc_source" node.description = "RTT AGC Mic (WebRTC)" }}
+            sink.props   = {{ node.name = "rtt_agc_sink"   node.description = "RTT AGC Sink (unused reference)" }}
+            capture.props = {{ target.object = "{mic_src}" }}
+            aec.args = {{
+                webrtc.gain_control = true webrtc.noise_suppression = true
+                webrtc.high_pass_filter = true webrtc.voice_detection = true
+                webrtc.extended_filter = true webrtc.transient_suppression = true
+            }}
+        }}
+    }}
+]
+"""
+
 def _apply_agc_profile(radio: bool) -> None:
     """Swap the PipeWire AGC config between radio mode (gain_control=false)
     and mic mode (gain_control=true), then hot-reload the echo-cancel module."""
-    import shutil as _sh
-    src = _AGC_CONF_RADIO if radio else _AGC_CONF
-    dst = _AGC_CONF_RADIO if not radio else _AGC_CONF
+    import time as _ta
     try:
-        # Read the appropriate profile and write it into the active config
-        with open(src) as f:
-            content = f.read()
-        # Update the active config target to match current source
+        if radio:
+            aioc_src = _find_aioc_source() or "alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback"
+            content = _AGC_PROFILE_RADIO.format(aioc_src=aioc_src)
+        else:
+            mic_src = _pre_aioc_mic[0] or _find_always_on_mic_source() or RAW_MIC_SOURCE
+            content = _AGC_PROFILE_MIC.format(mic_src=mic_src)
+
         with open(_AGC_CONF, "w") as f:
             f.write(content)
-        # Hot-swap the echo-cancel module
+
+        # Hot-swap echo-cancel module
         mods = subprocess.run(["pactl", "list", "short", "modules"],
                               capture_output=True, text=True).stdout
         for line in mods.splitlines():
             if "echo-cancel" in line:
                 subprocess.run(["pactl", "unload-module", line.split()[0]],
                                capture_output=True)
-        import time as _ta; _ta.sleep(0.5)
+        _ta.sleep(0.5)
         subprocess.run(["pactl", "load-module", "module-echo-cancel",
                         "aec_method=webrtc",
                         f"source_name={AGC_SOURCE_NAME}",
-                        f"source_master={'alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback' if radio else (globals().get('RAW_MIC_SOURCE') or '')}",
+                        f"source_master={aioc_src if radio else mic_src}",
                         "sink_name=rtt_agc_sink",
-                        f"aec_args=webrtc.gain_control={'0' if radio else '1'} webrtc.noise_suppression=1 webrtc.high_pass_filter=1 webrtc.voice_detection=1 webrtc.extended_filter=1 webrtc.transient_suppression=1",
+                        f"aec_args=webrtc.gain_control={'0' if radio else '1'} "
+                        "webrtc.noise_suppression=1 webrtc.high_pass_filter=1 "
+                        "webrtc.voice_detection=1 webrtc.extended_filter=1 "
+                        "webrtc.transient_suppression=1",
                        ], capture_output=True)
         _ta.sleep(0.3)
         subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
+        globals()['RAW_MIC_SOURCE'] = aioc_src if radio else mic_src
         log.info("AGC profile → %s (gain_control=%s)", "radio" if radio else "mic", not radio)
     except Exception as exc:
         log.warning("AGC profile switch failed: %s", exc)
@@ -2656,6 +2701,25 @@ a:hover{{text-decoration:underline;}}
   <b>Mic:</b> <span id="panelmic">{ds["mic"]}</span> &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: <span id="panelgain">{ds["gain"]}</span>x<br>
   <b>Speaker:</b> <span id="panelspk">{ds["speaker_name"]}</span> &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
+<div class="sect" style="margin-top:10px;padding-top:10px;" id="radiosect">
+  <h4>&#128225; Radio Mode (AIOC)</h4>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0;">
+    <span style="font-size:13px;color:var(--mu);">Profile:</span>
+    <b id="radiomode" style="color:{'#dc2626' if _ptt_alive() else '#64748b'};">{'&#128225; Radio — AGC gain off, gate active' if _ptt_alive() else 'Mic — AGC gain on'}</b>
+    <button id="radiobtn" onclick="toggleRadio()"
+      style="padding:4px 12px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _ptt_alive() else 'color:#64748b;border-color:#334155;'}">
+      {'Switch to Mic' if _ptt_alive() else 'Switch to Radio'}</button>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:6px 0;">
+    <span style="font-size:13px;color:var(--mu);">TX Volume:</span>
+    <b id="txvol" style="font-size:1.1em;min-width:52px;">{ds["spk_vol"]}</b>
+    <div style="display:flex;gap:5px;">
+      <button class="bQ" onclick="adjTX(-25)">&#8722; Lower</button>
+      <button class="bL" onclick="adjTX(+25)">+ Higher</button>
+    </div>
+  </div>
+  {'<p style="font-size:12px;color:#dc2626;margin:4px 0;">&#9888; AIOC connected — TX transmits over the air</p>' if _ptt_alive() else '<p style="font-size:12px;color:var(--mu);margin:4px 0;">AIOC not connected — plug in to enable Radio mode.</p>'}
+</div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
   <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
@@ -2776,7 +2840,28 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
 function adj(d){{adjVol(d);}}
-
+function adjTX(d){{
+  fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>{{
+    upd();
+    fetch('/speaker-cal/vol').then(r=>r.json()).then(dv=>{{
+      const tv=document.getElementById('txvol');
+      if(tv) tv.textContent=dv.spk_vol;
+    }});
+  }});
+}}
+function toggleRadio(){{
+  fetch('/radio/profile').then(r=>r.json()).then(d=>{{
+    const rm=document.getElementById('radiomode');
+    const rb=document.getElementById('radiobtn');
+    if(d.profile==='radio'){{
+      if(rm){{rm.textContent='📡 Radio — AGC gain off, gate active';rm.style.color='#dc2626';}}
+      if(rb){{rb.textContent='Switch to Mic';rb.style.color='#dc2626';rb.style.borderColor='#dc2626';rb.style.background='#3b0000';}}
+    }} else {{
+      if(rm){{rm.textContent='Mic — AGC gain on';rm.style.color='#64748b';}}
+      if(rb){{rb.textContent='Switch to Radio';rb.style.color='#64748b';rb.style.borderColor='#334155';rb.style.background='';}}
+    }}
+  }});
+}}
 function adj(d){{fetch('/speaker-cal/adjust?delta='+d).then(()=>upd());}}
 function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Playing test loop…';}});}}
@@ -3226,10 +3311,12 @@ setInterval(upd, 2000);
                 kind  = qs.get("type", ["vol"])[0]   # "vol" or "sw"
 
                 def _snap10(val, d):
-                    """Snap to nearest multiple of 10, then step by 10; min 1."""
+                    """Snap to nearest multiple of 10, then step by 10; min 1.
+                    When AIOC is active allow up to 500% (radio TX needs boosted levels)."""
                     snapped = round(val / 10) * 10
                     result  = snapped + d
-                    return max(1, min(100, result))
+                    max_vol = 500 if _ptt_alive() else 100
+                    return max(1, min(max_vol, result))
 
                 sink = subprocess.run(["pactl","get-default-sink"],
                                       capture_output=True,text=True).stdout.strip()
@@ -3260,6 +3347,29 @@ setInterval(upd, 2000);
                 resp = _json.dumps(_get_device_status()).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json")
                 self.send_header("Content-Length", str(len(resp))); self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path.startswith("/radio/profile"):
+                import json as _json, urllib.parse as _up2
+                qs2    = _up2.parse_qs(_up2.urlparse(self.path).query)
+                action = qs2.get("set", [None])[0]   # "radio" | "mic" | None (toggle)
+                currently_radio = _ptt_alive() and _find_aioc_source() is not None
+                if action == "radio":
+                    go_radio = True
+                elif action == "mic":
+                    go_radio = False
+                else:
+                    go_radio = not currently_radio  # toggle
+                import threading as _trad
+                _trad.Thread(target=_apply_agc_profile, args=(go_radio,), daemon=True).start()
+                resp = _json.dumps({
+                    "profile": "radio" if go_radio else "mic",
+                    "aioc_connected": _ptt_serial[0] is not None,
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
                 self.wfile.write(resp)
 
             elif self.path == "/device-status":
