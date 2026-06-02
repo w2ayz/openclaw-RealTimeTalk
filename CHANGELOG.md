@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.3.0 — 2026-06-02
+
+### Added
+
+- **Play test loop transmits over radio when Radio profile is active.** The calibration page "Play test" button now keys PTT (250 ms pre-key, 400 ms tail) and routes audio through the AIOC sink when Radio mode is on, instead of playing locally. Stop button releases PTT immediately if stopped mid-transmission.
+
+- **Monitor button works from SLEEPING state.** Clicking Monitor while sleeping now pre-arms `_persist_monitoring=True` and fires the wake signal so the new session starts directly in Monitoring mode rather than Silent.
+
+### Fixed
+
+- **gain_control re-enabled for Radio (AIOC) mode.** Disabling WebRTC gain_control for radio caused Five to mishear because radio signal strength varies widely and a fixed 16× software gain couldn't compensate. Radio mode now uses the same AGC settings as mic mode (gain_control=true, 2× software gain) — the only difference is capture source (AIOC vs C-Media) and output routing (AIOC + PTT vs USB speaker).
+
+- **PTT fails after AIOC replug with new ttyACM number.** After disconnect/reconnect the AIOC gets a new port number (e.g. ttyACM0→ttyACM1). `_ptt_alive()` now compares `serial.port` to the current VID:PID-discovered port and reopens if they differ. `_ptt_key()` also catches `[Errno 5] Input/output error` and retries on the new port.
+
+- **AIOC ACTIVE banner showed even when Radio profile was off.** Banner was keyed off `_ptt_alive()` (AIOC cable connected), not the actual radio profile state. Changed to `_radio_profile_active[0]` — banner only appears when Radio mode is explicitly active.
+
+- **`rtt_agc_source` used as its own AGC source_master (self-referential loop).** `_pre_aioc_mic[0]` could hold `rtt_agc_source` if `RAW_MIC_SOURCE` was already the virtual source at AIOC connection time. `_apply_agc_profile(False)` then loaded the echo-cancel module with `source_master=rtt_agc_source`, which the WebRTC AEC cancelled completely (peak output ≈ 0). Added explicit filter: any candidate containing `rtt_agc`, `AIOC`, or `All-In-One` is skipped; C-Media fallback is always used for mic mode.
+
+- **Radio-mode MIC_GAIN not applied at startup.** After a daemon restart with AIOC already connected, `_activate_agc_source()` always set `MIC_GAIN=2x` before the AIOC startup check. Added explicit `MIC_GAIN=AGC_MIC_GAIN_RADIO` assignment immediately after `_ptt_open()` at startup.
+
+- **Active state not persisted across session reconnects.** When the OpenAI session ended and reconnected (60-min limit, network drop), the daemon always restarted in Silent mode. Added `_persist_active` — set True on wake phrase / HTTP wake, False on sleep phrase / auto-sleep. New sessions restore this flag transparently.
+
+---
+
 ## v2.2.0 — 2026-06-02
 
 ### Added
