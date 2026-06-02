@@ -111,7 +111,7 @@ MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-le
 # / --mic-gate values when the AGC source is unavailable.
 AGC_SOURCE_NAME   = "rtt_agc_source"
 AGC_MIC_GAIN       = 2.0          # mic mode: gain_control ON so WebRTC normalises; light trim only
-AGC_MIC_GAIN_RADIO = 16.0        # radio mode: gain_control OFF; software compensates
+AGC_MIC_GAIN_RADIO = 2.0         # radio mode: gain_control ON; AGC normalises same as mic
 AGC_MIC_GATE       = 60          # AGC+NS clean the signal; gate only residual
 # Raw physical mic that AGC captures from. Read from the PipeWire AGC config
 # so the user's mic selection (via device picker) survives daemon restarts.
@@ -377,7 +377,7 @@ _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelis
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
-_radio_profile_active: list = [False] # True when AGC is in radio mode (gain_control=false)
+_radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -515,8 +515,8 @@ _AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-a
 _AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
 
 _AGC_PROFILE_RADIO = """\
-# RealTimeTalk AGC — Radio mode (AIOC). gain_control=false so the noise
-# gate works against true signal levels rather than AGC-amplified noise.
+# RealTimeTalk AGC — Radio mode (AIOC). Same AGC settings as mic mode;
+# gain_control=true lets WebRTC normalise varying radio signal levels.
 context.modules = [
     {{   name = libpipewire-module-echo-cancel
         args = {{
@@ -525,7 +525,7 @@ context.modules = [
             sink.props   = {{ node.name = "rtt_agc_sink"   node.description = "RTT AGC Sink (unused reference)" }}
             capture.props = {{ target.object = "{aioc_src}" }}
             aec.args = {{
-                webrtc.gain_control = false webrtc.noise_suppression = true
+                webrtc.gain_control = true webrtc.noise_suppression = true
                 webrtc.high_pass_filter = true webrtc.voice_detection = true
                 webrtc.extended_filter = true webrtc.transient_suppression = true
             }}
@@ -595,7 +595,7 @@ def _apply_agc_profile(radio: bool) -> None:
                         f"source_name={AGC_SOURCE_NAME}",
                         f"source_master={aioc_src if radio else mic_src}",
                         "sink_name=rtt_agc_sink",
-                        f"aec_args=webrtc.gain_control={'0' if radio else '1'} "
+                        f"aec_args=webrtc.gain_control=1 "
                         "webrtc.noise_suppression=1 webrtc.high_pass_filter=1 "
                         "webrtc.voice_detection=1 webrtc.extended_filter=1 "
                         "webrtc.transient_suppression=1",
