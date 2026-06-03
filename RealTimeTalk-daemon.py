@@ -3785,11 +3785,14 @@ setInterval(upd, 2000);
                         def _announce_change():
                             _safe_volume_new_sinks(1)   # PipeWire at 1% safety reset
                             import time as _time; _time.sleep(0.5)
-                            _cur_sink = subprocess.run(
-                                ["pactl","get-default-sink"],
-                                capture_output=True,text=True).stdout.strip()
-                            if _cur_sink:
-                                _apply_device_cal(_cur_sink)
+                            # Restore calibrated levels for ALL known sinks, not just default
+                            _cal_sinks = subprocess.run(
+                                ["pactl","list","short","sinks"],
+                                capture_output=True, text=True).stdout.splitlines()
+                            for _sl in _cal_sinks:
+                                _sn = _sl.split()[1] if len(_sl.split()) > 1 else None
+                                if _sn:
+                                    _apply_device_cal(_sn)
                             speak(msg, sess.alsa_output, volume=_cal_sw_volume)
                         _t.Thread(target=_announce_change, daemon=True).start()
 
