@@ -4101,10 +4101,11 @@ def _dtmf_listener() -> None:
         (941, 1209): '*', (941, 1336): '0', (941, 1477): '#', (941, 1633): 'D',
     }
     _FRAME = int(DTMF_SAMPLE_RATE * 0.04)   # 40 ms analysis window
-    _DEBOUNCE_FRAMES = 2                     # digit must hold for ~80 ms (FM radio tones are clean enough)
-    _SEQ_TIMEOUT = 5.0                       # reset sequence after 5 s silence
-    _ENERGY_THRESHOLD = 5e3                  # minimum Goertzel energy (int16 scale: 5000)
-    _RATIO_THRESHOLD  = 1.5                  # dominant freq must be 1.5× next (FM radio is less clean)
+    _CONFIRM_FRAMES   = 2                    # digit must appear in 2 consecutive frames (~80 ms)
+    _DIGIT_COOLDOWN   = 0.5                  # s: min gap before same digit accepted again into seq
+    _SEQ_TIMEOUT      = 6.0                  # reset sequence after 6 s of no new digit
+    _ENERGY_THRESHOLD = 5e4                  # minimum Goertzel energy; real FM DTMF: 50k-130k
+    _RATIO_THRESHOLD  = 3.0                  # dominant freq must be 3× next; real FM DTMF: 2.5-11×
 
     def _goertzel(samples, freq, rate):
         """Return signal power at freq using Goertzel algorithm."""
@@ -4158,12 +4159,14 @@ def _dtmf_listener() -> None:
             buf = _np2.array([], dtype=_np2.float32)
             seq = ""
             last_digit = None
-            hold_count = 0
-            last_digit_time = 0.0
+            last_digit_time = 0.0   # time last digit was accepted into seq
+            last_seq_time  = 0.0   # time of last any digit (for seq timeout)
+            confirm_digit  = None   # candidate digit awaiting 2nd consecutive confirmation
+            confirm_count  = 0
 
             def _cb(indata, frames, t, status):
                 nonlocal buf
-                # Convert int16 → float for Goertzel (keeps int16-scale energy values ~1e6+)
+                # Convert int16 → float for Goertzel (keeps int16-scale energy values)
                 buf = _np2.concatenate([buf, indata[:, 0].astype(_np2.float32)])
 
             with _sd2.InputStream(device=aioc_dev, channels=1,
@@ -4177,22 +4180,29 @@ def _dtmf_listener() -> None:
                         digit = _decode_frame(frame.tolist())
                         now = _td.time()
 
-                        # Sequence timeout
-                        if now - last_digit_time > _SEQ_TIMEOUT:
+                        # Sequence timeout — reset if no new digit for a while
+                        if seq and now - last_seq_time > _SEQ_TIMEOUT:
+                            log.debug("DTMF seq timeout — reset (was: %s)", seq)
                             seq = ""
 
-                        if digit == last_digit:
-                            hold_count += 1
+                        # Two-stage confirmation: digit must appear in _CONFIRM_FRAMES consecutive frames
+                        if digit == confirm_digit:
+                            confirm_count += 1
                         else:
-                            hold_count = 0
-                            last_digit = digit
+                            confirm_digit = digit
+                            confirm_count = 1
 
-                        if digit and hold_count == _DEBOUNCE_FRAMES:
-                            # New stable digit — append to sequence
-                            if not seq or seq[-1] != digit:
-                                seq += digit
+                        if digit and confirm_count >= _CONFIRM_FRAMES:
+                            # Confirmed digit — accept if not same as recent
+                            same_recent = (digit == last_digit and
+                                           now - last_digit_time < _DIGIT_COOLDOWN)
+                            if not same_recent:
+                                last_digit = digit
                                 last_digit_time = now
-                                log.info("DTMF digit: %s → seq=%s", digit, seq)
+                                last_seq_time = now
+                                if not seq or seq[-1] != digit:
+                                    seq += digit
+                                    log.info("DTMF digit: %s → seq=%s", digit, seq)
 
                             # Check for wake/sleep sequences
                             if DTMF_WAKE_SEQ in seq:
