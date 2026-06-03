@@ -4080,159 +4080,107 @@ setInterval(function(){{
 # ── openwakeword listener ─────────────────────────────────────────────────────
 
 def _dtmf_listener() -> None:
-    """Monitor the AIOC raw audio source for DTMF sequences.
+    """Monitor AIOC audio for DTMF sequences using the 'dtmf' library.
 
-    Reads from the physical AIOC source (not the AGC virtual source) using
-    sounddevice at 8 kHz, runs Goertzel algorithm on each 40 ms frame to
-    identify DTMF digits, and triggers wake/sleep when the configured
-    sequences (123 = wake, 321 = sleep) are fully received.
-
-    Runs as a daemon thread for the lifetime of the process; restarts
-    automatically if the AIOC source disappears (device unplug).
+    Reads from the PipeWire default source (rtt_agc_source → AIOC audio)
+    at 8 kHz, feeds 1-second chunks to dtmf.detect() which uses a tuned
+    Goertzel implementation, and triggers wake/sleep when the configured
+    sequences are fully received (123 = wake, 321 = sleep).
     """
     import time as _td, sounddevice as _sd2, numpy as _np2
-    # Goertzel frequencies for DTMF rows and columns
-    _ROW_FREQS = [697, 770, 852, 941]
-    _COL_FREQS = [1209, 1336, 1477, 1633]
-    _DIGIT_MAP = {
-        (697, 1209): '1', (697, 1336): '2', (697, 1477): '3', (697, 1633): 'A',
-        (770, 1209): '4', (770, 1336): '5', (770, 1477): '6', (770, 1633): 'B',
-        (852, 1209): '7', (852, 1336): '8', (852, 1477): '9', (852, 1633): 'C',
-        (941, 1209): '*', (941, 1336): '0', (941, 1477): '#', (941, 1633): 'D',
-    }
-    _FRAME = int(DTMF_SAMPLE_RATE * 0.04)   # 40 ms analysis window
-    _CONFIRM_FRAMES   = 2                    # digit must appear in 2 consecutive frames (~80 ms)
-    _DIGIT_COOLDOWN   = 0.5                  # s: min gap before same digit accepted again into seq
-    _SEQ_TIMEOUT      = 6.0                  # reset sequence after 6 s of no new digit
-    _ENERGY_THRESHOLD = 5e4                  # minimum Goertzel energy; real FM DTMF: 50k-130k
-    _RATIO_THRESHOLD  = 3.0                  # dominant freq must be 3× next; real FM DTMF: 2.5-11×
+    try:
+        import dtmf as _dtmf_lib
+    except ImportError:
+        log.warning("DTMF listener: 'dtmf' library not installed — pip install dtmf")
+        return
 
-    def _goertzel(samples, freq, rate):
-        """Return signal power at freq using Goertzel algorithm."""
-        n = len(samples)
-        k = int(0.5 + n * freq / rate)
-        w = 2 * _np2.pi * k / n
-        coeff = 2 * _np2.cos(w)
-        s_prev, s_prev2 = 0.0, 0.0
-        for s in samples:
-            s_new = s + coeff * s_prev - s_prev2
-            s_prev2 = s_prev
-            s_prev = s_new
-        return s_prev2**2 + s_prev**2 - coeff * s_prev * s_prev2
-
-    def _decode_frame(samples):
-        """Decode a DTMF digit from a frame, or return None if no tone."""
-        sr = DTMF_SAMPLE_RATE
-        powers_row = {f: _goertzel(samples, f, sr) for f in _ROW_FREQS}
-        powers_col = {f: _goertzel(samples, f, sr) for f in _COL_FREQS}
-        best_row = max(powers_row, key=powers_row.get)
-        best_col = max(powers_col, key=powers_col.get)
-        total = sum(powers_row.values()) + sum(powers_col.values())
-        if total < _ENERGY_THRESHOLD:   # ignore silence / very low signal
-            return None
-        # Both best row and col must dominate (≥ _RATIO_THRESHOLD× next best)
-        row_vals = sorted(powers_row.values(), reverse=True)
-        col_vals = sorted(powers_col.values(), reverse=True)
-        if row_vals[1] > 0 and row_vals[0] / row_vals[1] < _RATIO_THRESHOLD:
-            return None
-        if col_vals[1] > 0 and col_vals[0] / col_vals[1] < _RATIO_THRESHOLD:
-            return None
-        return _DIGIT_MAP.get((best_row, best_col))
+    _CHUNK        = DTMF_SAMPLE_RATE       # 1 second of audio per detect() call
+    _DIGIT_COOLDOWN = 0.4                  # s: min gap before same digit accepted again
+    _SEQ_TIMEOUT  = 6.0                    # reset sequence after 6 s of no new digit
 
     while True:   # outer loop: reconnect on device loss
-        # AIOC audio is available via rtt_agc_source → PipeWire default source.
-        # DTMF tones (697–1633 Hz) survive all WebRTC filters in that path.
         if not _find_aioc_source():
             _td.sleep(3)
             continue
-        # Find 'pulse' or 'default' device in sounddevice list
+        # Use PipeWire pulse/default — sounddevice can't access AIOC directly
         aioc_dev = next(
             (i for i, d in enumerate(_sd2.query_devices())
              if d['max_input_channels'] > 0
              and d['name'].lower() in ('pulse', 'default')),
             None)
-        if aioc_dev is None:
-            aioc_dev = None   # sounddevice will use system default
         try:
-            log.info("DTMF listener ready via AGC source (wake=%s sleep=%s)",
+            log.info("DTMF listener ready via dtmf library (wake=%s sleep=%s)",
                      DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
-            buf = _np2.array([], dtype=_np2.float32)
             seq = ""
             last_digit = None
-            last_digit_time = 0.0   # time last digit was accepted into seq
-            last_seq_time  = 0.0   # time of last any digit (for seq timeout)
-            confirm_digit  = None   # candidate digit awaiting 2nd consecutive confirmation
-            confirm_count  = 0
+            last_digit_time = 0.0
+            last_seq_time  = 0.0
 
-            def _cb(indata, frames, t, status):
-                nonlocal buf
-                # Convert int16 → float for Goertzel (keeps int16-scale energy values)
-                buf = _np2.concatenate([buf, indata[:, 0].astype(_np2.float32)])
+            while _find_aioc_source():
+                # Record 1 second of audio then run dtmf.detect() on it
+                chunk = _sd2.rec(_CHUNK, samplerate=DTMF_SAMPLE_RATE,
+                                 channels=1, dtype='float32',
+                                 device=aioc_dev, blocking=True)
+                now = _td.time()
+                samples = chunk[:, 0].tolist()
 
-            with _sd2.InputStream(device=aioc_dev, channels=1,
-                                  samplerate=DTMF_SAMPLE_RATE, dtype='int16',
-                                  latency='low', callback=_cb):
-                while _find_aioc_source():
-                    _td.sleep(0.01)
-                    while len(buf) >= _FRAME:
-                        frame = buf[:_FRAME]
-                        buf = buf[_FRAME:]
-                        digit = _decode_frame(frame.tolist())
-                        now = _td.time()
+                # Sequence timeout
+                if seq and now - last_seq_time > _SEQ_TIMEOUT:
+                    log.debug("DTMF seq timeout — reset (was: %s)", seq)
+                    seq = ""
 
-                        # Sequence timeout — reset if no new digit for a while
-                        if seq and now - last_seq_time > _SEQ_TIMEOUT:
-                            log.debug("DTMF seq timeout — reset (was: %s)", seq)
-                            seq = ""
+                # Detect DTMF in this chunk
+                results = list(_dtmf_lib.detect(samples, DTMF_SAMPLE_RATE))
+                detected = [r.tone.symbol for r in results if r.tone]
+                if not detected:
+                    continue
 
-                        # Two-stage confirmation: digit must appear in _CONFIRM_FRAMES consecutive frames
-                        if digit == confirm_digit:
-                            confirm_count += 1
-                        else:
-                            confirm_digit = digit
-                            confirm_count = 1
+                # Find the most common digit in this chunk (majority vote)
+                from collections import Counter as _Ctr
+                digit = _Ctr(detected).most_common(1)[0][0]
+                count = _Ctr(detected).most_common(1)[0][1]
+                confidence = count / len(results)
 
-                        if digit and confirm_count >= _CONFIRM_FRAMES:
-                            # Confirmed digit — accept if not same as recent
-                            same_recent = (digit == last_digit and
-                                           now - last_digit_time < _DIGIT_COOLDOWN)
-                            if not same_recent:
-                                last_digit = digit
-                                last_digit_time = now
-                                last_seq_time = now
-                                if not seq or seq[-1] != digit:
-                                    seq += digit
-                                    log.info("DTMF digit: %s → seq=%s", digit, seq)
+                # Require ≥30% of blocks to agree (filters noise/transients)
+                if confidence < 0.30:
+                    continue
 
-                            # Check for wake/sleep sequences
-                            if DTMF_WAKE_SEQ in seq:
-                                seq = ""
-                                log.info("DTMF wake sequence '%s' received", DTMF_WAKE_SEQ)
-                                _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
-                                if _idle_disconnected[0] and _wake_event[0]:
-                                    _last_activity[0] = now
-                                    _wake_activate[0] = True
-                                    _persist_active[0] = True
-                                    _save_sleep_state(False)
-                                    _wake_event[0].set()
-                                elif _wake_event[0]:
-                                    # Session active but silent — go Active
-                                    _persist_active[0] = True
-                                    # Signal via a synthetic wake event is not needed;
-                                    # next transcript handler will see _persist_active
-                                    # Force active on next session via flag
-                                    _wake_activate[0] = True
+                same_recent = (digit == last_digit and
+                               now - last_digit_time < _DIGIT_COOLDOWN)
+                if same_recent:
+                    continue
 
-                            elif DTMF_SLEEP_SEQ in seq:
-                                seq = ""
-                                log.info("DTMF sleep sequence '%s' received", DTMF_SLEEP_SEQ)
-                                _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
-                                _persist_active[0] = False
+                last_digit = digit
+                last_digit_time = now
+                last_seq_time = now
+                if not seq or seq[-1] != digit:
+                    seq += digit
+                    log.info("DTMF digit: %s (%.0f%% confident) → seq=%s",
+                             digit, confidence * 100, seq)
 
-                            # Trim sequence to last N chars (longest possible match)
-                            max_seq = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
-                            if len(seq) > max_seq:
-                                seq = seq[-max_seq:]
+                max_seq = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
+                if len(seq) > max_seq:
+                    seq = seq[-max_seq:]
+
+                if DTMF_WAKE_SEQ in seq:
+                    seq = ""
+                    log.info("DTMF wake sequence '%s' received", DTMF_WAKE_SEQ)
+                    _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
+                    if _idle_disconnected[0] and _wake_event[0]:
+                        _last_activity[0] = now
+                        _wake_activate[0] = True
+                        _persist_active[0] = True
+                        _save_sleep_state(False)
+                        _wake_event[0].set()
+                    elif _wake_event[0]:
+                        _persist_active[0] = True
+                        _wake_activate[0] = True
+
+                elif DTMF_SLEEP_SEQ in seq:
+                    seq = ""
+                    log.info("DTMF sleep sequence '%s' received", DTMF_SLEEP_SEQ)
+                    _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
+                    _persist_active[0] = False
 
         except Exception as exc:
             log.warning("DTMF listener error: %s — retrying in 5s", exc)
