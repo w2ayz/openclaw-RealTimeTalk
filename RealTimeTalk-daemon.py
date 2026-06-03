@@ -663,6 +663,16 @@ def _ptt_alive() -> bool:
         _is_tx[0] = False
         log.info("AIOC disconnected — PTT disabled, restoring mic AGC profile")
         _radio_profile_active[0] = False
+        # Stop monitor loopback — source device is gone
+        if _aioc_monitor_module[0] is not None:
+            try:
+                subprocess.run(["pactl", "unload-module",
+                                str(_aioc_monitor_module[0])], capture_output=True)
+            except Exception:
+                pass
+            _aioc_monitor_module[0] = None
+            _aioc_monitor_sink[0] = None
+            log.info("AIOC monitor loopback stopped (AIOC disconnected)")
         import threading as _tptt2
         _tptt2.Thread(target=_apply_agc_profile, args=(False,), daemon=True).start()
         _pre_aioc_mic[0] = None
@@ -2986,9 +2996,10 @@ function loadDevices(){{
     let h='';
     const monSink=d.monitor_sink||null;
     const aiocAvail=!!(d.sinks||[]).find(s=>s.name.includes('AIOC')||s.name.includes('All-In-One'));
+    const showMonCol=aiocAvail||!!monSink; // show Monitor column if AIOC present OR loopback active
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
     h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th>'
-      +(aiocAvail?'<th style="color:#34d399;white-space:nowrap">&#128266; Monitor</th>':'')
+      +(showMonCol?'<th style="color:#34d399;white-space:nowrap">&#128266; Monitor</th>':'')
       +'</tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
@@ -3009,7 +3020,7 @@ function loadDevices(){{
           +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
           +(active?' disabled':'')
           +'>'+(active?'Active':'Use')+'</button>'))+'</td>'
-        +(aiocAvail?'<td style="text-align:center">'
+        +(showMonCol?'<td style="text-align:center">'
           +(isAioc?'—':('<button class="use-btn'+(monitoring?' active':'')+'"'
             +' data-sink="'+s.name+'"'
             +' onclick="setAiocMonitor(this.dataset.sink)" style="padding:3px 10px;'
