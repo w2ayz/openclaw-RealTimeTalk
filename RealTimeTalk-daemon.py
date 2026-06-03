@@ -4101,8 +4101,10 @@ def _dtmf_listener() -> None:
         (941, 1209): '*', (941, 1336): '0', (941, 1477): '#', (941, 1633): 'D',
     }
     _FRAME = int(DTMF_SAMPLE_RATE * 0.04)   # 40 ms analysis window
-    _DEBOUNCE_FRAMES = 3                     # digit must hold for ~120 ms
+    _DEBOUNCE_FRAMES = 2                     # digit must hold for ~80 ms (FM radio tones are clean enough)
     _SEQ_TIMEOUT = 5.0                       # reset sequence after 5 s silence
+    _ENERGY_THRESHOLD = 5e3                  # minimum Goertzel energy (int16 scale: 5000)
+    _RATIO_THRESHOLD  = 1.5                  # dominant freq must be 1.5× next (FM radio is less clean)
 
     def _goertzel(samples, freq, rate):
         """Return signal power at freq using Goertzel algorithm."""
@@ -4125,14 +4127,14 @@ def _dtmf_listener() -> None:
         best_row = max(powers_row, key=powers_row.get)
         best_col = max(powers_col, key=powers_col.get)
         total = sum(powers_row.values()) + sum(powers_col.values())
-        if total < 1e6:   # energy threshold — ignore silence
+        if total < _ENERGY_THRESHOLD:   # ignore silence / very low signal
             return None
-        # Both best row and col must dominate (≥ 2× next best)
+        # Both best row and col must dominate (≥ _RATIO_THRESHOLD× next best)
         row_vals = sorted(powers_row.values(), reverse=True)
         col_vals = sorted(powers_col.values(), reverse=True)
-        if row_vals[1] > 0 and row_vals[0] / row_vals[1] < 2.0:
+        if row_vals[1] > 0 and row_vals[0] / row_vals[1] < _RATIO_THRESHOLD:
             return None
-        if col_vals[1] > 0 and col_vals[0] / col_vals[1] < 2.0:
+        if col_vals[1] > 0 and col_vals[0] / col_vals[1] < _RATIO_THRESHOLD:
             return None
         return _DIGIT_MAP.get((best_row, best_col))
 
@@ -4161,10 +4163,11 @@ def _dtmf_listener() -> None:
 
             def _cb(indata, frames, t, status):
                 nonlocal buf
-                buf = _np2.concatenate([buf, indata[:, 0]])
+                # Convert int16 → float for Goertzel (keeps int16-scale energy values ~1e6+)
+                buf = _np2.concatenate([buf, indata[:, 0].astype(_np2.float32)])
 
             with _sd2.InputStream(device=aioc_dev, channels=1,
-                                  samplerate=DTMF_SAMPLE_RATE, dtype='float32',
+                                  samplerate=DTMF_SAMPLE_RATE, dtype='int16',
                                   latency='low', callback=_cb):
                 while _find_aioc_source():
                     _td.sleep(0.01)
@@ -4189,7 +4192,7 @@ def _dtmf_listener() -> None:
                             if not seq or seq[-1] != digit:
                                 seq += digit
                                 last_digit_time = now
-                                log.debug("DTMF: %s → seq=%s", digit, seq)
+                                log.info("DTMF digit: %s → seq=%s", digit, seq)
 
                             # Check for wake/sleep sequences
                             if DTMF_WAKE_SEQ in seq:
