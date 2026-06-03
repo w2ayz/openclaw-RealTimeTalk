@@ -3390,10 +3390,12 @@ setInterval(upd, 2000);
                 # Headset mode: start looping test speech.
                 # When Radio profile is active, keys PTT before each playback iteration.
                 _headset_cal_loop[0] = True
-                _use_radio = _radio_profile_active[0]
-                _aioc_sink_name = _find_aioc_sink() if _use_radio else None
+                _use_radio  = _radio_profile_active[0]
+                _aioc_sink_name  = _find_aioc_sink() if _use_radio else None
+                _mon_sink_name   = _aioc_monitor_sink[0]   # monitor device if active
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
-                def _loop(alsa=alsa, radio=_use_radio, aioc_sink=_aioc_sink_name):
+                def _loop(alsa=alsa, radio=_use_radio,
+                          aioc_sink=_aioc_sink_name, mon_sink=_mon_sink_name):
                     import tempfile as _tf, os as _os, time as _tl
                     _pre = _tf.mktemp(suffix=".wav")
                     try:
@@ -3405,9 +3407,14 @@ setInterval(upd, 2000);
                         )
                         while _headset_cal_loop[0]:
                             if radio and aioc_sink:
+                                # Radio profile active → PTT + transmit over AIOC
                                 _ptt_key()
                                 _tl.sleep(AIOC_PTT_PREKEY_MS / 1000)
                                 proc = _sp.Popen(["paplay", f"--device={aioc_sink}", _pre],
+                                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            elif mon_sink:
+                                # Monitor device active → play to monitoring speaker
+                                proc = _sp.Popen(["paplay", f"--device={mon_sink}", _pre],
                                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             else:
                                 proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
@@ -3424,7 +3431,9 @@ setInterval(upd, 2000);
                         except FileNotFoundError: pass
                 import threading as _t2
                 _t2.Thread(target=_loop, daemon=True).start()
-                via = "radio (PTT)" if _use_radio else "speaker"
+                via = ("radio (PTT)" if _use_radio
+                       else f"monitor ({_mon_sink_name.split('.')[-1][:20]})" if _mon_sink_name
+                       else "speaker")
                 _html(self, 200, f"<p>Loop started via {via}.</p>")
 
             elif self.path == "/speaker-cal/loop-stop":
