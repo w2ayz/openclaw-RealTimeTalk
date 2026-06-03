@@ -1,5 +1,37 @@
 # Changelog
 
+## v2.4.0 — 2026-06-03
+
+### Added
+
+- **AIOC audio monitor loopback.** A 🔊 Monitor button is now in the Cal mode row (after Radio). Clicking it starts a PipeWire `module-loopback` tee from the AIOC source to a local speaker, so incoming radio audio is audible locally while simultaneously feeding OpenAI. A Monitor column in the Speakers table lets you pick which device to use — each non-AIOC speaker has an Off/On button. The active monitor device shows **Monitoring** in its State column instead of Running.
+
+- **Manual Adjustment tracks monitoring device volume.** The Vol/SW display on the calibration page now shows the active monitoring device's volume, so the +/- buttons adjust how loud you hear incoming radio audio. When Radio profile fires a transmission, Vol/SW temporarily switches to AIOC TX levels in red with a countdown (`TX Ns ↑`) for 10 seconds after PTT releases, then reverts to monitoring device levels.
+
+- **Play test loop routes to monitoring device.** When Radio profile is off and a monitor loopback is active, the Play test button plays through the monitoring speaker (not over the air). When Radio profile is on, it still keys PTT and transmits.
+
+- **Built-in HDMI audio set to 30% in calibration store.**
+
+### Fixed
+
+- **PTT fires even when Radio profile is off.** `speak()` keyed PTT whenever AIOC was physically connected, ignoring the Radio toggle. Added `_radio_profile_active[0]` guard so PTT and AIOC audio routing only activate when Radio mode is explicitly on.
+
+- **Device-change TTS announcement transmitted over radio.** The "Audio devices changed" announcement was spoken through the AIOC output with PTT keyed when Radio profile was active. Now skips TTS when `_radio_profile_active` is True — the dashboard banner still shows the message.
+
+- **All sinks reset to 1% on device change, only default restored.** The safety volume reset set all sinks to 1% but only restored the default sink's calibrated level. Non-default sinks (Bluetooth monitoring devices etc.) stayed at 1% until manually fixed. Now restores all connected sinks from the calibration store after the safety reset.
+
+- **Monitor loopback killed on daemon restart.** Startup cleanup unconditionally unloaded all `module-loopback` instances, including actively running monitor loopbacks. Changed to smart recovery: loopbacks whose source is still present are kept and their tracking state (`_aioc_monitor_module`, `_aioc_monitor_sink`) is restored; only loopbacks with a gone source are removed.
+
+- **Monitor loopback not stopped when AIOC disconnects.** Added AIOC disconnect handling in `_ptt_alive()` to also unload the loopback module when AIOC unplugs, so the target speaker reverts from Monitoring to its normal state.
+
+- **Monitor column hidden after AIOC disconnects.** `aiocAvail` was False when AIOC was unplugged, hiding the Monitor column and preventing the user from turning off an active loopback. Column now shows whenever a loopback is active (`monSink` set), regardless of AIOC connection.
+
+- **AIOC speaker missing from Speakers list.** AIOC sink was filtered from the table. It now appears as Running with no Use/Monitor buttons (can't self-monitor or switch to AIOC via Use).
+
+- **TX display window triggered without a real transmission.** `_ptt_release()` unconditionally set `_tx_display_until` even when called as a safety no-op (e.g. loop-stop with Radio off). Guard added: only starts the 10-second TX display window when `_is_tx` was True and Radio profile is active.
+
+---
+
 ## v2.3.0 — 2026-06-02
 
 ### Added
