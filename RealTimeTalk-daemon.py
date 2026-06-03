@@ -704,6 +704,9 @@ def _ptt_key() -> None:
 def _ptt_release() -> None:
     """Release PTT via AIOC serial DTR."""
     import time as _ptr
+    if _is_tx[0] and _radio_profile_active[0]:
+        # Only trigger the TX display window when we were actually transmitting
+        _tx_display_until[0] = _ptr.time() + 10
     s = _ptt_serial[0]
     if s:
         try:
@@ -711,7 +714,6 @@ def _ptt_release() -> None:
         except Exception as exc:
             log.warning("PTT release failed: %s", exc)
     _is_tx[0] = False
-    _tx_display_until[0] = _ptr.time() + 10   # show TX levels for 10s after release
 
 
 def run_speaker_calibration(alsa_output: str = None,
