@@ -380,6 +380,7 @@ _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected;
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
 _aioc_monitor_module: list = [None]  # PipeWire loopback module ID when AIOC monitor is active
 _aioc_monitor_sink:   list = [None]  # sink name currently used for AIOC monitor loopback
+_tx_display_until:    list = [0.0]   # epoch until which Manual Adjustment shows TX (AIOC) levels
 
 
 def _find_always_on_mic_source() -> str | None:
@@ -702,6 +703,7 @@ def _ptt_key() -> None:
 
 def _ptt_release() -> None:
     """Release PTT via AIOC serial DTR."""
+    import time as _ptr
     s = _ptt_serial[0]
     if s:
         try:
@@ -709,6 +711,7 @@ def _ptt_release() -> None:
         except Exception as exc:
             log.warning("PTT release failed: %s", exc)
     _is_tx[0] = False
+    _tx_display_until[0] = _ptr.time() + 10   # show TX levels for 10s after release
 
 
 def run_speaker_calibration(alsa_output: str = None,
@@ -2891,8 +2894,20 @@ function startMicCal(){{
 function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   const vv=document.getElementById('volval');
   const sv=document.getElementById('swval');
-  if(vv) vv.textContent=d.spk_vol;
-  if(sv) sv.textContent=d.sw_pct+'%';
+  const txMode=d.tx_mode||false;
+  const txSec=d.tx_remaining||0;
+  const txColor='#dc2626';
+  const txLabel=txMode?' <span style="font-size:.75em;font-weight:normal;color:'+txColor+'">TX'+(txSec>0?' '+txSec+'s':'')+' ↑</span>':'';
+  if(vv){{
+    vv.innerHTML=d.spk_vol+txLabel;
+    vv.style.color=txMode?txColor:'';
+  }}
+  if(sv){{
+    sv.textContent=d.sw_pct+'%';
+    sv.style.color=txMode?txColor:'';
+  }}
+  // Update row label to show what device is being adjusted
+  const spkLabel=document.querySelector('td[style*="color:#aaa"][style*="width:32px"]');
   // Keep top panel in sync
   const pv=document.getElementById('panelvol');
   const ps=document.getElementById('panelsw');
@@ -3435,8 +3450,17 @@ setInterval(upd, 2000);
                     max_vol = 500 if _ptt_alive() else 100
                     return max(1, min(max_vol, result))
 
-                sink = subprocess.run(["pactl","get-default-sink"],
-                                      capture_output=True,text=True).stdout.strip()
+                import time as _tadj
+                _in_tx = _tx_display_until[0] > _tadj.time() or _is_tx[0]
+                # Target: TX window → AIOC sink; monitor active → monitor sink; else → default
+                if _in_tx:
+                    sink = _find_aioc_sink() or subprocess.run(
+                        ["pactl","get-default-sink"], capture_output=True,text=True).stdout.strip()
+                elif _aioc_monitor_sink[0]:
+                    sink = _aioc_monitor_sink[0]
+                else:
+                    sink = subprocess.run(["pactl","get-default-sink"],
+                                          capture_output=True,text=True).stdout.strip()
                 if kind == "sw":
                     # Adjust software gain (_cal_sw_volume)
                     cur_sw  = int(_cal_sw_volume * 100)
@@ -3701,8 +3725,38 @@ setInterval(upd, 2000);
                 self.wfile.write(resp)
 
             elif self.path == "/speaker-cal/vol":
-                import json as _json
-                resp = _json.dumps(_get_device_status()).encode()
+                import json as _json, time as _tvol, re as _rvol
+                _status = _get_device_status()
+                _now = _tvol.time()
+                _in_tx_window = _tx_display_until[0] > _now
+                _tx_remaining = max(0, int(_tx_display_until[0] - _now)) if _in_tx_window else 0
+
+                if _in_tx_window or _is_tx[0]:
+                    # Show AIOC TX levels in red during and for 10s after transmission
+                    _aioc_snk = _find_aioc_sink()
+                    if _aioc_snk:
+                        _vo = subprocess.run(["pactl","get-sink-volume",_aioc_snk],
+                                             capture_output=True,text=True).stdout
+                        _vm = _rvol.search(r'(\d+)%', _vo)
+                        _status["spk_vol"] = (_vm.group(1)+'%') if _vm else _status["spk_vol"]
+                        _status["speaker_name"] = "All-In-One-Cable (TX)"
+                    _status["tx_mode"] = True
+                    _status["tx_remaining"] = _tx_remaining
+                elif _aioc_monitor_sink[0]:
+                    # Show monitor device levels so user can adjust monitoring volume
+                    _mon = _aioc_monitor_sink[0]
+                    _vo = subprocess.run(["pactl","get-sink-volume",_mon],
+                                         capture_output=True,text=True).stdout
+                    _vm = _rvol.search(r'(\d+)%', _vo)
+                    _status["spk_vol"] = (_vm.group(1)+'%') if _vm else _status["spk_vol"]
+                    _status["speaker_name"] = _status.get("speaker_name","") + " (monitor)"
+                    _status["tx_mode"] = False
+                    _status["tx_remaining"] = 0
+                else:
+                    _status["tx_mode"] = False
+                    _status["tx_remaining"] = 0
+
+                resp = _json.dumps(_status).encode()
                 self.send_response(200); self.send_header("Content-Type","application/json")
                 self.send_header("Content-Length", str(len(resp))); self.end_headers()
                 self.wfile.write(resp)
