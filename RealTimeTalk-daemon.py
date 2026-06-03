@@ -3793,7 +3793,9 @@ setInterval(upd, 2000);
                                 _sn = _sl.split()[1] if len(_sl.split()) > 1 else None
                                 if _sn:
                                     _apply_device_cal(_sn)
-                            speak(msg, sess.alsa_output, volume=_cal_sw_volume)
+                            # Don't announce over the air — skip TTS when Radio profile active
+                            if not _radio_profile_active[0]:
+                                speak(msg, sess.alsa_output, volume=_cal_sw_volume)
                         _t.Thread(target=_announce_change, daemon=True).start()
 
                 if _device_change_msg[0]:
