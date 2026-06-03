@@ -518,8 +518,15 @@ _AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-a
 _AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
 
 _AGC_PROFILE_RADIO = """\
-# RealTimeTalk AGC — Radio mode (AIOC). Same AGC settings as mic mode;
-# gain_control=true lets WebRTC normalise varying radio signal levels.
+# RealTimeTalk AGC — Radio mode (AIOC).
+# voice_detection=false: WebRTC VAD suppresses audio that doesn't match
+#   its close-mic speech model; radio audio (FM pre-emphasis, weak signals,
+#   pauses between words) gets falsely attenuated, causing choppy playback.
+# transient_suppression=false: designed to remove keyboard clicks; for radio
+#   it silences the squelch key-up click (useful signal onset cue) and clips
+#   sharp consonants (P/T/K) in transmitted speech.
+# extended_filter=false: long-tail AEC for speaker echo; no real echo exists
+#   in radio RX and it can spuriously cancel parts of the signal.
 context.modules = [
     {{   name = libpipewire-module-echo-cancel
         args = {{
@@ -529,8 +536,8 @@ context.modules = [
             capture.props = {{ target.object = "{aioc_src}" }}
             aec.args = {{
                 webrtc.gain_control = true webrtc.noise_suppression = true
-                webrtc.high_pass_filter = true webrtc.voice_detection = true
-                webrtc.extended_filter = true webrtc.transient_suppression = true
+                webrtc.high_pass_filter = true webrtc.voice_detection = false
+                webrtc.extended_filter = false webrtc.transient_suppression = false
             }}
         }}
     }}
@@ -600,8 +607,11 @@ def _apply_agc_profile(radio: bool) -> None:
                         "sink_name=rtt_agc_sink",
                         f"aec_args=webrtc.gain_control=1 "
                         "webrtc.noise_suppression=1 webrtc.high_pass_filter=1 "
-                        "webrtc.voice_detection=1 webrtc.extended_filter=1 "
-                        "webrtc.transient_suppression=1",
+                        + ("webrtc.voice_detection=0 webrtc.extended_filter=0 "
+                           "webrtc.transient_suppression=0"
+                           if radio else
+                           "webrtc.voice_detection=1 webrtc.extended_filter=1 "
+                           "webrtc.transient_suppression=1"),
                        ], capture_output=True)
         _ta.sleep(0.3)
         subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
