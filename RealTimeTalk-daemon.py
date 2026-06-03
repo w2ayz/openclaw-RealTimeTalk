@@ -368,6 +368,10 @@ _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded i
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
+# DTMF detection — sequences transmitted over radio to wake/sleep Five
+DTMF_WAKE_SEQ   = "123"   # transmit DTMF 1-2-3 to wake Five
+DTMF_SLEEP_SEQ  = "321"   # transmit DTMF 3-2-1 to put Five to sleep
+DTMF_SAMPLE_RATE = 8000   # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
@@ -4075,6 +4079,153 @@ setInterval(function(){{
 
 # ── openwakeword listener ─────────────────────────────────────────────────────
 
+def _dtmf_listener() -> None:
+    """Monitor the AIOC raw audio source for DTMF sequences.
+
+    Reads from the physical AIOC source (not the AGC virtual source) using
+    sounddevice at 8 kHz, runs Goertzel algorithm on each 40 ms frame to
+    identify DTMF digits, and triggers wake/sleep when the configured
+    sequences (123 = wake, 321 = sleep) are fully received.
+
+    Runs as a daemon thread for the lifetime of the process; restarts
+    automatically if the AIOC source disappears (device unplug).
+    """
+    import time as _td, sounddevice as _sd2, numpy as _np2
+    # Goertzel frequencies for DTMF rows and columns
+    _ROW_FREQS = [697, 770, 852, 941]
+    _COL_FREQS = [1209, 1336, 1477, 1633]
+    _DIGIT_MAP = {
+        (697, 1209): '1', (697, 1336): '2', (697, 1477): '3', (697, 1633): 'A',
+        (770, 1209): '4', (770, 1336): '5', (770, 1477): '6', (770, 1633): 'B',
+        (852, 1209): '7', (852, 1336): '8', (852, 1477): '9', (852, 1633): 'C',
+        (941, 1209): '*', (941, 1336): '0', (941, 1477): '#', (941, 1633): 'D',
+    }
+    _FRAME = int(DTMF_SAMPLE_RATE * 0.04)   # 40 ms analysis window
+    _DEBOUNCE_FRAMES = 3                     # digit must hold for ~120 ms
+    _SEQ_TIMEOUT = 5.0                       # reset sequence after 5 s silence
+
+    def _goertzel(samples, freq, rate):
+        """Return signal power at freq using Goertzel algorithm."""
+        n = len(samples)
+        k = int(0.5 + n * freq / rate)
+        w = 2 * _np2.pi * k / n
+        coeff = 2 * _np2.cos(w)
+        s_prev, s_prev2 = 0.0, 0.0
+        for s in samples:
+            s_new = s + coeff * s_prev - s_prev2
+            s_prev2 = s_prev
+            s_prev = s_new
+        return s_prev2**2 + s_prev**2 - coeff * s_prev * s_prev2
+
+    def _decode_frame(samples):
+        """Decode a DTMF digit from a frame, or return None if no tone."""
+        sr = DTMF_SAMPLE_RATE
+        powers_row = {f: _goertzel(samples, f, sr) for f in _ROW_FREQS}
+        powers_col = {f: _goertzel(samples, f, sr) for f in _COL_FREQS}
+        best_row = max(powers_row, key=powers_row.get)
+        best_col = max(powers_col, key=powers_col.get)
+        total = sum(powers_row.values()) + sum(powers_col.values())
+        if total < 1e6:   # energy threshold — ignore silence
+            return None
+        # Both best row and col must dominate (≥ 2× next best)
+        row_vals = sorted(powers_row.values(), reverse=True)
+        col_vals = sorted(powers_col.values(), reverse=True)
+        if row_vals[1] > 0 and row_vals[0] / row_vals[1] < 2.0:
+            return None
+        if col_vals[1] > 0 and col_vals[0] / col_vals[1] < 2.0:
+            return None
+        return _DIGIT_MAP.get((best_row, best_col))
+
+    while True:   # outer loop: reconnect on device loss
+        # AIOC audio is available via rtt_agc_source → PipeWire default source.
+        # DTMF tones (697–1633 Hz) survive all WebRTC filters in that path.
+        if not _find_aioc_source():
+            _td.sleep(3)
+            continue
+        # Find 'pulse' or 'default' device in sounddevice list
+        aioc_dev = next(
+            (i for i, d in enumerate(_sd2.query_devices())
+             if d['max_input_channels'] > 0
+             and d['name'].lower() in ('pulse', 'default')),
+            None)
+        if aioc_dev is None:
+            aioc_dev = None   # sounddevice will use system default
+        try:
+            log.info("DTMF listener ready via AGC source (wake=%s sleep=%s)",
+                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
+            buf = _np2.array([], dtype=_np2.float32)
+            seq = ""
+            last_digit = None
+            hold_count = 0
+            last_digit_time = 0.0
+
+            def _cb(indata, frames, t, status):
+                nonlocal buf
+                buf = _np2.concatenate([buf, indata[:, 0]])
+
+            with _sd2.InputStream(device=aioc_dev, channels=1,
+                                  samplerate=DTMF_SAMPLE_RATE, dtype='float32',
+                                  latency='low', callback=_cb):
+                while _find_aioc_source():
+                    _td.sleep(0.01)
+                    while len(buf) >= _FRAME:
+                        frame = buf[:_FRAME]
+                        buf = buf[_FRAME:]
+                        digit = _decode_frame(frame.tolist())
+                        now = _td.time()
+
+                        # Sequence timeout
+                        if now - last_digit_time > _SEQ_TIMEOUT:
+                            seq = ""
+
+                        if digit == last_digit:
+                            hold_count += 1
+                        else:
+                            hold_count = 0
+                            last_digit = digit
+
+                        if digit and hold_count == _DEBOUNCE_FRAMES:
+                            # New stable digit — append to sequence
+                            if not seq or seq[-1] != digit:
+                                seq += digit
+                                last_digit_time = now
+                                log.debug("DTMF: %s → seq=%s", digit, seq)
+
+                            # Check for wake/sleep sequences
+                            if DTMF_WAKE_SEQ in seq:
+                                seq = ""
+                                log.info("DTMF wake sequence '%s' received", DTMF_WAKE_SEQ)
+                                _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
+                                if _idle_disconnected[0] and _wake_event[0]:
+                                    _last_activity[0] = now
+                                    _wake_activate[0] = True
+                                    _persist_active[0] = True
+                                    _save_sleep_state(False)
+                                    _wake_event[0].set()
+                                elif _wake_event[0]:
+                                    # Session active but silent — go Active
+                                    _persist_active[0] = True
+                                    # Signal via a synthetic wake event is not needed;
+                                    # next transcript handler will see _persist_active
+                                    # Force active on next session via flag
+                                    _wake_activate[0] = True
+
+                            elif DTMF_SLEEP_SEQ in seq:
+                                seq = ""
+                                log.info("DTMF sleep sequence '%s' received", DTMF_SLEEP_SEQ)
+                                _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
+                                _persist_active[0] = False
+
+                            # Trim sequence to last N chars (longest possible match)
+                            max_seq = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
+                            if len(seq) > max_seq:
+                                seq = seq[-max_seq:]
+
+        except Exception as exc:
+            log.warning("DTMF listener error: %s — retrying in 5s", exc)
+            _td.sleep(5)
+
+
 def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     """Background thread: always-on local wake word detection via openwakeword.
 
@@ -4236,6 +4387,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         daemon=True,
         name="oww-wakeword",
     ).start()
+    _thr.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
 
     # Restore sleep state persisted across service restarts (e.g. mic device change)
     if _load_sleep_state():
