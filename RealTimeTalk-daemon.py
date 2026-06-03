@@ -4091,14 +4091,33 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                session_key: str = OPENCLAW_SESSION):
     global ALSA_OUTPUT
     ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
-    # Clean up any loopback modules left over from a previous run
+    # Recover or clean up loopback modules left from a previous run.
+    # Keep valid loopbacks (source still exists); kill only stale ones.
     try:
         _mods = subprocess.run(["pactl","list","short","modules"],
                                capture_output=True, text=True).stdout
+        _sources = subprocess.run(["pactl","list","short","sources"],
+                                  capture_output=True, text=True).stdout
+        _source_names = {l.split()[1] for l in _sources.splitlines() if len(l.split())>1}
+        import re as _re_lb
         for _ml in _mods.splitlines():
-            if "module-loopback" in _ml:
-                subprocess.run(["pactl","unload-module", _ml.split()[0]], capture_output=True)
-                log.info("Cleaned up stale loopback module %s", _ml.split()[0])
+            if "module-loopback" not in _ml:
+                continue
+            _mid = _ml.split()[0]
+            _src_m = _re_lb.search(r'source=(\S+)', _ml)
+            _snk_m = _re_lb.search(r'sink=(\S+)', _ml)
+            _src = _src_m.group(1) if _src_m else None
+            _snk = _snk_m.group(1) if _snk_m else None
+            if _src and _src in _source_names:
+                # Valid loopback — restore tracking state
+                _aioc_monitor_module[0] = int(_mid)
+                _aioc_monitor_sink[0]   = _snk
+                log.info("Restored monitor loopback module %s → %s",
+                         _mid, (_snk or '?').split('.')[-1][:30])
+            else:
+                # Source gone — stale module
+                subprocess.run(["pactl","unload-module", _mid], capture_output=True)
+                log.info("Cleaned up stale loopback module %s (source gone)", _mid)
     except Exception:
         pass
     _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
