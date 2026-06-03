@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.5.0 — 2026-06-03
+
+### Fixed
+
+- **Radio AGC audio quality — disabled voice_detection, transient_suppression and extended_filter.** Three WebRTC processing stages designed for close-talking microphones were harmful for radio audio:
+
+  - **`voice_detection` (VAD)** classifies each audio frame as voice or not-voice using a model trained on clean close-mic speech. Radio audio has FM pre-emphasis (boosted treble), a different spectral shape, and varying SNR — frames are falsely classified as non-voice and suppressed, causing choppy audio where words get cut off mid-sentence.
+
+  - **`transient_suppression`** is designed to remove brief loud clicks (keyboard, mouse clicks near a microphone). For radio it silences the squelch key-up click (a useful signal-onset cue) and clips sharp consonants (P, T, K sounds) in transmitted speech.
+
+  - **`extended_filter`** is a longer-tail AEC (acoustic echo cancellation) filter designed to cancel speaker echo. No real echo exists in radio RX audio; the filter runs expensive DSP on data it cannot usefully model and can spuriously cancel parts of the received signal if any incidental correlation with local playback is detected.
+
+  **Kept for radio mode:** `gain_control` (normalises varying signal levels), `noise_suppression` (reduces FM static/hiss — beneficial for OpenAI transcription), `high_pass_filter` (removes sub-300 Hz rumble; radio voice sits in the 300–3000 Hz band).
+
+  Mic mode (non-radio) keeps all flags enabled as before.
+
+---
+
 ## v2.4.0 — 2026-06-03
 
 ### Added
