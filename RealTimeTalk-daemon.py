@@ -1633,7 +1633,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
 
         # If AIOC PTT is available, route audio to the AIOC sink and key the radio.
         import time as _ptt_t
-        _aioc_sink = _find_aioc_sink() if _ptt_alive() else None
+        _aioc_sink = _find_aioc_sink() if (_ptt_alive() and _radio_profile_active[0]) else None
         _use_ptt   = bool(_aioc_sink)
 
         # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
