@@ -383,6 +383,7 @@ _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mi
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
 _dtmf_force_silent:   list = [False]  # set True by DTMF 321 to silence current session immediately
+_dtmf_force_active:   list = [False]  # set True by DTMF 123 to activate current silent session immediately
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
@@ -2148,7 +2149,14 @@ class RealtimeSession:
 
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
-            # Apply DTMF force-silent flag immediately (doesn't need transcript)
+            # Apply DTMF force flags immediately (don't wait for next transcript)
+            if _dtmf_force_active[0]:
+                _dtmf_force_active[0] = False
+                if not self._active:
+                    self._active = True
+                    _last_activity[0] = __import__("time").time()
+                    _log_entry("system", "Voice activated")
+                    log.info("DTMF force-active applied to session")
             if _dtmf_force_silent[0]:
                 _dtmf_force_silent[0] = False
                 self._active = False
@@ -2171,12 +2179,17 @@ class RealtimeSession:
             }))
 
     async def _handle_transcript(self, transcript: str):
-        # Check DTMF force-silent flag (set by DTMF 321 from radio)
+        # Apply DTMF force flags (belt-and-suspenders alongside _send_mic)
+        if _dtmf_force_active[0]:
+            _dtmf_force_active[0] = False
+            if not self._active:
+                self._active = True
+                _last_activity[0] = __import__("time").time()
+                _log_entry("system", "Voice activated")
         if _dtmf_force_silent[0]:
             _dtmf_force_silent[0] = False
             self._active = False
             _log_entry("system", "Voice silenced")
-            log.info("DTMF force-silent applied to session")
 
         # Default to Simplified Chinese (transcriber often returns Traditional)
         transcript = _to_simplified(transcript)
@@ -4261,6 +4274,7 @@ def _dtmf_listener() -> None:
                 _wake_event[0].set()
             elif _wake_event[0]:
                 _persist_active[0] = True; _wake_activate[0] = True
+                _dtmf_force_active[0] = True   # signal current silent session to go active immediately
         elif DTMF_SLEEP_SEQ in seq:
             seq = ""
             log.info("DTMF sleep '%s' received", DTMF_SLEEP_SEQ)
