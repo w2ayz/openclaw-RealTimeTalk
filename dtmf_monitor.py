@@ -536,8 +536,19 @@ def run_monitor():
     print(f"┌{HR}┐")
     print(_row(f"Radio DTMF Monitor   [ ESC / Q = quit ]"))
     print(f"├{HR}┤")
-    src_label = src.split(".")[-1].replace("-fallback","").replace("mono","").strip("-").strip() if src else src
-    print(_row(f"Source   : {src_label}"))
+    # Get human-readable description from PipeWire
+    try:
+        _out = subprocess.run(["pactl","list","sources"], capture_output=True, text=True).stdout
+        _desc = src
+        for _line in _out.split("\n"):
+            if f"Name: {src}" in _line:
+                _desc = src   # found the source, next Description line follows
+            elif _desc == src and "Description:" in _line:
+                _desc = _line.split("Description:")[-1].strip()
+                break
+    except Exception:
+        _desc = src
+    print(_row(f"Source   : {_desc}"))
     print(_row(f"Mode     : {mode}"))
     if profiles:
         print(_row(f"Profiles : {len(profiles)} digits trained"))
