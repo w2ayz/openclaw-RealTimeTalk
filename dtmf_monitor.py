@@ -250,21 +250,35 @@ def _accept_digit(digit):
 
 # ── Display thread ─────────────────────────────────────────────────────────
 def display_thread(profiles):
-    mode_str = ("\033[32m[LEARNED]\033[0m" if profiles
-                else "\033[33m[STANDARD multimon-ng]\033[0m")
+    import shutil
+    mode_lbl = "LEARNED" if profiles else "STD"
+
     while True:
         with lock:
-            cos=state['cos']; level=state['level']
-            digs=[d for t,d in state['digits'] if time.time()-t<10]
-            seq=state['seq']
-        bar_n=min(level*20//2000,20)
-        bar="█"*bar_n+"░"*(20-bar_n)
-        cos_s="\033[32mOPEN  \033[0m" if cos else "\033[31mCLOSED\033[0m"
-        dig_s=" ".join(digs[-8:]) if digs else "-"
-        seq_s=" ".join(seq) if seq else "_"
-        sys.stdout.write(
-            f"\r  COS:{cos_s}[{bar}]{level:6d} | "
-            f"DTMF:{dig_s:<16}| Seq:{seq_s:<6} {mode_str}   ")
+            cos   = state['cos']; level = state['level']
+            digs  = [d for t,d in state['digits'] if time.time()-t<10]
+            seq   = state['seq']
+
+        cols  = shutil.get_terminal_size((80, 24)).columns
+        bar_n = min(level*20//2000, 20)
+        bar   = "█"*bar_n + "░"*(20-bar_n)
+        dig_s = " ".join(digs[-8:]) if digs else "-"
+        seq_s = " ".join(seq)        if seq  else "_"
+
+        # Build plain line first so we know the exact visible width
+        cos_p = "OPEN  " if cos else "CLOSED"
+        plain = f"  COS:{cos_p}[{bar}]{level:6d} | DTMF:{dig_s:<14}| Seq:{seq_s:<4} [{mode_lbl}]"
+        if len(plain) > cols - 1:
+            plain = plain[:cols-1]
+
+        # Now inject ANSI colours at known positions in the plain string
+        cos_col = "\033[32m" if cos else "\033[31m"
+        mod_col = "\033[32m" if profiles else "\033[33m"
+        line = (plain
+                .replace(cos_p,    f"{cos_col}{cos_p}\033[0m", 1)
+                .replace(mode_lbl, f"{mod_col}{mode_lbl}\033[0m", 1))
+
+        sys.stdout.write(f"\r{line}\033[K")   # \033[K clears to end-of-line
         sys.stdout.flush()
         time.sleep(0.1)
 
