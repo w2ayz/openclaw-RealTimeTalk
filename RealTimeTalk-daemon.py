@@ -2670,55 +2670,64 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
-            elif self.path == "/dtmf-train":
-                import json as _jdt
+            elif self.path in ("/dtmf-monitor", "/dtmf-train", "/dtmf-retrain"):
                 profiles = _load_dtmf_profiles()
-                # Try to launch dtmf_monitor.py in a terminal if DISPLAY available
-                _script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "dtmf_monitor.py")
+                _script  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dtmf_monitor.py")
                 _python  = os.path.join(os.path.dirname(sys.executable), "python3")
+                _mode    = {"dtmf-monitor": "monitor", "dtmf-train": "train",
+                            "dtmf-retrain": "retrain"}[self.path.lstrip("/")]
+                _args    = {"monitor": "", "train": "--train", "retrain": "--retrain"}[_mode]
+                _titles  = {"monitor": "DTMF Monitor", "train": "DTMF Train", "retrain": "DTMF Retrain"}
+                _colors  = {"monitor": "#60a5fa", "train": "#f59e0b", "retrain": "#a78bfa"}
                 _launched = False
+                _disp = os.environ.get("DISPLAY", ":0")
                 if os.environ.get("DISPLAY") or os.path.exists("/tmp/.X11-unix/X0"):
                     try:
                         subprocess.Popen(
-                            ["xterm", "-title", "DTMF Training",
-                             "-e", f"{_python} {_script} --train; echo; read -p 'Press Enter to close'"],
-                            env={**os.environ, "DISPLAY": os.environ.get("DISPLAY",":0")})
+                            ["xterm", "-title", _titles[_mode], "-fg", "white", "-bg", "#07090f",
+                             "-e", f"{_python} {_script} {_args}; echo; read -p 'Press Enter to close'"],
+                            env={**os.environ, "DISPLAY": _disp})
                         _launched = True
-                    except Exception:
-                        pass
+                    except Exception: pass
                 _n = len(profiles)
-                _prof_html = ""
-                if profiles:
-                    _prof_html = "<table style='border-collapse:collapse;font-size:13px;margin:10px 0;'>"
-                    _prof_html += "<tr><th>Digit</th><th>Row Hz</th><th>Col Hz</th><th>Samples</th></tr>"
-                    for _d, _p in sorted(profiles.items()):
-                        _prof_html += (f"<tr><td style='padding:3px 10px;'><b>{_d}</b></td>"
-                                       f"<td style='padding:3px 10px;'>{_p['row_hz']:.1f}</td>"
-                                       f"<td style='padding:3px 10px;'>{_p['col_hz']:.1f}</td>"
-                                       f"<td style='padding:3px 10px;'>{_p['samples']}</td></tr>")
-                    _prof_html += "</table>"
+                _prof_rows = "".join(
+                    f"<tr><td style='padding:3px 10px;font-weight:bold'>{_d}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['row_hz']:.1f}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['col_hz']:.1f}</td>"
+                    f"<td style='padding:3px 10px;'>{_p['samples']}</td></tr>"
+                    for _d, _p in sorted(profiles.items())) if profiles else ""
+                _prof_html = (f"<table style='border-collapse:collapse;font-size:13px;margin:10px 0;'>"
+                              f"<tr><th>Digit</th><th>Row Hz</th><th>Col Hz</th><th>Samples</th></tr>"
+                              f"{_prof_rows}</table>") if _prof_rows else "<p style='color:#475569'>No profiles trained yet.</p>"
+                _cmd_map = {"monitor": f"python3 {_script}",
+                            "train":   f"python3 {_script} --train",
+                            "retrain": f"python3 {_script} --retrain"}
                 _body = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
-<title>DTMF Training — RealTimeTalk</title>
-<style>body{{font-family:monospace;background:#07090f;color:#dde4ef;padding:20px;}}
-h2{{color:#dc2626;}} a{{color:#38bdf8;}} table{{border:1px solid #1a2535;}}
-th{{background:#0d1119;padding:6px 12px;color:#64748b;}}
+<title>{_titles[_mode]} — RealTimeTalk</title>
+<style>body{{font-family:monospace;background:#07090f;color:#dde4ef;padding:20px;max-width:600px;}}
+h2{{color:{_colors[_mode]};}} a{{color:#38bdf8;text-decoration:none;}}
+table{{border:1px solid #1a2535;}} th{{background:#0d1119;padding:6px 12px;color:#64748b;}}
+.nav{{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;}}
+.nav a{{padding:5px 12px;border:1px solid #1a2535;border-radius:6px;font-size:13px;color:#64748b;}}
+.nav a.active{{color:{_colors[_mode]};border-color:{_colors[_mode]};}}
 .cmd{{background:#0d1119;border:1px solid #1a2535;padding:10px 14px;border-radius:6px;
-      font-size:14px;color:#34d399;margin:12px 0;}}</style></head><body>
-<h2>&#128225; DTMF Training</h2>
-<p>Profile file: <code>{DTMF_PROFILE_FILE}</code></p>
-<p><b>{_n} digit(s) trained</b> {'— loaded into daemon ✓' if _n else '— no profiles yet'}</p>
+      font-size:14px;color:#34d399;margin:10px 0;}}</style></head><body>
+<div class='nav'>
+  <a href='/calibration'>← Calibration</a>
+  <a href='/dtmf-monitor' {'class="active"' if _mode=='monitor' else ''}>&#128225; Monitor</a>
+  <a href='/dtmf-train'   {'class="active"' if _mode=='train'   else ''}>&#9881; Train</a>
+  <a href='/dtmf-retrain' {'class="active"' if _mode=='retrain' else ''}>&#8635; Retrain</a>
+</div>
+<h2>{_titles[_mode]}</h2>
+<p>Profiles: <b>{_n} digit(s) trained</b>  |  File: <code style='font-size:11px'>{DTMF_PROFILE_FILE}</code></p>
 {_prof_html}
-<hr style='border-color:#1a2535;margin:16px 0;'>
-{'<p style="color:#34d399;">✓ Training terminal launched (xterm)</p>' if _launched else ''}
-<p>Run training from terminal:</p>
-<div class='cmd'>python3 {_script} --train</div>
-<div class='cmd'>python3 {_script} --retrain &nbsp;&nbsp;# pick specific digits</div>
-<p style='color:#64748b;font-size:12px;'>
-Restart the daemon after training to reload profiles.<br>
-Wake={DTMF_WAKE_SEQ} &nbsp; Sleep={DTMF_SLEEP_SEQ} &nbsp;
-COS≥{DTMF_COS_THRESHOLD} &nbsp; Tail={DTMF_COS_TAIL_S}s</p>
-<p><a href='/dashboard'>← Dashboard</a></p>
+<hr style='border-color:#1a2535;margin:14px 0;'>
+{'<p style="color:#34d399;">&#10003; Terminal launched (xterm)</p>' if _launched else '<p style="color:#64748b;font-size:12px;">xterm not available — run from terminal:</p>'}
+<div class='cmd'>{_cmd_map[_mode]}</div>
+<p style='color:#475569;font-size:12px;margin-top:12px;'>
+Wake={DTMF_WAKE_SEQ} &nbsp;|&nbsp; Sleep={DTMF_SLEEP_SEQ} &nbsp;|&nbsp;
+COS≥{DTMF_COS_THRESHOLD} &nbsp;|&nbsp; Tail={DTMF_COS_TAIL_S}s &nbsp;|&nbsp;
+Restart daemon after training to reload profiles.</p>
 </body></html>"""
                 _enc = _body.encode()
                 self.send_response(200)
@@ -2869,6 +2878,9 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
+  <a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#60a5fa;background:#071a2e;" title="Launch DTMF signal monitor in terminal">&#128225; DTMF Mon</a>
+  <a href="/dtmf-train" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#f59e0b;background:#130e02;" title="Train DTMF frequency profiles for your radio">&#9881; DTMF Train</a>
+  <a href="/dtmf-retrain" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#a78bfa;background:#0e0820;" title="Retrain specific DTMF digits">&#8635; DTMF Retrain</a>
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -4082,7 +4094,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a>{'<a href="/dtmf-train" class="btn" style="color:#dc2626;border-color:#dc2626;" data-hint="Open DTMF training tool (Radio profile must be active)">&#128225; DTMF Train</a>' if _radio_profile_active[0] else ''}</div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
