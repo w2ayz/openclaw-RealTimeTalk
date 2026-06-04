@@ -406,35 +406,41 @@ def run_retrain():
 
     def draw_table(selected):
         os.system('clear')
-        print("\n╔══════════════════════════════════════════════════════════════╗")
-        print("║              DTMF PROFILE TABLE  — pick digits to retrain  ║")
-        print("╠══════╦══════════╦══════════╦═════════╦═══════════════════╣")
-        print("║ Digit║ Row Hz   ║ Col Hz   ║ Samples ║ Status            ║")
-        print("╠══════╬══════════╬══════════╬═════════╬═══════════════════╣")
+        SEP = "+-------+----------+----------+---------+------------------------+"
+        HDR = "| Digit |  Row Hz  |  Col Hz  | Samples | Status                 |"
+        print("\n  DTMF PROFILE TABLE — pick digits to retrain\n")
+        print(f"  {SEP}")
+        print(f"  {HDR}")
+        print(f"  {SEP}")
         for d in ALL_DIGITS:
-            sel_mark = "\033[93m►\033[0m" if d in selected else " "
+            mark = ">" if d in selected else " "
             if d in profiles:
                 p = profiles[d]
-                # Compare to nearest standard
                 std_r = min(STD_ROWS, key=lambda r: abs(r-p['row_hz']))
                 std_c = min(STD_COLS, key=lambda c: abs(c-p['col_hz']))
                 std_d = STD_MAP.get((std_r, std_c), '?')
                 drift = abs(p['row_hz']-std_r) + abs(p['col_hz']-std_c)
-                quality = "\033[32m✓ Good\033[0m" if drift < 15 else \
-                          "\033[33m~ Offset\033[0m" if drift < 50 else \
-                          "\033[31m✗ Drift\033[0m"
-                row = (f"║ {sel_mark}{d:<3} ║ {p['row_hz']:>7.1f}  ║"
-                       f" {p['col_hz']:>7.1f}  ║  {p['samples']:>5}  ║"
-                       f" {quality} (std={std_d})   ║")
+                if drift < 15:   qual_plain = "Good    "; qual_color = "\033[32mGood\033[0m    "
+                elif drift < 50: qual_plain = "Offset  "; qual_color = "\033[33mOffset\033[0m  "
+                else:            qual_plain = "Drift   "; qual_color = "\033[31mDrift\033[0m   "
+                status_plain = f"{qual_plain} (std={std_d})"
+                status_color = f"{qual_color} (std={std_d})"
+                # Build plain line first to get correct width, then reinsert color
+                line = (f"| {mark}{d:<2}  | {p['row_hz']:>7.1f}  |"
+                        f" {p['col_hz']:>7.1f}  |   {p['samples']:>4}  |"
+                        f" {status_plain:<22} |")
+                # Replace plain qual with colored version for display
+                line_display = line.replace(status_plain, status_color, 1)
+                if d in selected:
+                    line_display = "\033[93m" + line_display.replace(">","►",1) + "\033[0m"
             else:
-                row = (f"║ {sel_mark}{d:<3} ║ \033[90m(not trained)\033[0m"
-                       f"              ║         ║ \033[90m—\033[0m                 ║")
-            print(row)
-        print("╚══════╩══════════╩══════════╩═════════╩═══════════════════╝")
-        sel_str = " ".join(sorted(selected)) if selected else "(none)"
+                line_display = f"|  {d:<2}  | {'(not trained)':<8}  | {'':>7}  |   {'':>4}  | {'—':<22} |"
+            print(f"  {line_display}")
+        print(f"  {SEP}")
+        sel_str = " ".join(sorted(selected, key=lambda x: ALL_DIGITS.index(x) if x in ALL_DIGITS else 99)) \
+                  if selected else "(none)"
         print(f"\n  Selected: \033[93m{sel_str}\033[0m")
-        print("  Keys: type a digit/*/# to toggle  │  A=select all trained"
-              "  │  C=clear  │  Enter=start  │  Q=quit")
+        print("\n  Keys:  digit/*/# = toggle  |  A = all trained  |  C = clear  |  Enter = start  |  Q = quit")
 
     selected = set()
     fd  = sys.stdin.fileno()
