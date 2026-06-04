@@ -370,7 +370,8 @@ _wake_event:          list = [None]   # threading.Event; set by /wake to reconne
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 # DTMF detection — sequences transmitted over radio to wake/sleep Five
 DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake Five
-DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to sleep
+DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to silent
+DTMF_DEEPSLEEP_SEQ = "987"   # transmit DTMF 9-8-7 to disconnect immediately (skip 10-min wait)
 DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
 DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
 DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
@@ -383,7 +384,8 @@ _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mi
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
 _dtmf_force_silent:   list = [False]  # set True by DTMF 321 to silence current session immediately
-_dtmf_force_active:   list = [False]  # set True by DTMF 123 to activate current silent session immediately
+_dtmf_force_active:    list = [False]  # set True by DTMF 123 to activate current silent session immediately
+_dtmf_force_deepsleep: list = [False]  # set True by DTMF 987 to disconnect from OpenAI immediately
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
@@ -2157,6 +2159,13 @@ class RealtimeSession:
                     _last_activity[0] = __import__("time").time()
                     _log_entry("system", "Voice activated")
                     log.info("DTMF force-active applied to session")
+            if _dtmf_force_deepsleep[0]:
+                _dtmf_force_deepsleep[0] = False
+                _persist_active[0] = False
+                _idle_disconnected[0] = True
+                _save_sleep_state(True)
+                log.info("DTMF deep-sleep — closing session")
+                self.stop_event.set()   # terminates this session → main loop enters sleep wait
             if _dtmf_force_silent[0]:
                 _dtmf_force_silent[0] = False
                 self._active = False
@@ -4292,9 +4301,15 @@ def _dtmf_listener() -> None:
         elif DTMF_SLEEP_SEQ in seq:
             seq = ""
             log.info("DTMF sleep '%s' received", DTMF_SLEEP_SEQ)
-            _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
+            _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — Five silent")
             _persist_active[0] = False
-            _dtmf_force_silent[0] = True   # signal current session to go silent immediately
+            _dtmf_force_silent[0] = True
+        elif DTMF_DEEPSLEEP_SEQ in seq:
+            seq = ""
+            log.info("DTMF deep-sleep '%s' received", DTMF_DEEPSLEEP_SEQ)
+            _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — Five sleeping (disconnecting)")
+            _persist_active[0] = False
+            _dtmf_force_deepsleep[0] = True
         return seq
 
     _last_dig   = [None];  _last_dig_t = [0.0];  _state_time = [0.0]

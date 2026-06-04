@@ -21,6 +21,7 @@ parser.add_argument('--digits',        default='1234567890*#', help='Digits to t
 parser.add_argument('--samples',       type=int, default=5,   help='Samples per digit in training (default 5)')
 parser.add_argument('--wake',          default='123')
 parser.add_argument('--sleep',         default='321')
+parser.add_argument('--deepsleep',     default='987')
 parser.add_argument('--cos-threshold', type=int,   default=200,  help='Raw int16 COS threshold (default 200)')
 parser.add_argument('--cos-tail',      type=float, default=0.5,  help='COS hold-open seconds (default 0.5)')
 parser.add_argument('--profiles',      default=os.path.expanduser('~/.config/rtt/dtmf_profiles.json'))
@@ -28,6 +29,7 @@ args = parser.parse_args()
 
 WAKE_SEQ      = args.wake
 SLEEP_SEQ     = args.sleep
+DEEPSLEEP_SEQ = args.deepsleep
 COS_THRESHOLD = args.cos_threshold
 COS_TAIL_S    = args.cos_tail
 SEQ_TIMEOUT   = 8.0
@@ -235,13 +237,18 @@ def _accept_digit(digit):
         if not state['seq'] or state['seq'][-1] != digit:
             state['seq'] += digit
             state['digits'].append((now, digit))
-        ml = max(len(WAKE_SEQ), len(SLEEP_SEQ))
+        ml = max(len(WAKE_SEQ), len(SLEEP_SEQ), len(DEEPSLEEP_SEQ))
         if len(state['seq']) > ml: state['seq'] = state['seq'][-ml:]
         if WAKE_SEQ in state['seq']:
             state['seq'] = ""
             msg = f"[{time.strftime('%H:%M:%S')}] *** WAKE '{WAKE_SEQ}' detected!"
             state['actions'].append(msg)
             print(f"\n\033[32m{msg}\033[0m")
+        elif DEEPSLEEP_SEQ in state['seq']:
+            state['seq'] = ""
+            msg = f"[{time.strftime('%H:%M:%S')}] *** DEEP SLEEP '{DEEPSLEEP_SEQ}' detected!"
+            state['actions'].append(msg)
+            print(f"\n\033[31m{msg}\033[0m")
         elif SLEEP_SEQ in state['seq']:
             state['seq'] = ""
             msg = f"[{time.strftime('%H:%M:%S')}] *** SLEEP '{SLEEP_SEQ}' detected!"
@@ -506,15 +513,19 @@ def run_monitor():
     profiles = load_profiles()
     mode = "LEARNED PROFILES" if profiles else "STANDARD (multimon-ng fallback)"
 
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│  AIOC DTMF Monitor          Press  ESC  or  Q  to quit │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print(f"│  Source  : {src[:45]:<45} │")
-    print(f"│  Mode    : {mode[:45]:<45} │")
+    import shutil as _sh
+    W = min(_sh.get_terminal_size((80,24)).columns, 72) - 2  # inner width
+    def _row(text): return f"│ {text[:W-1]:<{W-1}} │"
+    HR = "─" * W
+    print(f"┌{HR}┐")
+    print(_row(f"AIOC DTMF Monitor   [ ESC / Q = quit ]"))
+    print(f"├{HR}┤")
+    print(_row(f"Source   : {src}"))
+    print(_row(f"Mode     : {mode}"))
     if profiles:
-        print(f"│  Profiles: {len(profiles)} digits trained{'':<35} │")
-    print(f"│  Wake={WAKE_SEQ}  Sleep={SLEEP_SEQ}  COS≥{COS_THRESHOLD}{'':<32} │")
-    print("└─────────────────────────────────────────────────────────┘")
+        print(_row(f"Profiles : {len(profiles)} digits trained"))
+    print(_row(f"Wake={WAKE_SEQ}  Sleep={SLEEP_SEQ}  DeepSleep={DEEPSLEEP_SEQ}  COS≥{COS_THRESHOLD}"))
+    print(f"└{HR}┘")
 
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()
     threading.Thread(target=dtmf_thread,        args=(profiles,), daemon=True).start()
