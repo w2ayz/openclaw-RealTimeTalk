@@ -445,27 +445,30 @@ def run_retrain():
     selected = set()
     fd  = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        draw_table(selected)
-        while True:
-            if _sel.select([sys.stdin], [], [], 0.05)[0]:
-                ch = sys.stdin.read(1)
-                if ch in ('\r', '\n'):
-                    break
-                if ch.upper() == 'Q':
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                    print("\n"); return
-                if ch.upper() == 'A':
-                    selected = set(d for d in ALL_DIGITS if d in profiles)
-                elif ch.upper() == 'C':
-                    selected = set()
-                elif ch.upper() in ALL_DIGITS or ch in ALL_DIGITS:
-                    d = ch.upper()
-                    selected ^= {d}   # toggle
-                draw_table(selected)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def read_key():
+        """Read one keypress in raw mode, restore terminal after."""
+        try:
+            tty.setraw(fd)
+            while True:
+                if _sel.select([sys.stdin], [], [], 0.1)[0]:
+                    return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    while True:
+        draw_table(selected)           # drawn in normal terminal mode → correct \r\n
+        ch = read_key()                # brief raw mode for single keypress only
+        if ch in ('\r', '\n'):
+            break
+        if ch.upper() == 'Q':
+            print("\n"); return
+        if ch.upper() == 'A':
+            selected = set(d for d in ALL_DIGITS if d in profiles)
+        elif ch.upper() == 'C':
+            selected = set()
+        elif ch.upper() in ALL_DIGITS or ch in ALL_DIGITS:
+            selected ^= {ch.upper()}
 
     print()
     if not selected:
