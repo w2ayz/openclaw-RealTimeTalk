@@ -270,6 +270,25 @@ def display_thread(profiles):
 # ══════════════════════════════════════════════════════════════════════════
 # TRAINING MODE
 # ══════════════════════════════════════════════════════════════════════════
+def _ask(prompt, default='y'):
+    """Single-keypress Y/N prompt. Returns True for yes."""
+    import tty, termios, select as _sel
+    sys.stdout.write(prompt); sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            if _sel.select([sys.stdin], [], [], 0.05)[0]:
+                ch = sys.stdin.read(1).lower()
+                if ch in ('y', '\r', '\n', ' '):
+                    sys.stdout.write("Y\n"); sys.stdout.flush(); return True
+                if ch in ('n',):
+                    sys.stdout.write("N\n"); sys.stdout.flush(); return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def run_training():
     src = find_aioc_source()
     if not src:
@@ -277,91 +296,103 @@ def run_training():
 
     profiles = load_profiles()
     digits   = list(args.digits)
-    needed   = args.samples
 
     print(f"\n╔══════════════════════════════════════════════╗")
     print(f"║          DTMF TRAINING MODE                 ║")
-    print(f"║  Digits to train : {args.digits:<26}║")
-    print(f"║  Samples needed  : {needed:<26}║")
-    print(f"║  Profile file    : {PROFILE_FILE[-26:]:<26}║")
+    print(f"║  Digits : {args.digits:<35}║")
+    print(f"║  Transmit each digit once — accept/reject   ║")
+    print(f"║  1 accepted sample minimum, more = better   ║")
     print(f"╚══════════════════════════════════════════════╝\n")
 
-    # Start raw audio capture
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()
     time.sleep(1)
 
     for digit in digits:
-        samples_row = []
-        samples_col = []
-        print(f"\n── Digit  \033[93m{digit}\033[0m  ─────────────────────────────────")
-        print(f"   Transmit DTMF {digit} at various durations ({needed} times)")
+        samples_row, samples_col = [], []
+        print(f"\n── Digit \033[93m{digit}\033[0m {'─'*38}")
         if digit in profiles:
             p = profiles[digit]
-            print(f"   (existing: row={p['row_hz']:.0f}Hz col={p['col_hz']:.0f}Hz "
-                  f"n={p['samples']})")
-        print()
+            print(f"   Existing: row={p['row_hz']:.0f}Hz  col={p['col_hz']:.0f}Hz  "
+                  f"(n={p['samples']})  — will update if you add more")
 
-        burst_active = False
-        burst_frames = []
-        last_cos = False
-        collected = 0
+        want_more = True
+        while want_more:
+            print(f"   Transmit DTMF \033[93m{digit}\033[0m once (any duration) …")
 
-        while collected < needed:
-            time.sleep(0.05)
-            cos  = state['cos']
-            lvl  = state['level']
+            # Wait for a complete COS burst
+            burst_active = False
+            burst_frames = []
+            last_cos = False
+            got_burst = False
 
-            # Print live level bar
-            bar_n = min(lvl*30//5000, 30)
-            cos_s = "\033[32m●\033[0m" if cos else "○"
-            sys.stdout.write(
-                f"\r  {cos_s} [{('█'*bar_n).ljust(30,'░')}] {lvl:6d}  "
-                f"collected {collected}/{needed}   ")
-            sys.stdout.flush()
+            while not got_burst:
+                time.sleep(0.04)
+                cos = state['cos']; lvl = state['level']
+                bar_n = min(lvl*30//5000, 30)
+                cos_s = "\033[32m●\033[0m" if cos else "○"
+                sys.stdout.write(
+                    f"\r   {cos_s} [{'█'*bar_n}{'░'*(30-bar_n)}] {lvl:6d}   ")
+                sys.stdout.flush()
 
-            if cos and not last_cos:
-                # COS rising edge — start collecting burst
-                burst_active = True
-                burst_frames = []
-            if burst_active and cos:
-                with raw_lock:
-                    burst_frames += [f for t,f in raw_buf if t > time.time()-0.05]
-            if not cos and last_cos and burst_active:
-                # COS falling edge — analyse burst
-                burst_active = False
-                if burst_frames:
-                    full = np.concatenate(burst_frames)
-                    # Use middle 60% to avoid key-up/down transients
-                    trim = len(full)//5
-                    mid  = full[trim:-trim] if len(full) > trim*3 else full
-                    if len(mid) > RATE//20:
-                        row_hz, col_hz = decode_frame_fft(mid)
-                        if row_hz and col_hz:
-                            samples_row.append(row_hz)
-                            samples_col.append(col_hz)
-                            collected += 1
-                            sys.stdout.write(
-                                f"\r  ✓ Sample {collected}: "
-                                f"row={row_hz:.0f}Hz  col={col_hz:.0f}Hz          \n")
-                            sys.stdout.flush()
-            last_cos = cos
+                if cos and not last_cos:
+                    burst_active = True; burst_frames = []
+                if burst_active and cos:
+                    with raw_lock:
+                        burst_frames += [f for t,f in raw_buf
+                                         if t > time.time()-0.05]
+                if not cos and last_cos and burst_active:
+                    burst_active = False; got_burst = True
+                last_cos = cos
 
-        # Average and store
+            sys.stdout.write("\r" + " "*55 + "\r"); sys.stdout.flush()
+
+            # Analyse burst
+            row_hz = col_hz = None
+            if burst_frames:
+                full = np.concatenate(burst_frames)
+                trim = max(len(full)//5, 1)
+                mid  = full[trim:-trim] if len(full) > trim*3 else full
+                if len(mid) > RATE//20:
+                    row_hz, col_hz = decode_frame_fft(mid)
+
+            if row_hz and col_hz:
+                std = STD_MAP.get(
+                    (min(STD_ROWS, key=lambda r: abs(r-row_hz)),
+                     min(STD_COLS, key=lambda c: abs(c-col_hz))), '?')
+                print(f"   Detected:  row=\033[96m{row_hz:.0f}\033[0mHz  "
+                      f"col=\033[96m{col_hz:.0f}\033[0mHz  "
+                      f"(std={std})  n={len(samples_row)+1}")
+                if _ask("   Accept? [Y/n]: "):
+                    samples_row.append(row_hz)
+                    samples_col.append(col_hz)
+                    print(f"   \033[32m✓ Accepted\033[0m  ({len(samples_row)} sample(s) so far)")
+                else:
+                    print(f"   \033[33m✗ Rejected — try again\033[0m")
+            else:
+                print(f"   \033[31m✗ Could not extract frequencies — try again\033[0m")
+
+            if samples_row:
+                want_more = _ask(f"   Transmit again for more confidence? [y/N]: " if len(samples_row)>=1 else "")
+                if not want_more and len(samples_row) == 0:
+                    want_more = True  # force at least one accepted sample
+            # else loop back automatically
+
+        # Save profile for this digit
         avg_row = float(np.median(samples_row))
         avg_col = float(np.median(samples_col))
         profiles[digit] = {
             'row_hz':  round(avg_row, 1),
             'col_hz':  round(avg_col, 1),
-            'samples': collected,
+            'samples': len(samples_row),
         }
         std = STD_MAP.get((min(STD_ROWS, key=lambda r: abs(r-avg_row)),
                            min(STD_COLS, key=lambda c: abs(c-avg_col))), '?')
-        print(f"\n  ✓ {digit}  row={avg_row:.1f}Hz  col={avg_col:.1f}Hz  "
-              f"(std DTMF={std})  n={collected}")
+        print(f"   \033[32m✓ Digit {digit} saved\033[0m  "
+              f"row={avg_row:.1f}Hz  col={avg_col:.1f}Hz  "
+              f"std={std}  n={len(samples_row)}")
 
     save_profiles(profiles)
-    print("\n\033[32mTraining complete!\033[0m")
-    print(f"Run without --train to use learned profiles.\n")
+    print("\n\033[32mTraining complete!\033[0m  Run without --train to use profiles.\n")
 
 # ══════════════════════════════════════════════════════════════════════════
 # NORMAL MONITOR MODE
