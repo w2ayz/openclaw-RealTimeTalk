@@ -1,3 +1,15 @@
+## v2.8.0 — 2026-06-05
+
+### Fixed
+
+- **dtmf_monitor Source field blank** — `src.split('.')[-1]` on `mono-fallback` stripped to empty. Now reads the PipeWire `Description:` field via `pactl list sources` using a proper `_in_block` flag so the correct source's description is found (not the first description in the output). Shows e.g. `All-In-One-Cable Mono` for the AIOC.
+
+- **dtmf_monitor sequence labels corrected** — header previously showed `Silent=789` (wrong — 789 is wake-to-silent) and `Deep=987`. Now shows `Silent=321  DeepSleep=987/789` matching actual behaviour.
+
+- **dtmf_monitor removes AIOC branding** — title changed from `AIOC DTMF Monitor` to `Radio DTMF Monitor` so it reads correctly for any radio interface, not just AIOC.
+
+---
+
 ## v2.7.0 — 2026-06-05
 
 ### Added
