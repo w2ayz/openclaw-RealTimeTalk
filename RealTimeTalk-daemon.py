@@ -372,8 +372,9 @@ _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listen
 DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake Five
 DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to silent
 DTMF_DEEPSLEEP_SEQ  = "987"   # transmit DTMF 9-8-7 to disconnect immediately (skip 10-min wait)
-DTMF_MONITOR_ON_SEQ = "456"   # transmit DTMF 4-5-6 to start monitoring (passive transcription only)
-DTMF_MONITOR_OFF_SEQ= "654"   # transmit DTMF 6-5-4 to stop monitoring
+DTMF_MONITOR_ON_SEQ  = "456"   # transmit DTMF 4-5-6 to start monitoring (passive transcription only)
+DTMF_MONITOR_OFF_SEQ = "654"   # transmit DTMF 6-5-4 to stop monitoring
+DTMF_WAKE_SILENT_SEQ = "789"   # transmit DTMF 7-8-9 to wake from deep sleep into Silent (no routing)
 DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
 DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
 DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
@@ -4304,8 +4305,8 @@ def _dtmf_listener() -> None:
         if not seq or seq[-1] != digit:
             seq += digit
             log.info("DTMF digit: %s → seq=%s", digit, seq)
-        max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ),
-                      len(DTMF_DEEPSLEEP_SEQ), len(DTMF_MONITOR_ON_SEQ), len(DTMF_MONITOR_OFF_SEQ))
+        max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ), len(DTMF_DEEPSLEEP_SEQ),
+                      len(DTMF_MONITOR_ON_SEQ), len(DTMF_MONITOR_OFF_SEQ), len(DTMF_WAKE_SILENT_SEQ))
         if len(seq) > max_len:
             seq = seq[-max_len:]
         if DTMF_WAKE_SEQ in seq:
@@ -4336,13 +4337,30 @@ def _dtmf_listener() -> None:
             log.info("DTMF monitor-on '%s' received", DTMF_MONITOR_ON_SEQ)
             _log_entry("system", f"DTMF {DTMF_MONITOR_ON_SEQ} — monitoring on")
             _persist_monitoring[0] = True
+            _persist_active[0] = False       # monitoring is passive, not active
             _dtmf_force_monitor[0] = True
+            if _idle_disconnected[0] and _wake_event[0]:
+                # Sleeping → wake into monitoring (no _wake_activate so session starts silent+monitoring)
+                _last_activity[0] = now
+                _save_sleep_state(False)
+                _wake_event[0].set()
         elif DTMF_MONITOR_OFF_SEQ in seq:
             seq = ""
             log.info("DTMF monitor-off '%s' received", DTMF_MONITOR_OFF_SEQ)
             _log_entry("system", f"DTMF {DTMF_MONITOR_OFF_SEQ} — monitoring off")
             _persist_monitoring[0] = False
             _dtmf_force_monitor[0] = False
+        elif DTMF_WAKE_SILENT_SEQ in seq:
+            seq = ""
+            log.info("DTMF wake-silent '%s' received", DTMF_WAKE_SILENT_SEQ)
+            _log_entry("system", f"DTMF {DTMF_WAKE_SILENT_SEQ} — waking to silent")
+            _persist_active[0] = False       # silent, not active
+            _persist_monitoring[0] = False   # not monitoring
+            if _idle_disconnected[0] and _wake_event[0]:
+                _last_activity[0] = now
+                _save_sleep_state(False)
+                _wake_event[0].set()
+            # If already awake (silent/monitoring), nothing extra needed
         return seq
 
     _last_dig   = [None];  _last_dig_t = [0.0];  _state_time = [0.0]

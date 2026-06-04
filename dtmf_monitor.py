@@ -24,6 +24,7 @@ parser.add_argument('--sleep',         default='321')
 parser.add_argument('--deepsleep',     default='987')
 parser.add_argument('--monitor-on',    default='456')
 parser.add_argument('--monitor-off',   default='654')
+parser.add_argument('--wake-silent',   default='789')
 parser.add_argument('--cos-threshold', type=int,   default=200,  help='Raw int16 COS threshold (default 200)')
 parser.add_argument('--cos-tail',      type=float, default=0.5,  help='COS hold-open seconds (default 0.5)')
 parser.add_argument('--profiles',      default=os.path.expanduser('~/.config/rtt/dtmf_profiles.json'))
@@ -32,8 +33,9 @@ args = parser.parse_args()
 WAKE_SEQ      = args.wake
 SLEEP_SEQ     = args.sleep
 DEEPSLEEP_SEQ   = args.deepsleep
-MONITOR_ON_SEQ  = args.monitor_on
-MONITOR_OFF_SEQ = args.monitor_off
+MONITOR_ON_SEQ   = args.monitor_on
+MONITOR_OFF_SEQ  = args.monitor_off
+WAKE_SILENT_SEQ  = args.wake_silent
 COS_THRESHOLD = args.cos_threshold
 COS_TAIL_S    = args.cos_tail
 SEQ_TIMEOUT   = 8.0
@@ -242,7 +244,7 @@ def _accept_digit(digit):
             state['seq'] += digit
             state['digits'].append((now, digit))
         ml = max(len(WAKE_SEQ), len(SLEEP_SEQ), len(DEEPSLEEP_SEQ),
-                 len(MONITOR_ON_SEQ), len(MONITOR_OFF_SEQ))
+                 len(MONITOR_ON_SEQ), len(MONITOR_OFF_SEQ), len(WAKE_SILENT_SEQ))
         if len(state['seq']) > ml: state['seq'] = state['seq'][-ml:]
         if WAKE_SEQ in state['seq']:
             state['seq'] = ""
@@ -264,6 +266,10 @@ def _accept_digit(digit):
             state['seq'] = ""
             msg = f"[{time.strftime('%H:%M:%S')}] *** MONITOR OFF '{MONITOR_OFF_SEQ}' detected!"
             state['actions'].append(msg); print(f"\n\033[36m{msg}\033[0m")
+        elif WAKE_SILENT_SEQ in state['seq']:
+            state['seq'] = ""
+            msg = f"[{time.strftime('%H:%M:%S')}] *** WAKE SILENT '{WAKE_SILENT_SEQ}' detected!"
+            state['actions'].append(msg); print(f"\n\033[94m{msg}\033[0m")
 
 # ── Display thread ─────────────────────────────────────────────────────────
 def display_thread(profiles):
@@ -534,7 +540,7 @@ def run_monitor():
     print(_row(f"Mode     : {mode}"))
     if profiles:
         print(_row(f"Profiles : {len(profiles)} digits trained"))
-    print(_row(f"Wake={WAKE_SEQ}  Sleep={SLEEP_SEQ}  Deep={DEEPSLEEP_SEQ}  Mon={MONITOR_ON_SEQ}/{MONITOR_OFF_SEQ}  COS≥{COS_THRESHOLD}"))
+    print(_row(f"Wake={WAKE_SEQ}  Silent={WAKE_SILENT_SEQ}  Sleep={SLEEP_SEQ}  Deep={DEEPSLEEP_SEQ}  Mon={MONITOR_ON_SEQ}/{MONITOR_OFF_SEQ}"))
     print(f"└{HR}┘")
 
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()
