@@ -534,13 +534,14 @@ def run_monitor():
     def _row(text): return f"│ {text[:W-1]:<{W-1}} │"
     HR = "─" * W
     print(f"┌{HR}┐")
-    print(_row(f"AIOC DTMF Monitor   [ ESC / Q = quit ]"))
+    print(_row(f"Radio DTMF Monitor   [ ESC / Q = quit ]"))
     print(f"├{HR}┤")
-    print(_row(f"Source   : {src}"))
+    src_label = src.split(".")[-1].replace("-fallback","").replace("mono","").strip("-").strip() if src else src
+    print(_row(f"Source   : {src_label}"))
     print(_row(f"Mode     : {mode}"))
     if profiles:
         print(_row(f"Profiles : {len(profiles)} digits trained"))
-    print(_row(f"Wake={WAKE_SEQ}  Silent={WAKE_SILENT_SEQ}  Sleep={SLEEP_SEQ}  Deep={DEEPSLEEP_SEQ}  Mon={MONITOR_ON_SEQ}/{MONITOR_OFF_SEQ}"))
+    print(_row(f"Wake={WAKE_SEQ}  Silent={SLEEP_SEQ}  DeepSleep={DEEPSLEEP_SEQ}/{WAKE_SILENT_SEQ}  Mon={MONITOR_ON_SEQ}/{MONITOR_OFF_SEQ}"))
     print(f"└{HR}┘")
 
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()
