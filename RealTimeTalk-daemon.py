@@ -4080,87 +4080,91 @@ setInterval(function(){{
 # ── openwakeword listener ─────────────────────────────────────────────────────
 
 def _dtmf_listener() -> None:
-    """Monitor AIOC audio for DTMF sequences using the 'dtmf' library.
+    """Monitor AIOC audio for DTMF sequences using multimon-ng.
 
-    Reads from the PipeWire default source (rtt_agc_source → AIOC audio)
-    at 8 kHz, feeds 1-second chunks to dtmf.detect() which uses a tuned
-    Goertzel implementation, and triggers wake/sleep when the configured
-    sequences are fully received (123 = wake, 321 = sleep).
+    Pipes PipeWire audio through:
+      pacat (48kHz raw) → sox (resample to 22050Hz) → multimon-ng -a DTMF
+
+    multimon-ng is the standard radio/SDR DTMF decoder — handles FM
+    demodulated audio at standard 40-100ms tone durations without
+    requiring long key presses.  Output lines are parsed for 'DTMF: X'.
+
+    Runs as a daemon thread; restarts the subprocess pipeline automatically
+    if AIOC disconnects or any process dies.
     """
-    import time as _td, sounddevice as _sd2, numpy as _np2
-    try:
-        import dtmf as _dtmf_lib
-    except ImportError:
-        log.warning("DTMF listener: 'dtmf' library not installed — pip install dtmf")
-        return
+    import time as _td, re as _re_dtmf
 
-    _CHUNK        = DTMF_SAMPLE_RATE       # 1 second of audio per detect() call
-    _DIGIT_COOLDOWN = 0.4                  # s: min gap before same digit accepted again
-    _SEQ_TIMEOUT  = 6.0                    # reset sequence after 6 s of no new digit
+    _SEQ_TIMEOUT    = 10.0   # reset incomplete sequence after 10 s silence
+    _DIGIT_COOLDOWN = 0.3    # ignore same digit repeated within 300 ms
 
-    while True:   # outer loop: reconnect on device loss
+    _DTMF_PAT = _re_dtmf.compile(r'^DTMF:\s*([0-9A-D*#])$')
+
+    while True:   # outer reconnect loop
         if not _find_aioc_source():
             _td.sleep(3)
             continue
-        # Use PipeWire pulse/default — sounddevice can't access AIOC directly
-        aioc_dev = next(
-            (i for i, d in enumerate(_sd2.query_devices())
-             if d['max_input_channels'] > 0
-             and d['name'].lower() in ('pulse', 'default')),
-            None)
+
         try:
-            log.info("DTMF listener ready via dtmf library (wake=%s sleep=%s)",
+            log.info("DTMF listener ready via multimon-ng (wake=%s sleep=%s)",
                      DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
+
+            # Pipeline: pacat → sox → multimon-ng
+            pacat = subprocess.Popen(
+                ["pacat", "--record", "--raw",
+                 "--format=s16le", "--rate=48000", "--channels=1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+            sox = subprocess.Popen(
+                ["sox", "-t", "raw", "-r", "48000",
+                 "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                 "-t", "raw", "-r", "22050", "-"],
+                stdin=pacat.stdout, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+
+            mmng = subprocess.Popen(
+                ["multimon-ng", "-a", "DTMF", "-t", "raw", "-"],
+                stdin=sox.stdout, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+
+            # Allow sox/pacat to receive SIGPIPE when mmng closes
+            pacat.stdout.close()
+            sox.stdout.close()
+
             seq = ""
             last_digit = None
             last_digit_time = 0.0
             last_seq_time  = 0.0
 
-            while _find_aioc_source():
-                # Record 1 second of audio then run dtmf.detect() on it
-                chunk = _sd2.rec(_CHUNK, samplerate=DTMF_SAMPLE_RATE,
-                                 channels=1, dtype='float32',
-                                 device=aioc_dev, blocking=True)
+            for raw_line in mmng.stdout:
                 now = _td.time()
-                samples = chunk[:, 0].tolist()
+                line = raw_line.decode(errors="ignore").strip()
+
+                m = _DTMF_PAT.match(line)
+                if not m:
+                    continue
+                digit = m.group(1)
 
                 # Sequence timeout
                 if seq and now - last_seq_time > _SEQ_TIMEOUT:
                     log.debug("DTMF seq timeout — reset (was: %s)", seq)
                     seq = ""
 
-                # Detect DTMF in this chunk
-                results = list(_dtmf_lib.detect(samples, DTMF_SAMPLE_RATE))
-                detected = [r.tone.symbol for r in results if r.tone]
-                if not detected:
-                    continue
-
-                # Find the most common digit in this chunk (majority vote)
-                from collections import Counter as _Ctr
-                digit = _Ctr(detected).most_common(1)[0][0]
-                count = _Ctr(detected).most_common(1)[0][1]
-                confidence = count / len(results)
-
-                # Require ≥30% of blocks to agree (filters noise/transients)
-                if confidence < 0.30:
-                    continue
-
-                same_recent = (digit == last_digit and
-                               now - last_digit_time < _DIGIT_COOLDOWN)
-                if same_recent:
+                # Debounce: ignore same digit within cooldown window
+                if digit == last_digit and now - last_digit_time < _DIGIT_COOLDOWN:
                     continue
 
                 last_digit = digit
                 last_digit_time = now
                 last_seq_time = now
+
                 if not seq or seq[-1] != digit:
                     seq += digit
-                    log.info("DTMF digit: %s (%.0f%% confident) → seq=%s",
-                             digit, confidence * 100, seq)
+                    log.info("DTMF digit: %s → seq=%s", digit, seq)
 
-                max_seq = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
-                if len(seq) > max_seq:
-                    seq = seq[-max_seq:]
+                # Trim to longest possible sequence
+                max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
+                if len(seq) > max_len:
+                    seq = seq[-max_len:]
 
                 if DTMF_WAKE_SEQ in seq:
                     seq = ""
@@ -4182,9 +4186,17 @@ def _dtmf_listener() -> None:
                     _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
                     _persist_active[0] = False
 
+                # Stop if AIOC gone
+                if not _find_aioc_source():
+                    break
+
         except Exception as exc:
             log.warning("DTMF listener error: %s — retrying in 5s", exc)
-            _td.sleep(5)
+        finally:
+            for p in (mmng, sox, pacat):
+                try: p.kill()
+                except Exception: pass
+        _td.sleep(5)
 
 
 def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
