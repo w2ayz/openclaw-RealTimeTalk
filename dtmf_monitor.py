@@ -536,16 +536,19 @@ def run_monitor():
     print(f"┌{HR}┐")
     print(_row(f"Radio DTMF Monitor   [ ESC / Q = quit ]"))
     print(f"├{HR}┤")
-    # Get human-readable description from PipeWire
+    # Get human-readable description from PipeWire for the physical source
     try:
         _out = subprocess.run(["pactl","list","sources"], capture_output=True, text=True).stdout
         _desc = src
+        _in_block = False
         for _line in _out.split("\n"):
             if f"Name: {src}" in _line:
-                _desc = src   # found the source, next Description line follows
-            elif _desc == src and "Description:" in _line:
+                _in_block = True
+            elif _in_block and "Description:" in _line:
                 _desc = _line.split("Description:")[-1].strip()
                 break
+            elif _in_block and _line.strip().startswith("Name:"):
+                break   # moved past the block without finding Description
     except Exception:
         _desc = src
     print(_row(f"Source   : {_desc}"))
