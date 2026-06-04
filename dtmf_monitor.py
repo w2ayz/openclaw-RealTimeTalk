@@ -16,8 +16,8 @@ parser.add_argument('--wake',  default='123')
 parser.add_argument('--sleep', default='321')
 parser.add_argument('--cos-threshold', type=int, default=200,
                     help='Raw int16 peak threshold for COS open (closed~120, sustained carrier~300-450, default 200)')
-parser.add_argument('--cos-tail', type=float, default=1.5,
-                    help='Seconds to hold COS open after signal drops (default 1.5)')
+parser.add_argument('--cos-tail', type=float, default=0.5,
+                    help='Seconds to hold COS open after signal drops (default 0.5)')
 args = parser.parse_args()
 
 WAKE_SEQ       = args.wake
