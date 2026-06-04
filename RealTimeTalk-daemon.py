@@ -3049,15 +3049,8 @@ function toggleAiocMonitor(){{
 }}
 function toggleRadio(){{
   fetch('/radio/profile').then(r=>r.json()).then(d=>{{
-    const rb=document.getElementById('radiobtn');
-    if(!rb) return;
-    if(d.profile==='radio'){{
-      rb.innerHTML='&#128225; Radio&nbsp;&#10003;';
-      rb.style.color='#dc2626';rb.style.borderColor='#dc2626';rb.style.background='#3b0000';
-    }} else {{
-      rb.innerHTML='&#128225; Radio';
-      rb.style.color='#475569';rb.style.borderColor='#334155';rb.style.background='';
-    }}
+    // Reload page so server re-renders DTMF buttons based on new profile state
+    location.reload();
   }});
 }}
 function adj(d){{fetch('/speaker-cal/adjust?delta='+d).then(()=>upd());}}
