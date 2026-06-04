@@ -369,9 +369,12 @@ _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI W
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 # DTMF detection — sequences transmitted over radio to wake/sleep Five
-DTMF_WAKE_SEQ   = "123"   # transmit DTMF 1-2-3 to wake Five
-DTMF_SLEEP_SEQ  = "321"   # transmit DTMF 3-2-1 to put Five to sleep
-DTMF_SAMPLE_RATE = 8000   # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
+DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake Five
+DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to sleep
+DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
+DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
+DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
+DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
@@ -2667,6 +2670,63 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
+            elif self.path == "/dtmf-train":
+                import json as _jdt
+                profiles = _load_dtmf_profiles()
+                # Try to launch dtmf_monitor.py in a terminal if DISPLAY available
+                _script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "dtmf_monitor.py")
+                _python  = os.path.join(os.path.dirname(sys.executable), "python3")
+                _launched = False
+                if os.environ.get("DISPLAY") or os.path.exists("/tmp/.X11-unix/X0"):
+                    try:
+                        subprocess.Popen(
+                            ["xterm", "-title", "DTMF Training",
+                             "-e", f"{_python} {_script} --train; echo; read -p 'Press Enter to close'"],
+                            env={**os.environ, "DISPLAY": os.environ.get("DISPLAY",":0")})
+                        _launched = True
+                    except Exception:
+                        pass
+                _n = len(profiles)
+                _prof_html = ""
+                if profiles:
+                    _prof_html = "<table style='border-collapse:collapse;font-size:13px;margin:10px 0;'>"
+                    _prof_html += "<tr><th>Digit</th><th>Row Hz</th><th>Col Hz</th><th>Samples</th></tr>"
+                    for _d, _p in sorted(profiles.items()):
+                        _prof_html += (f"<tr><td style='padding:3px 10px;'><b>{_d}</b></td>"
+                                       f"<td style='padding:3px 10px;'>{_p['row_hz']:.1f}</td>"
+                                       f"<td style='padding:3px 10px;'>{_p['col_hz']:.1f}</td>"
+                                       f"<td style='padding:3px 10px;'>{_p['samples']}</td></tr>")
+                    _prof_html += "</table>"
+                _body = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>DTMF Training — RealTimeTalk</title>
+<style>body{{font-family:monospace;background:#07090f;color:#dde4ef;padding:20px;}}
+h2{{color:#dc2626;}} a{{color:#38bdf8;}} table{{border:1px solid #1a2535;}}
+th{{background:#0d1119;padding:6px 12px;color:#64748b;}}
+.cmd{{background:#0d1119;border:1px solid #1a2535;padding:10px 14px;border-radius:6px;
+      font-size:14px;color:#34d399;margin:12px 0;}}</style></head><body>
+<h2>&#128225; DTMF Training</h2>
+<p>Profile file: <code>{DTMF_PROFILE_FILE}</code></p>
+<p><b>{_n} digit(s) trained</b> {'— loaded into daemon ✓' if _n else '— no profiles yet'}</p>
+{_prof_html}
+<hr style='border-color:#1a2535;margin:16px 0;'>
+{'<p style="color:#34d399;">✓ Training terminal launched (xterm)</p>' if _launched else ''}
+<p>Run training from terminal:</p>
+<div class='cmd'>python3 {_script} --train</div>
+<div class='cmd'>python3 {_script} --retrain &nbsp;&nbsp;# pick specific digits</div>
+<p style='color:#64748b;font-size:12px;'>
+Restart the daemon after training to reload profiles.<br>
+Wake={DTMF_WAKE_SEQ} &nbsp; Sleep={DTMF_SLEEP_SEQ} &nbsp;
+COS≥{DTMF_COS_THRESHOLD} &nbsp; Tail={DTMF_COS_TAIL_S}s</p>
+<p><a href='/dashboard'>← Dashboard</a></p>
+</body></html>"""
+                _enc = _body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(_enc)))
+                self.end_headers()
+                self.wfile.write(_enc)
+
             elif self.path in ("/calibrate", "/speaker-cal") and "/" not in self.path[1:]:
                 # Legacy top-level routes redirect to combined page (sub-routes like /speaker-cal/run pass through)
                 # Note: /calibrate and /speaker-cal exactly (no sub-path)
@@ -4022,7 +4082,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a>{'<a href="/dtmf-train" class="btn" style="color:#dc2626;border-color:#dc2626;" data-hint="Open DTMF training tool (Radio profile must be active)">&#128225; DTMF Train</a>' if _radio_profile_active[0] else ''}</div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -4079,127 +4139,198 @@ setInterval(function(){{
 
 # ── openwakeword listener ─────────────────────────────────────────────────────
 
+def _load_dtmf_profiles() -> dict:
+    """Load learned DTMF frequency profiles from disk."""
+    try:
+        with open(DTMF_PROFILE_FILE) as f:
+            import json as _j
+            p = _j.load(f)
+            log.info("DTMF: loaded %d learned profiles from %s", len(p), DTMF_PROFILE_FILE)
+            return p
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log.warning("DTMF: could not load profiles: %s", e)
+        return {}
+
+
+def _goertzel_energy(samples: list, freq: float, rate: int) -> float:
+    """Return Goertzel energy at freq in samples."""
+    import math
+    n = len(samples)
+    k = int(0.5 + n * freq / rate)
+    w = 2 * math.pi * k / n
+    c = 2 * math.cos(w)
+    q1 = q2 = 0.0
+    for s in samples:
+        q0 = s + c * q1 - q2; q2 = q1; q1 = q0
+    return q2 * q2 + q1 * q1 - c * q1 * q2
+
+
+def _decode_with_profiles(frame, profiles: dict):
+    """Decode DTMF digit from int16 frame using learned profiles. Returns digit or None."""
+    import numpy as _np_dtmf
+    samples = frame.astype(_np_dtmf.float64).tolist()
+    scores  = {d: (_goertzel_energy(samples, p['row_hz'], DTMF_SAMPLE_RATE) +
+                   _goertzel_energy(samples, p['col_hz'], DTMF_SAMPLE_RATE))
+               for d, p in profiles.items()}
+    if not scores:
+        return None
+    best   = max(scores, key=scores.get)
+    best_e = scores[best]
+    median = sorted(scores.values())[len(scores) // 2]
+    if best_e < 1e6 or (median > 0 and best_e / median < 3.0):
+        return None
+    return best
+
+
 def _dtmf_listener() -> None:
-    """Monitor AIOC audio for DTMF sequences using multimon-ng.
+    """Monitor AIOC audio for DTMF sequences.
 
-    Pipes PipeWire audio through:
-      pacat (48kHz raw) → sox (resample to 22050Hz) → multimon-ng -a DTMF
+    When learned profiles exist (~/.config/rtt/dtmf_profiles.json):
+      Uses custom Goertzel detector with radio-specific frequencies.
+      COS gated: only accepts digits when raw audio > DTMF_COS_THRESHOLD.
 
-    multimon-ng is the standard radio/SDR DTMF decoder — handles FM
-    demodulated audio at standard 40-100ms tone durations without
-    requiring long key presses.  Output lines are parsed for 'DTMF: X'.
+    When no profiles:
+      Falls back to pacat → sox → multimon-ng pipeline.
 
-    Runs as a daemon thread; restarts the subprocess pipeline automatically
-    if AIOC disconnects or any process dies.
+    Runs as a daemon thread; restarts automatically on AIOC disconnect.
     """
     import time as _td, re as _re_dtmf
+    import numpy as _np_dtmf
 
-    _SEQ_TIMEOUT    = 10.0   # reset incomplete sequence after 10 s silence
-    _DIGIT_COOLDOWN = 0.3    # ignore same digit repeated within 300 ms
+    _SEQ_TIMEOUT    = 10.0
+    _DIGIT_COOLDOWN = 0.3
+    _DTMF_PAT       = _re_dtmf.compile(r'^DTMF:\s*([0-9A-D*#])$')
+    _FRAME          = DTMF_SAMPLE_RATE  // 10    # 100ms analysis window
+    _CHUNK          = DTMF_SAMPLE_RATE * 2 * 50 // 1000  # 50ms s16le bytes
 
-    _DTMF_PAT = _re_dtmf.compile(r'^DTMF:\s*([0-9A-D*#])$')
-
-    while True:   # outer reconnect loop
-        if not _find_aioc_source():
-            _td.sleep(3)
-            continue
-
-        try:
-            log.info("DTMF listener ready via multimon-ng (wake=%s sleep=%s)",
-                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
-
-            # Use raw AIOC source (bypasses WebRTC which suppresses pure sine tones)
-            aioc_src = _find_aioc_source()
-            # Pipeline: pacat → sox → multimon-ng
-            pacat = subprocess.Popen(
-                ["pacat", "--record", "--raw",
-                 "--format=s16le", "--rate=48000", "--channels=1",
-                 "--latency-msec=100",   # flush to pipe every 100ms (without this pacat buffers indefinitely)
-                 f"--device={aioc_src}"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-
-            sox = subprocess.Popen(
-                ["sox", "-t", "raw", "-r", "48000",
-                 "-e", "signed-integer", "-b", "16", "-c", "1", "-",
-                 "-t", "raw", "-r", "22050", "-"],
-                stdin=pacat.stdout, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
-
-            mmng = subprocess.Popen(
-                ["multimon-ng", "-a", "DTMF", "-t", "raw", "-"],
-                stdin=sox.stdout, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
-
-            # Allow sox/pacat to receive SIGPIPE when mmng closes
-            pacat.stdout.close()
-            sox.stdout.close()
-
+    def _handle_digit(digit, now, seq_ref):
+        seq = seq_ref[0]
+        if seq and now - _state_time[0] > _SEQ_TIMEOUT:
             seq = ""
-            last_digit = None
-            last_digit_time = 0.0
-            last_seq_time  = 0.0
+        if digit == _last_dig[0] and now - _last_dig_t[0] < _DIGIT_COOLDOWN:
+            return seq
+        _last_dig[0] = digit; _last_dig_t[0] = now; _state_time[0] = now
+        if not seq or seq[-1] != digit:
+            seq += digit
+            log.info("DTMF digit: %s → seq=%s", digit, seq)
+        max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
+        if len(seq) > max_len:
+            seq = seq[-max_len:]
+        if DTMF_WAKE_SEQ in seq:
+            seq = ""
+            log.info("DTMF wake '%s' received", DTMF_WAKE_SEQ)
+            _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
+            if _idle_disconnected[0] and _wake_event[0]:
+                _last_activity[0] = now; _wake_activate[0] = True
+                _persist_active[0] = True; _save_sleep_state(False)
+                _wake_event[0].set()
+            elif _wake_event[0]:
+                _persist_active[0] = True; _wake_activate[0] = True
+        elif DTMF_SLEEP_SEQ in seq:
+            seq = ""
+            log.info("DTMF sleep '%s' received", DTMF_SLEEP_SEQ)
+            _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
+            _persist_active[0] = False
+        return seq
 
-            for raw_line in mmng.stdout:
-                now = _td.time()
-                line = raw_line.decode(errors="ignore").strip()
+    _last_dig   = [None];  _last_dig_t = [0.0];  _state_time = [0.0]
+    _cos_until  = [0.0]
 
-                m = _DTMF_PAT.match(line)
-                if not m:
-                    continue
-                digit = m.group(1)
+    while True:
+        aioc_src = _find_aioc_source()
+        if not aioc_src:
+            _td.sleep(3); continue
 
-                # Sequence timeout
-                if seq and now - last_seq_time > _SEQ_TIMEOUT:
-                    log.debug("DTMF seq timeout — reset (was: %s)", seq)
-                    seq = ""
+        profiles = _load_dtmf_profiles()
 
-                # Debounce: ignore same digit within cooldown window
-                if digit == last_digit and now - last_digit_time < _DIGIT_COOLDOWN:
-                    continue
+        if profiles:
+            # ── Goertzel path with learned profiles ──────────────────────
+            log.info("DTMF listener ready via learned profiles "
+                     "(wake=%s sleep=%s COS≥%d)",
+                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ, DTMF_COS_THRESHOLD)
+            try:
+                proc = subprocess.Popen(
+                    ["pacat", "--record", "--raw", "--format=s16le",
+                     "--rate=48000", "--channels=1", "--latency-msec=50",
+                     f"--device={aioc_src}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-                last_digit = digit
-                last_digit_time = now
-                last_seq_time = now
+                buf = b""; seq_ref = [""]
+                prev_dig = [None]; hold = [0]
 
-                if not seq or seq[-1] != digit:
-                    seq += digit
-                    log.info("DTMF digit: %s → seq=%s", digit, seq)
-
-                # Trim to longest possible sequence
-                max_len = max(len(DTMF_WAKE_SEQ), len(DTMF_SLEEP_SEQ))
-                if len(seq) > max_len:
-                    seq = seq[-max_len:]
-
-                if DTMF_WAKE_SEQ in seq:
-                    seq = ""
-                    log.info("DTMF wake sequence '%s' received", DTMF_WAKE_SEQ)
-                    _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
-                    if _idle_disconnected[0] and _wake_event[0]:
-                        _last_activity[0] = now
-                        _wake_activate[0] = True
-                        _persist_active[0] = True
-                        _save_sleep_state(False)
-                        _wake_event[0].set()
-                    elif _wake_event[0]:
-                        _persist_active[0] = True
-                        _wake_activate[0] = True
-
-                elif DTMF_SLEEP_SEQ in seq:
-                    seq = ""
-                    log.info("DTMF sleep sequence '%s' received", DTMF_SLEEP_SEQ)
-                    _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
-                    _persist_active[0] = False
-
-                # Stop if AIOC gone
-                if not _find_aioc_source():
-                    break
-
-        except Exception as exc:
-            log.warning("DTMF listener error: %s — retrying in 5s", exc)
-        finally:
-            for p in (mmng, sox, pacat):
-                try: p.kill()
+                while _find_aioc_source():
+                    chunk = proc.stdout.read(_CHUNK)
+                    if not chunk: break
+                    buf += chunk
+                    while len(buf) >= _CHUNK:
+                        raw = _np_dtmf.frombuffer(buf[:_CHUNK], dtype=_np_dtmf.int16)
+                        buf = buf[_CHUNK:]
+                        peak = int(_np_dtmf.max(_np_dtmf.abs(raw)))
+                        now  = _td.time()
+                        # COS detection
+                        if peak > DTMF_COS_THRESHOLD:
+                            _cos_until[0] = now + DTMF_COS_TAIL_S
+                        cos_open = now < _cos_until[0]
+                        if not cos_open:
+                            prev_dig[0] = None; hold[0] = 0; continue
+                        # Decode — need 100ms window; accumulate
+                        # (we use last _FRAME samples from buf for analysis)
+                        if len(raw) >= _FRAME:
+                            frame = raw[-_FRAME:]
+                            # Resample 48kHz → 8kHz (6:1 decimation)
+                            frame_8k = frame[::6].copy()
+                            digit = _decode_with_profiles(frame_8k, profiles)
+                            if digit == prev_dig[0]:
+                                hold[0] += 1
+                            else:
+                                prev_dig[0] = digit; hold[0] = 1
+                            if digit and hold[0] == 3:
+                                seq_ref[0] = _handle_digit(digit, now, seq_ref)
+            except Exception as exc:
+                log.warning("DTMF Goertzel error: %s", exc)
+            finally:
+                try: proc.kill()
                 except Exception: pass
+
+        else:
+            # ── multimon-ng fallback ──────────────────────────────────────
+            log.info("DTMF listener ready via multimon-ng "
+                     "(no profiles — run dtmf_monitor.py --train to improve) "
+                     "wake=%s sleep=%s", DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
+            try:
+                pacat = subprocess.Popen(
+                    ["pacat", "--record", "--raw", "--format=s16le",
+                     "--rate=48000", "--channels=1", "--latency-msec=100",
+                     f"--device={aioc_src}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                sox = subprocess.Popen(
+                    ["sox", "-t", "raw", "-r", "48000",
+                     "-e", "signed-integer", "-b", "16", "-c", "1", "-",
+                     "-t", "raw", "-r", "22050", "-"],
+                    stdin=pacat.stdout, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL)
+                mmng = subprocess.Popen(
+                    ["multimon-ng", "-a", "DTMF", "-t", "raw", "-"],
+                    stdin=sox.stdout, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL)
+                pacat.stdout.close(); sox.stdout.close()
+                seq_ref = [""]
+                for raw_line in mmng.stdout:
+                    now  = _td.time()
+                    line = raw_line.decode(errors="ignore").strip()
+                    m    = _DTMF_PAT.match(line)
+                    if not m: continue
+                    seq_ref[0] = _handle_digit(m.group(1), now, seq_ref)
+                    if not _find_aioc_source(): break
+            except Exception as exc:
+                log.warning("DTMF multimon-ng error: %s", exc)
+            finally:
+                for p in (mmng, sox, pacat):
+                    try: p.kill()
+                    except Exception: pass
+
         _td.sleep(5)
 
 
