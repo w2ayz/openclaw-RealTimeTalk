@@ -382,6 +382,7 @@ _wake_activate:       list = [False]  # set True when waking from sleep so new s
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
+_dtmf_force_silent:   list = [False]  # set True by DTMF 321 to silence current session immediately
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
 _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
@@ -2147,6 +2148,12 @@ class RealtimeSession:
 
     async def _send_mic(self, ws):
         while not self.stop_event.is_set():
+            # Apply DTMF force-silent flag immediately (doesn't need transcript)
+            if _dtmf_force_silent[0]:
+                _dtmf_force_silent[0] = False
+                self._active = False
+                _log_entry("system", "Voice silenced")
+                log.info("DTMF force-silent applied to session")
             try:
                 chunk = await asyncio.wait_for(self._mic_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -2164,6 +2171,13 @@ class RealtimeSession:
             }))
 
     async def _handle_transcript(self, transcript: str):
+        # Check DTMF force-silent flag (set by DTMF 321 from radio)
+        if _dtmf_force_silent[0]:
+            _dtmf_force_silent[0] = False
+            self._active = False
+            _log_entry("system", "Voice silenced")
+            log.info("DTMF force-silent applied to session")
+
         # Default to Simplified Chinese (transcriber often returns Traditional)
         transcript = _to_simplified(transcript)
 
@@ -4252,6 +4266,7 @@ def _dtmf_listener() -> None:
             log.info("DTMF sleep '%s' received", DTMF_SLEEP_SEQ)
             _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — sleeping Five")
             _persist_active[0] = False
+            _dtmf_force_silent[0] = True   # signal current session to go silent immediately
         return seq
 
     _last_dig   = [None];  _last_dig_t = [0.0];  _state_time = [0.0]
