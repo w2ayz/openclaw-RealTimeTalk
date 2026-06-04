@@ -1,3 +1,39 @@
+## v2.7.0 — 2026-06-05
+
+### Added
+
+- **Full DTMF state machine via radio.** All Five states are now reachable by transmitting DTMF sequences:
+
+  | Sequence | Action |
+  |---|---|
+  | **123** | Wake → **ACTIVE** (Five listens and responds) |
+  | **321** | → **SILENT** (connected, no routing to Five) |
+  | **789** | Wake from deep sleep → **SILENT** (like OWW, no routing) |
+  | **456** | → **MONITORING** (passive transcription only, no Five response) — works from any state including Deep Sleep |
+  | **654** | → **SILENT** (stop monitoring) |
+  | **987** | → **DEEP SLEEP** (disconnect from OpenAI immediately, skip 10-min wait) |
+
+- **DTMF 987 deep-sleep** skips the normal 10-minute idle wait and disconnects immediately. Clears monitoring state so the Monitor toggle shows Off after sleeping.
+
+- **DTMF 789 wake-to-silent** — wakes from deep sleep into Silent mode (session reconnects but Five does not respond). Equivalent to OWW "Hey Jarvis" wake but via radio.
+
+- **DTMF 456/654 monitoring toggle** — start/stop passive radio transcription via DTMF. 456 from Deep Sleep automatically wakes the session into monitoring mode.
+
+- **Copy button on DTMF pages** — each terminal command block on the Monitor/Train/Retrain calibration pages has a Copy button that copies the command to clipboard.
+
+- **DTMF buttons hidden until Radio profile active** — the three DTMF buttons (Mon/Train/Retrain) on the calibration page only appear when `📡 Radio ✓` is active.
+
+- **Calibration page reloads after Radio toggle** — so DTMF buttons appear/disappear immediately without manual refresh.
+
+### Fixed
+
+- **DTMF 321 sleep did not silence current session** — only set `_persist_active` (affects next session). Now sets `_dtmf_force_silent` flag checked in `_send_mic` every 500ms.
+- **DTMF 123 wake did not activate current silent session** — same pattern. Now sets `_dtmf_force_active` flag applied in `_send_mic`.
+- **DTMF 987 stopped entire daemon** — `stop_event.set()` terminated the daemon process. Fixed to close `self._ws` (WebSocket) instead so only the current session ends.
+- **dtmf_monitor display wraps/loops in narrow terminals** — build line as plain text first, truncate to terminal width, inject ANSI colours after. Add `\033[K` (erase to end of line) to clear ghost characters on resize.
+
+---
+
 # Changelog
 
 ## v2.6.0 — 2026-06-04
