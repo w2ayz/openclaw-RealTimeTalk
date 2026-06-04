@@ -2738,7 +2738,11 @@ table{{border:1px solid #1a2535;}} th{{background:#0d1119;padding:6px 12px;color
 .nav a{{padding:5px 12px;border:1px solid #1a2535;border-radius:6px;font-size:13px;color:#64748b;}}
 .nav a.active{{color:{_colors[_mode]};border-color:{_colors[_mode]};}}
 .cmd{{background:#0d1119;border:1px solid #1a2535;padding:10px 14px;border-radius:6px;
-      font-size:14px;color:#34d399;margin:10px 0;}}</style></head><body>
+      font-size:14px;color:#34d399;margin:10px 0;display:flex;align-items:center;gap:10px;}}
+.copybtn{{padding:3px 10px;font-size:12px;border:1px solid #1a2535;border-radius:5px;
+          background:#0d1119;color:#64748b;cursor:pointer;font-family:monospace;white-space:nowrap;}}
+.copybtn:hover{{border-color:#34d399;color:#34d399;}}
+.copybtn.copied{{color:#34d399;border-color:#34d399;}}</style></head><body>
 <div class='nav'>
   <a href='/calibration'>← Calibration</a>
   <a href='/dtmf-monitor' {'class="active"' if _mode=='monitor' else ''}>&#128225; Monitor</a>
@@ -2750,7 +2754,17 @@ table{{border:1px solid #1a2535;}} th{{background:#0d1119;padding:6px 12px;color
 {_prof_html}
 <hr style='border-color:#1a2535;margin:14px 0;'>
 {'<p style="color:#34d399;">&#10003; Terminal launched (xterm)</p>' if _launched else '<p style="color:#64748b;font-size:12px;">xterm not available — run from terminal:</p>'}
-<div class='cmd'>{_cmd_map[_mode]}</div>
+<div class='cmd'><span id='cmd'>{_cmd_map[_mode]}</span><button class='copybtn' onclick='copyCmd()'>Copy</button></div>
+<script>
+function copyCmd(){{
+  var t=document.getElementById('cmd').textContent;
+  navigator.clipboard.writeText(t).then(function(){{
+    var b=document.querySelector('.copybtn');
+    b.textContent='Copied!';b.classList.add('copied');
+    setTimeout(function(){{b.textContent='Copy';b.classList.remove('copied');}},1500);
+  }});
+}}
+</script>
 <p style='color:#475569;font-size:12px;margin-top:12px;'>
 Wake={DTMF_WAKE_SEQ} &nbsp;|&nbsp; Sleep={DTMF_SLEEP_SEQ} &nbsp;|&nbsp;
 COS≥{DTMF_COS_THRESHOLD} &nbsp;|&nbsp; Tail={DTMF_COS_TAIL_S}s &nbsp;|&nbsp;
