@@ -187,8 +187,18 @@ if __name__ == "__main__":
     threading.Thread(target=dtmf_thread,    daemon=True).start()
     threading.Thread(target=display_thread, daemon=True).start()
 
+    import tty, termios, select as _sel
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
     try:
+        tty.setraw(fd)
         while True:
-            time.sleep(1)
+            if _sel.select([sys.stdin], [], [], 0.1)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ('\x1b', 'q', 'Q'):   # ESC or q
+                    break
     except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
         print("\n\nStopped.")
