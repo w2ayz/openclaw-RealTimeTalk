@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """
 AIOC Real-Time DTMF Monitor
-COS detection via RTT /levels endpoint.
+COS detection via raw AIOC audio level (pacat direct, bypasses AGC).
 DTMF decoding via pacat|sox|multimon-ng.
 Usage: python3 dtmf_monitor.py [--wake 123] [--sleep 321]
+
+COS method: raw AIOC source level (squelch closed ~120, open ~12000+).
+Serial DCD and HID VCOS are non-functional in AIOC firmware v1.0.
 """
-import subprocess, threading, time, re, sys, argparse
-import urllib.request
+import subprocess, threading, time, re, sys, argparse, numpy as np
 
 # ── Config ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument('--wake',  default='123')
 parser.add_argument('--sleep', default='321')
-parser.add_argument('--cos-threshold', type=int, default=500,
-                    help='Audio level threshold for COS open (default 500)')
-parser.add_argument('--cos-tail', type=float, default=0.5,
-                    help='Seconds to hold COS open after signal drops (default 0.5)')
+parser.add_argument('--cos-threshold', type=int, default=200,
+                    help='Raw int16 peak threshold for COS open (closed~120, sustained carrier~300-450, default 200)')
+parser.add_argument('--cos-tail', type=float, default=1.5,
+                    help='Seconds to hold COS open after signal drops (default 1.5)')
 args = parser.parse_args()
 
 WAKE_SEQ       = args.wake
 SLEEP_SEQ      = args.sleep
-COS_THRESHOLD  = args.cos_threshold
+COS_THRESHOLD  = args.cos_threshold   # raw int16 peak; closed~120, open~12000+
 COS_TAIL_S     = args.cos_tail
 SEQ_TIMEOUT    = 8.0
 DIGIT_COOLDOWN = 0.4
-RTT_URL        = "http://localhost:19000"
 
 # ── Shared state ───────────────────────────────────────────────────────────
 state = {
@@ -47,25 +48,44 @@ def find_aioc_source():
     except: pass
     return None
 
-# ── COS thread: poll /levels ───────────────────────────────────────────────
+# ── COS thread: raw AIOC audio level via pacat ────────────────────────────
+# Reads directly from the raw AIOC source (bypasses WebRTC AGC).
+# Raw levels: squelch closed ~120 int16, squelch open ~12000+  → unambiguous.
+# Serial DCD and HID VCOS are non-functional in AIOC firmware v1.0.
 def cos_thread():
+    CHUNK_BYTES = 48000 * 2 * 50 // 1000   # 50ms of s16le at 48kHz = 4800 bytes
     while True:
+        src = find_aioc_source()
+        if not src:
+            time.sleep(2); continue
         try:
-            req = urllib.request.urlopen(f"{RTT_URL}/levels", timeout=3)
-            for line in req:
-                line = line.decode().strip()
-                if line.startswith("data:"):
-                    vals = line[5:].split(",")
-                    if len(vals) == 2:
-                        peak = int(vals[0])
-                        now = time.time()
-                        with lock:
-                            state['level'] = peak
-                            if peak > COS_THRESHOLD:
-                                cos_until[0] = now + COS_TAIL_S
-                            state['cos'] = now < cos_until[0]
+            proc = subprocess.Popen(
+                ["pacat","--record","--raw","--format=s16le",
+                 "--rate=48000","--channels=1","--latency-msec=50",
+                 f"--device={src}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            buf = b""
+            while True:
+                chunk = proc.stdout.read(CHUNK_BYTES)
+                if not chunk:
+                    break
+                buf += chunk
+                while len(buf) >= CHUNK_BYTES:
+                    frame = np.frombuffer(buf[:CHUNK_BYTES], dtype=np.int16)
+                    buf = buf[CHUNK_BYTES:]
+                    peak = int(np.max(np.abs(frame)))
+                    now = time.time()
+                    with lock:
+                        state['level'] = peak
+                        if peak > COS_THRESHOLD:
+                            cos_until[0] = now + COS_TAIL_S
+                        state['cos'] = now < cos_until[0]
         except Exception:
-            time.sleep(1)
+            pass
+        finally:
+            try: proc.kill()
+            except: pass
+        time.sleep(1)
 
 # ── DTMF thread: pacat|sox|multimon-ng ────────────────────────────────────
 def dtmf_thread():
