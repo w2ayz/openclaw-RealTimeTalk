@@ -2164,8 +2164,13 @@ class RealtimeSession:
                 _persist_active[0] = False
                 _idle_disconnected[0] = True
                 _save_sleep_state(True)
-                log.info("DTMF deep-sleep — closing session")
-                self.stop_event.set()   # terminates this session → main loop enters sleep wait
+                log.info("DTMF deep-sleep — closing WebSocket")
+                if self._ws:
+                    # Close WebSocket; session.run() will end and main loop enters sleep-wait
+                    asyncio.get_event_loop().call_soon_threadsafe(
+                        asyncio.ensure_future,
+                        self._ws.close()
+                    )
             if _dtmf_force_silent[0]:
                 _dtmf_force_silent[0] = False
                 self._active = False
