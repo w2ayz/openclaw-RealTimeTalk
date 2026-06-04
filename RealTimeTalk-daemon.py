@@ -4108,10 +4108,14 @@ def _dtmf_listener() -> None:
             log.info("DTMF listener ready via multimon-ng (wake=%s sleep=%s)",
                      DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
 
+            # Use raw AIOC source (bypasses WebRTC which suppresses pure sine tones)
+            aioc_src = _find_aioc_source()
             # Pipeline: pacat → sox → multimon-ng
             pacat = subprocess.Popen(
                 ["pacat", "--record", "--raw",
-                 "--format=s16le", "--rate=48000", "--channels=1"],
+                 "--format=s16le", "--rate=48000", "--channels=1",
+                 "--latency-msec=100",   # flush to pipe every 100ms (without this pacat buffers indefinitely)
+                 f"--device={aioc_src}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
             sox = subprocess.Popen(
