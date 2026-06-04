@@ -15,7 +15,8 @@ from collections import defaultdict
 
 # ── Config ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--train',         action='store_true', help='Enter training mode')
+parser.add_argument('--train',         action='store_true', help='Train all digits')
+parser.add_argument('--retrain',       action='store_true', help='Show trained profiles, pick digits to retrain')
 parser.add_argument('--digits',        default='1234567890*#', help='Digits to train (default all)')
 parser.add_argument('--samples',       type=int, default=5,   help='Samples per digit in training (default 5)')
 parser.add_argument('--wake',          default='123')
@@ -395,6 +396,83 @@ def run_training():
     print("\n\033[32mTraining complete!\033[0m  Run without --train to use profiles.\n")
 
 # ══════════════════════════════════════════════════════════════════════════
+# RETRAIN MODE — show profile table, pick digits to retrain
+# ══════════════════════════════════════════════════════════════════════════
+def run_retrain():
+    import tty, termios, select as _sel
+
+    ALL_DIGITS = list('1234567890*#ABCD')
+    profiles   = load_profiles()
+
+    def draw_table(selected):
+        os.system('clear')
+        print("\n╔══════════════════════════════════════════════════════════════╗")
+        print("║              DTMF PROFILE TABLE  — pick digits to retrain  ║")
+        print("╠══════╦══════════╦══════════╦═════════╦═══════════════════╣")
+        print("║ Digit║ Row Hz   ║ Col Hz   ║ Samples ║ Status            ║")
+        print("╠══════╬══════════╬══════════╬═════════╬═══════════════════╣")
+        for d in ALL_DIGITS:
+            sel_mark = "\033[93m►\033[0m" if d in selected else " "
+            if d in profiles:
+                p = profiles[d]
+                # Compare to nearest standard
+                std_r = min(STD_ROWS, key=lambda r: abs(r-p['row_hz']))
+                std_c = min(STD_COLS, key=lambda c: abs(c-p['col_hz']))
+                std_d = STD_MAP.get((std_r, std_c), '?')
+                drift = abs(p['row_hz']-std_r) + abs(p['col_hz']-std_c)
+                quality = "\033[32m✓ Good\033[0m" if drift < 15 else \
+                          "\033[33m~ Offset\033[0m" if drift < 50 else \
+                          "\033[31m✗ Drift\033[0m"
+                row = (f"║ {sel_mark}{d:<3} ║ {p['row_hz']:>7.1f}  ║"
+                       f" {p['col_hz']:>7.1f}  ║  {p['samples']:>5}  ║"
+                       f" {quality} (std={std_d})   ║")
+            else:
+                row = (f"║ {sel_mark}{d:<3} ║ \033[90m(not trained)\033[0m"
+                       f"              ║         ║ \033[90m—\033[0m                 ║")
+            print(row)
+        print("╚══════╩══════════╩══════════╩═════════╩═══════════════════╝")
+        sel_str = " ".join(sorted(selected)) if selected else "(none)"
+        print(f"\n  Selected: \033[93m{sel_str}\033[0m")
+        print("  Keys: type a digit/*/# to toggle  │  A=select all trained"
+              "  │  C=clear  │  Enter=start  │  Q=quit")
+
+    selected = set()
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        draw_table(selected)
+        while True:
+            if _sel.select([sys.stdin], [], [], 0.05)[0]:
+                ch = sys.stdin.read(1)
+                if ch in ('\r', '\n'):
+                    break
+                if ch.upper() == 'Q':
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    print("\n"); return
+                if ch.upper() == 'A':
+                    selected = set(d for d in ALL_DIGITS if d in profiles)
+                elif ch.upper() == 'C':
+                    selected = set()
+                elif ch.upper() in ALL_DIGITS or ch in ALL_DIGITS:
+                    d = ch.upper()
+                    selected ^= {d}   # toggle
+                draw_table(selected)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    print()
+    if not selected:
+        print("No digits selected — nothing to retrain.")
+        return
+
+    # Override --digits with selection and run training
+    args.digits = ''.join(sorted(selected, key=lambda d: ALL_DIGITS.index(d)
+                                 if d in ALL_DIGITS else 99))
+    run_training()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # NORMAL MONITOR MODE
 # ══════════════════════════════════════════════════════════════════════════
 def run_monitor():
@@ -436,7 +514,9 @@ def run_monitor():
 
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if args.train:
+    if args.retrain:
+        run_retrain()
+    elif args.train:
         run_training()
     else:
         run_monitor()
