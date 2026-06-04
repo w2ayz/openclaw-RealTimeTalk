@@ -506,13 +506,15 @@ def run_monitor():
     profiles = load_profiles()
     mode = "LEARNED PROFILES" if profiles else "STANDARD (multimon-ng fallback)"
 
-    print(f"AIOC DTMF Monitor")
-    print(f"Source  : {src}")
-    print(f"Mode    : {mode}")
+    print("┌─────────────────────────────────────────────────────────┐")
+    print("│  AIOC DTMF Monitor          Press  ESC  or  Q  to quit │")
+    print("├─────────────────────────────────────────────────────────┤")
+    print(f"│  Source  : {src[:45]:<45} │")
+    print(f"│  Mode    : {mode[:45]:<45} │")
     if profiles:
-        print(f"Profiles: {len(profiles)} digits trained")
-    print(f"Wake={WAKE_SEQ}  Sleep={SLEEP_SEQ}  COS≥{COS_THRESHOLD}")
-    print("─"*60)
+        print(f"│  Profiles: {len(profiles)} digits trained{'':<35} │")
+    print(f"│  Wake={WAKE_SEQ}  Sleep={SLEEP_SEQ}  COS≥{COS_THRESHOLD}{'':<32} │")
+    print("└─────────────────────────────────────────────────────────┘")
 
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()
     threading.Thread(target=dtmf_thread,        args=(profiles,), daemon=True).start()
