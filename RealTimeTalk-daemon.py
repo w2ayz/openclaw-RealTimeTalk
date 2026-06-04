@@ -2753,6 +2753,20 @@ Restart daemon after training to reload profiles.</p>
                     is_headset = _detect_headset()
                 _mode_label = ("Headset" if is_headset else "Speaker") + \
                               (" (auto)" if _override is None else " (manual)")
+                _dtmf_btns = (
+                    '<a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#60a5fa;background:#071a2e;" title="DTMF signal monitor">'
+                    '&#128225; DTMF Mon</a>'
+                    '<a href="/dtmf-train" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#f59e0b;background:#130e02;" title="Train DTMF profiles">'
+                    '&#9881; DTMF Train</a>'
+                    '<a href="/dtmf-retrain" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid #334155;border-radius:8px;'
+                    'color:#a78bfa;background:#0e0820;" title="Retrain specific digits">'
+                    '&#8635; DTMF Retrain</a>'
+                ) if _radio_profile_active[0] else ""
                 ds = _get_device_status()
                 gate = _mic_gate_ref[0]
                 prev = _speaker_cal_result
@@ -2878,9 +2892,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
-  <a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#60a5fa;background:#071a2e;" title="Launch DTMF signal monitor in terminal">&#128225; DTMF Mon</a>
-  <a href="/dtmf-train" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#f59e0b;background:#130e02;" title="Train DTMF frequency profiles for your radio">&#9881; DTMF Train</a>
-  <a href="/dtmf-retrain" style="padding:4px 11px;font-size:13px;text-decoration:none;border:1px solid #334155;border-radius:8px;color:#a78bfa;background:#0e0820;" title="Retrain specific DTMF digits">&#8635; DTMF Retrain</a>
+  {_dtmf_btns}
 </div>
 {spk_adj_section}
 <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
@@ -4472,10 +4484,23 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         pass
     _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
     if _ptt_serial[0] is not None:
-        # AIOC connected at startup — apply radio-mode gain immediately
-        globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO
-        _radio_profile_active[0] = True
-        log.info("AIOC present at startup — MIC_GAIN=%.0fx (radio mode)", AGC_MIC_GAIN_RADIO)
+        # Check conf file to determine actual profile (user may have switched to mic mode)
+        try:
+            import re as _re_agc
+            _agc_content = open(_AGC_CONF).read()
+            _is_radio_conf = ("gain_control = false" in _agc_content or
+                              "AIOC" in _agc_content or "All-In-One" in _agc_content)
+        except Exception:
+            _is_radio_conf = True  # default to radio if can't read conf
+        if _is_radio_conf:
+            globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO
+            _radio_profile_active[0] = True
+            log.info("AIOC present at startup — radio profile active, MIC_GAIN=%.0fx",
+                     AGC_MIC_GAIN_RADIO)
+        else:
+            _radio_profile_active[0] = False
+            log.info("AIOC present at startup — mic profile active (conf file), MIC_GAIN=%.0fx",
+                     AGC_MIC_GAIN)
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
