@@ -4202,8 +4202,10 @@ def _dtmf_listener() -> None:
     _SEQ_TIMEOUT    = 10.0
     _DIGIT_COOLDOWN = 0.3
     _DTMF_PAT       = _re_dtmf.compile(r'^DTMF:\s*([0-9A-D*#])$')
-    _FRAME          = DTMF_SAMPLE_RATE  // 10    # 100ms analysis window
-    _CHUNK          = DTMF_SAMPLE_RATE * 2 * 50 // 1000  # 50ms s16le bytes
+    _RATE48         = 48000
+    _FRAME_8K       = DTMF_SAMPLE_RATE // 10      # 100ms window at 8kHz = 800 samples
+    _FRAME_48K      = _RATE48 // 10               # 100ms window at 48kHz = 4800 samples
+    _CHUNK48        = _RATE48 * 2 * 50 // 1000    # 50ms chunk at 48kHz = 4800 bytes
 
     def _handle_digit(digit, now, seq_ref):
         seq = seq_ref[0]
@@ -4259,35 +4261,37 @@ def _dtmf_listener() -> None:
 
                 buf = b""; seq_ref = [""]
                 prev_dig = [None]; hold = [0]
+                acc = _np_dtmf.array([], dtype=_np_dtmf.int16)  # rolling 48kHz accumulator
 
                 while _find_aioc_source():
-                    chunk = proc.stdout.read(_CHUNK)
+                    chunk = proc.stdout.read(_CHUNK48)
                     if not chunk: break
-                    buf += chunk
-                    while len(buf) >= _CHUNK:
-                        raw = _np_dtmf.frombuffer(buf[:_CHUNK], dtype=_np_dtmf.int16)
-                        buf = buf[_CHUNK:]
-                        peak = int(_np_dtmf.max(_np_dtmf.abs(raw)))
-                        now  = _td.time()
-                        # COS detection
-                        if peak > DTMF_COS_THRESHOLD:
-                            _cos_until[0] = now + DTMF_COS_TAIL_S
-                        cos_open = now < _cos_until[0]
-                        if not cos_open:
-                            prev_dig[0] = None; hold[0] = 0; continue
-                        # Decode — need 100ms window; accumulate
-                        # (we use last _FRAME samples from buf for analysis)
-                        if len(raw) >= _FRAME:
-                            frame = raw[-_FRAME:]
-                            # Resample 48kHz → 8kHz (6:1 decimation)
-                            frame_8k = frame[::6].copy()
-                            digit = _decode_with_profiles(frame_8k, profiles)
-                            if digit == prev_dig[0]:
-                                hold[0] += 1
-                            else:
-                                prev_dig[0] = digit; hold[0] = 1
-                            if digit and hold[0] == 3:
-                                seq_ref[0] = _handle_digit(digit, now, seq_ref)
+                    raw   = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
+                    peak  = int(_np_dtmf.max(_np_dtmf.abs(raw)))
+                    now   = _td.time()
+                    # COS detection on raw 48kHz level
+                    if peak > DTMF_COS_THRESHOLD:
+                        _cos_until[0] = now + DTMF_COS_TAIL_S
+                    cos_open = now < _cos_until[0]
+                    if not cos_open:
+                        prev_dig[0] = None; hold[0] = 0
+                        acc = _np_dtmf.array([], dtype=_np_dtmf.int16)
+                        continue
+                    # Accumulate until we have a 100ms window at 48kHz
+                    acc = _np_dtmf.concatenate([acc, raw])
+                    if len(acc) < _FRAME_48K:
+                        continue
+                    # Keep last 100ms, decimate 6:1 → 8kHz for Goertzel
+                    frame_48k = acc[-_FRAME_48K:]
+                    acc       = frame_48k  # slide window
+                    frame_8k  = frame_48k[::6].copy()
+                    digit = _decode_with_profiles(frame_8k, profiles)
+                    if digit == prev_dig[0]:
+                        hold[0] += 1
+                    else:
+                        prev_dig[0] = digit; hold[0] = 1
+                    if digit and hold[0] == 3:
+                        seq_ref[0] = _handle_digit(digit, now, seq_ref)
             except Exception as exc:
                 log.warning("DTMF Goertzel error: %s", exc)
             finally:
