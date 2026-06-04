@@ -2178,6 +2178,8 @@ class RealtimeSession:
             if _dtmf_force_deepsleep[0]:
                 _dtmf_force_deepsleep[0] = False
                 _persist_active[0] = False
+                _persist_monitoring[0] = False
+                self._monitoring = False   # turn off monitoring on current session
                 _idle_disconnected[0] = True
                 _save_sleep_state(True)
                 log.info("DTMF deep-sleep — closing WebSocket")
@@ -4331,6 +4333,7 @@ def _dtmf_listener() -> None:
             log.info("DTMF deep-sleep '%s' received", DTMF_DEEPSLEEP_SEQ)
             _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — Five sleeping (disconnecting)")
             _persist_active[0] = False
+            _persist_monitoring[0] = False   # clear monitoring when going to deep sleep
             _dtmf_force_deepsleep[0] = True
         elif DTMF_MONITOR_ON_SEQ in seq:
             seq = ""
