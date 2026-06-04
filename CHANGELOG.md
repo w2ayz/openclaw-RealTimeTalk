@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.6.0 — 2026-06-04
+
+### Added
+
+- **DTMF wake/sleep via radio (DTMF 1-2-3 = wake, 3-2-1 = sleep).** Transmitting DTMF tones from another radio now wakes or sleeps Five without any voice command or button press.
+
+- **`dtmf_monitor.py` — standalone real-time DTMF monitor.** Terminal tool for testing and training DTMF detection independently of the daemon. Run `python3 dtmf_monitor.py` to monitor, `--train` to train, `--retrain` to pick specific digits to retrain.
+
+- **DTMF training mode with learned frequency profiles.** The radio's actual DTMF frequencies (which differ from ITU standard due to FM pre-emphasis and radio tolerances) are learned per-digit and stored in `~/.config/rtt/dtmf_profiles.json`. Training captures each tone burst, extracts row+col frequencies via FFT, prompts Accept/Reject per sample, and averages accepted samples. Minimum 1 sample per digit.
+
+- **`--retrain` picker.** Shows a table of all trained digits with row/col Hz, sample count, and quality vs standard. Keyboard-driven: type a digit to toggle selection, A=all trained, C=clear, Enter=start. Only retrains selected digits.
+
+- **VCOS constants for daemon.** `DTMF_COS_THRESHOLD=200` and `DTMF_COS_TAIL_S=0.5` control carrier detection — raw int16 peak from the AIOC source above 200 means squelch is open; hold-open for 500ms after signal drops.
+
+- **📡 DTMF Train button on dashboard.** Appears only when Radio profile is active. Links to `/dtmf-train` which shows loaded profiles, attempts to launch `dtmf_monitor.py --train` in an xterm, and provides CLI commands as fallback.
+
+### Fixed
+
+- **Goertzel DTMF detection never triggered** — `_CHUNK` was calculated using `DTMF_SAMPLE_RATE=8kHz` but pacat records at 48kHz. Each chunk was only 8ms, and after 6:1 decimation gave 66 samples — far below the 800-sample `_FRAME` required. Detection condition was never met. Fixed with a rolling 48kHz accumulator: accumulate until 100ms available, decimate 6:1 to 8kHz, feed Goertzel.
+
+- **multimon-ng pacat pipeline buffered indefinitely** — without `--latency-msec=100`, pacat buffers all audio in memory and never flushes to the pipe. Added flag so audio is flushed every 100ms enabling real-time detection.
+
+### Notes
+
+- AIOC serial DCD and HID VCOS are non-functional in firmware v1.0 (DCD code disabled with `#if 0`, HID sends no spontaneous reports). COS detection uses raw audio level from the AIOC source directly.
+- When no profiles are trained, the daemon falls back to multimon-ng for DTMF detection.
+- Train profiles with `python3 dtmf_monitor.py --train` then restart the daemon.
+
+---
+
 ## v2.5.0 — 2026-06-03
 
 ### Fixed
