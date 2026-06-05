@@ -2231,6 +2231,11 @@ class RealtimeSession:
         # slightly garbled or accented variant that _is_english_or_chinese rejects.
         normalized = transcript.strip().rstrip(".!?,").lower()
 
+        # Drop punctuation-only transcripts (e.g. ".", "...") — nothing left after strip
+        if not normalized:
+            log.debug("Dropped punctuation-only transcript: %r", transcript)
+            return
+
         # Wake phrase — always checked regardless of active state
         if _matches_phrase(normalized, WAKE_PHRASES):
             self._busy.set()
@@ -4333,6 +4338,7 @@ def _dtmf_listener() -> None:
             log.info("DTMF deep-sleep '%s' received", DTMF_DEEPSLEEP_SEQ)
             _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — Five sleeping (disconnecting)")
             _persist_active[0] = False
+            _wake_activate[0] = False        # discard any stale activation intent
             _persist_monitoring[0] = False   # clear monitoring when going to deep sleep
             _dtmf_force_deepsleep[0] = True
         elif DTMF_MONITOR_ON_SEQ in seq:
@@ -4358,6 +4364,7 @@ def _dtmf_listener() -> None:
             log.info("DTMF wake-silent '%s' received", DTMF_WAKE_SILENT_SEQ)
             _log_entry("system", f"DTMF {DTMF_WAKE_SILENT_SEQ} — waking to silent")
             _persist_active[0] = False       # silent, not active
+            _wake_activate[0] = False        # override any stale activation intent
             _persist_monitoring[0] = False   # not monitoring
             if _idle_disconnected[0] and _wake_event[0]:
                 _last_activity[0] = now

@@ -1,3 +1,13 @@
+## v2.9.0 — 2026-06-05
+
+### Fixed
+
+- **DTMF 789 woke to ACTIVE instead of SILENT** — when DTMF 123 activated a running session, `_wake_activate` was set but only consumed by the next session creation. If the session later went to deep sleep (via 987 or auto-sleep), `_wake_activate` remained `True` and caused the next wake (including 789) to start Active. Fixed by clearing `_wake_activate` in both the 987 (deep-sleep) and 789 (wake-silent) DTMF handlers.
+
+- **Punctuation-only transcripts routed to OpenClaw** — transcripts of `.` or `...` normalized to an empty string, which had length 0 and bypassed the single-word noise guard (which checks `len == 1`). Now explicitly dropped with a debug log entry immediately after normalization.
+
+---
+
 ## v2.8.0 — 2026-06-05
 
 ### Fixed
