@@ -994,6 +994,14 @@ MONITOR_OFF_PHRASES = {"five stop monitoring", "stop monitoring", "five monitor 
 CONTINUE_PHRASES    = {"continue", "five continue", "please continue", "go on", "go ahead",
                        "keep going", "继续", "继续说", "你继续", "请继续"}
 
+# Wake confirmation — affirmative responses accepted after Five asks "Yes?"
+_WAKE_CONFIRM_AFFIRM = {
+    "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
+    "go ahead", "wake up", "wake", "activate", "please", "do it",
+    "好", "是", "对", "好的", "可以", "醒来",
+}
+_WAKE_CONFIRM_TIMEOUT = 8.0   # seconds to wait for confirmation before treating as mis-fire
+
 def _is_english_or_chinese(text: str) -> bool:
     """Return True only if the transcript appears to be English or Chinese.
     Filters out Japanese (hiragana/katakana), Arabic, Cyrillic, Korean, etc.
@@ -2039,6 +2047,8 @@ class RealtimeSession:
         self._monitoring  = _persist_monitoring[0]     # restored from last session
         self._multilang   = _persist_multilang[0]  # restored from last session
         self._mic_stream_ref: list = [None]   # current sd.InputStream; swapped on hot-plug
+        self._pending_wake_confirm = False    # True while waiting for voice confirmation to activate
+        self._pending_wake_t       = 0.0     # timestamp when confirmation was requested
 
     def _mic_cb(self, indata, frames, time_info, status):
         import time as _tcb
@@ -2236,28 +2246,58 @@ class RealtimeSession:
             log.debug("Dropped punctuation-only transcript: %r", transcript)
             return
 
-        # Wake phrase — always checked regardless of active state
-        if _matches_phrase(normalized, WAKE_PHRASES):
-            self._busy.set()
-            try:
-                if self._monitoring:
-                    self._monitoring = False
-                    _persist_monitoring[0] = False
-                    log.info("Wake phrase detected — exiting monitoring, voice active")
-                if not self._active:
+        # Wake confirmation pending — check affirmative response before anything else
+        if self._pending_wake_confirm:
+            import time as _twc
+            elapsed = _twc.time() - self._pending_wake_t
+            self._pending_wake_confirm = False
+            if elapsed > _WAKE_CONFIRM_TIMEOUT:
+                log.info("Wake confirmation timed out (%.1fs) — mis-fire: %r", elapsed, transcript)
+                _log_entry("system", "Wake mis-fire (timeout) — staying silent")
+            elif normalized in _WAKE_CONFIRM_AFFIRM or _matches_phrase(normalized, WAKE_PHRASES):
+                log.info("Wake confirmed — voice active")
+                _log_entry("system", "Voice activated")
+                self._busy.set()
+                try:
+                    if self._monitoring:
+                        self._monitoring = False
+                        _persist_monitoring[0] = False
                     self._active = True
                     _persist_active[0] = True
                     import time as _tact; _last_activity[0] = _tact.time()
-                    log.info("Wake phrase detected — voice active")
-                    _log_entry("system", "Voice activated")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "I'm listening.", self.alsa_output
                     )
-                else:
+                finally:
+                    self._busy.clear()
+            else:
+                log.info("Wake mis-fire — not confirmed: %r", transcript)
+                _log_entry("system", f"Wake mis-fire — ignored ({transcript!r})")
+            return
+
+        # Wake phrase — always checked regardless of active state
+        if _matches_phrase(normalized, WAKE_PHRASES):
+            if self._active:
+                # Already active — acknowledge as before
+                self._busy.set()
+                try:
                     log.info("Wake phrase detected — already active")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "Yes, I'm here.", self.alsa_output
                     )
+                finally:
+                    self._busy.clear()
+                return
+            # Silent or monitoring — ask for confirmation before activating
+            import time as _twc2
+            self._pending_wake_confirm = True
+            self._pending_wake_t = _twc2.time()
+            log.info("Wake phrase detected — requesting confirmation")
+            self._busy.set()
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, "Yes?", self.alsa_output
+                )
             finally:
                 self._busy.clear()
             return

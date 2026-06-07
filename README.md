@@ -18,8 +18,10 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
 - Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
 - **Language filter** — by default only English and Chinese are shown/processed; other languages (noise hallucinations) silently dropped; toggleable Multi-lang mode
+- **Wake confirmation** — when a wake phrase is detected in Silent or Monitoring mode, Five asks "Yes?" before activating; a non-affirmative response or 8-second timeout is logged as a mis-fire and activation is suppressed
 - **Speaker calibration** — acoustic sweep from minimum volume; finds the quietest clearly-audible level; works through PipeWire (no direct-ALSA conflict)
 - **Headset detection** — auto-detects combined USB headset; switches to manual volume adjustment UI
+- **Audio device hot-plug** — detects plug/unplug events, resets to safe volume, restores calibrated levels, announces the change over TTS
 - Web dashboard on port **19000** — conversation log, wake/sleep/calibrate/monitor controls
 - **Monitoring Only mode** — listen and display transcribed speech without routing to Five (for diagnosing capture quality)
 - Boot-order safe — retries gateway connection until OpenClaw is up
@@ -154,11 +156,16 @@ The dashboard auto-refreshes every 3 s and shows:
 
 | Say | Effect |
 |-----|--------|
-| "Five wake up" | Activate |
-| "Real Time Talk on" | Activate |
+| "Five wake up" | Request activation — Five asks "Yes?" for confirmation |
+| "Hey Jarvis" | Request activation — Five asks "Yes?" for confirmation |
+| "Real Time Talk on" | Request activation — Five asks "Yes?" for confirmation |
+| "Yes" / "Yeah" / "OK" / "Sure" | Confirm activation — Five says "I'm listening." |
+| "Five wake up" *(second time)* | Also accepted as confirmation |
 | "Five go to sleep" | Silence |
 | "Real Time Talk off" | Silence |
 | "Calibrate mic" / "Calibrate microphone" | Run mic noise calibration |
+
+**Wake confirmation:** When Five is in Silent or Monitoring mode, a wake phrase triggers a confirmation prompt ("Yes?") rather than immediate activation. Five waits up to 8 seconds for an affirmative reply. If no clear "yes" is received the event is logged as a mis-fire and Five stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.
 
 ---
 
@@ -271,6 +278,36 @@ The speaker calibration finds the minimum comfortable volume by playing a 440 Hz
 - Works through PipeWire (not direct ALSA) — no "device busy" errors
 - Detects headsets automatically — switches to manual volume adjustment
 - After calibration, all TTS plays at the calibrated level via software attenuation
+
+### Audio device hot-plug
+
+The daemon watches connected audio devices via a PipeWire fingerprint polled every few seconds. When the set of devices changes it:
+
+1. **Resets all PipeWire sinks to 1%** immediately — prevents a newly-connected speaker from blasting at 100%
+2. **Restores calibrated levels** for every known sink from the calibration store (after a 0.5 s settle delay)
+3. **Announces "Audio devices changed."** via TTS — suppressed when Radio profile is active (won't transmit over the air)
+4. **Shows a banner** on the web dashboard for 5 seconds
+
+**Volume applied on device connect:**
+
+| Device state | PipeWire | SW gain |
+|---|---|---|
+| Known (previously calibrated) | saved value | saved value |
+| Unknown / first connect | 1% | 10% |
+| Fallback (error) | 25% | 0.70 |
+
+**AIOC (radio interface) plug/unplug:**
+
+- **Plugged in** — saves current mic source, switches AGC to the radio profile (no voice detection, no transient suppression), sets AIOC as PipeWire default sink, applies AIOC calibration
+- **Unplugged** — restores previous mic source, switches back to regular mic AGC profile, stops any active AIOC monitor loopback, clears PTT state; serial port number change (`ttyACM0` → `ttyACM1`) handled automatically
+
+**HDMI changes** are silently ignored — display-source connect/disconnect triggers HDMI audio appearance/disappearance but is not a real speaker change and produces no announcement.
+
+**Mic hot-plug:** If the mic stream goes silent for too long (USB mic unplugged or PortAudio cache stale), the daemon reinitialises PortAudio and reopens the stream on the newly enumerated device.
+
+**Default sink preference:**
+- Radio profile active → AIOC sink
+- No radio → first `Generic_USB2.0` non-HDMI, non-AIOC sink
 
 ### Language filter
 

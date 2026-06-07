@@ -1,3 +1,13 @@
+## v2.10.0 — 2026-06-08
+
+### Added
+
+- **Wake confirmation step** — when a wake phrase ("Five wake up", "Hey Jarvis", etc.) is detected in Silent or Monitoring mode, Five now asks **"Yes?"** instead of activating immediately. Activation only proceeds if an affirmative reply ("yes", "yeah", "ok", "sure", "wake up", "好", "是", etc.) or a repeated wake phrase arrives within 8 seconds. Any other response — or silence — is logged as a mis-fire and Five stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.
+
+- **README: Audio device hot-plug section** — documents the plug/unplug logic: safety volume reset, calibration restore, TTS announcement, AIOC profile switch, HDMI suppression, mic stream recovery, and default sink preference.
+
+---
+
 ## v2.9.0 — 2026-06-05
 
 ### Fixed
