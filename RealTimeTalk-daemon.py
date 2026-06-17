@@ -1000,7 +1000,7 @@ _WAKE_CONFIRM_AFFIRM = {
     "go ahead", "wake up", "wake", "activate", "please", "do it",
     "好", "是", "对", "好的", "可以", "醒来",
 }
-_WAKE_CONFIRM_TIMEOUT = 8.0   # seconds to wait for confirmation before treating as mis-fire
+_WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
 
 def _is_english_or_chinese(text: str) -> bool:
     """Return True only if the transcript appears to be English or Chinese.
