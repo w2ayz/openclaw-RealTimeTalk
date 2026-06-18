@@ -997,7 +997,7 @@ CONTINUE_PHRASES    = {"continue", "five continue", "please continue", "go on", 
 # Wake confirmation — affirmative responses accepted after Five asks "Yes?"
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
-    "go ahead", "wake up", "wake", "activate", "please", "do it",
+    "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
     "好", "是", "对", "好的", "可以", "醒来",
 }
 _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
