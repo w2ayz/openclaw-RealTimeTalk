@@ -1638,6 +1638,16 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
         wav_parts.append(silence_path)
     try:
+        # If text contains Chinese, send the whole unsplit text to ElevenLabs so mixed
+        # Chinese/English uses one consistent voice (multilingual v2 handles both natively).
+        if _is_chinese_text(clean):
+            full_path = tempfile.mktemp(suffix=".wav")
+            if _elevenlabs_tts(clean, full_path):
+                wav_parts.append(full_path)
+                segments = []   # skip per-segment loop below
+            else:
+                log.warning("ElevenLabs full-text TTS failed — falling back to per-segment")
+
         for seg_text, lang in segments:
             part_path = tempfile.mktemp(suffix=".wav")
             if lang == 'zh':
