@@ -78,6 +78,10 @@ OPENAI_TTS_VOICE_ZH   = "nova"
 OPENAI_TTS_SAMPLE_RATE = 24000     # OpenAI TTS outputs 24 kHz; resampled to PIPER_SAMPLE_RATE
 _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 
+_oww_confirm_pending: list = [False]  # OWW fired in silent mode; next transcript triggers "Yes?"
+_oww_confirm_t:       list = [0.0]    # epoch time OWW set the flag (guard against stale transcripts)
+_OWW_CONFIRM_WINDOW        = 3.0      # seconds after OWW fire to accept the wake-word transcript
+
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
@@ -2308,6 +2312,25 @@ class RealtimeSession:
         if not normalized:
             log.debug("Dropped punctuation-only transcript: %r", transcript)
             return
+
+        # OWW fired in silent mode — use the next incoming transcript as the trigger for "Yes?"
+        if _oww_confirm_pending[0] and not self._active and not self._pending_wake_confirm:
+            import time as _toww
+            if _toww.time() - _oww_confirm_t[0] <= _OWW_CONFIRM_WINDOW:
+                _oww_confirm_pending[0] = False
+                self._pending_wake_confirm = True
+                self._pending_wake_t = _toww.time()
+                log.info("OWW wake — requesting voice confirmation")
+                self._busy.set()
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "Yes?", self.alsa_output
+                    )
+                finally:
+                    self._busy.clear()
+                return
+            else:
+                _oww_confirm_pending[0] = False  # stale — clear
 
         # Wake confirmation pending — check affirmative response before anything else
         if self._pending_wake_confirm:
@@ -4658,6 +4681,11 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                             _wake_event[0].set()
                         else:
                             _last_activity[0] = now
+                            # Session running in silent/monitoring mode — prime confirmation
+                            if not _persist_active[0] and not _oww_confirm_pending[0]:
+                                _oww_confirm_pending[0] = True
+                                _oww_confirm_t[0] = now
+                                log.info("OWW: silent mode — priming wake confirmation")
     except Exception as exc:
         log.error("openwakeword listener crashed: %s", exc)
 
