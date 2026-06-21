@@ -73,6 +73,11 @@ PIPER_VOICE       = PIPER_VOICE_EN   # default; speak() will pick based on langu
 PIPER_SAMPLE_RATE = 22050
 ALSA_OUTPUT       = "plughw:3,0"   # USB speaker; plughw handles rate conversion
 
+OPENAI_TTS_MODEL      = "tts-1-hd"
+OPENAI_TTS_VOICE_ZH   = "nova"
+OPENAI_TTS_SAMPLE_RATE = 24000     # OpenAI TTS outputs 24 kHz; resampled to PIPER_SAMPLE_RATE
+_openai_tts_key: str  = ""         # populated lazily from load_openai_key()
+
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 OPENAI_WS_URL     = "wss://api.openai.com/v1/realtime?intent=transcription"
 SAMPLE_RATE       = 24000        # OpenAI Realtime API rate
@@ -1500,6 +1505,58 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
 
     return [(s, l) for s, l in segments if s]
 
+def _openai_tts(text: str, output_path: str) -> bool:
+    """Call OpenAI TTS API for Chinese text, resample to PIPER_SAMPLE_RATE, write WAV.
+    Returns True on success; caller should fall back to Piper on False."""
+    import urllib.request as _ureq, json as _json, wave as _wv, io as _io
+    global _openai_tts_key
+    if not _openai_tts_key:
+        try:
+            _openai_tts_key = load_openai_key()
+        except Exception as e:
+            log.error("OpenAI TTS: cannot load API key: %s", e)
+            return False
+    payload = _json.dumps({
+        "model": OPENAI_TTS_MODEL,
+        "input": text,
+        "voice": OPENAI_TTS_VOICE_ZH,
+        "response_format": "wav",
+    }).encode("utf-8")
+    req = _ureq.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=payload,
+        headers={"Authorization": f"Bearer {_openai_tts_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _ureq.urlopen(req, timeout=15) as resp:
+            wav_bytes = resp.read()
+    except Exception as e:
+        log.error("OpenAI TTS request failed: %s", e)
+        return False
+    try:
+        with _wv.open(_io.BytesIO(wav_bytes), 'rb') as wf:
+            src_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        data = np.frombuffer(frames, dtype=np.int16)
+        if src_rate != PIPER_SAMPLE_RATE:
+            n_out = int(len(data) * PIPER_SAMPLE_RATE / src_rate)
+            data = np.interp(
+                np.linspace(0, len(data) - 1, n_out),
+                np.arange(len(data)),
+                data.astype(np.float32),
+            ).astype(np.int16)
+        with _wv.open(output_path, 'wb') as out_wf:
+            out_wf.setnchannels(1)
+            out_wf.setsampwidth(2)
+            out_wf.setframerate(PIPER_SAMPLE_RATE)
+            out_wf.writeframes(data.tobytes())
+        return True
+    except Exception as e:
+        log.error("OpenAI TTS WAV processing failed: %s", e)
+        return False
+
+
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False, interruptible: bool = False):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
@@ -1530,10 +1587,15 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         wav_parts.append(silence_path)
     try:
         for seg_text, lang in segments:
-            voice = PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN
             part_path = tempfile.mktemp(suffix=".wav")
+            if lang == 'zh':
+                if _openai_tts(seg_text, part_path):
+                    wav_parts.append(part_path)
+                    continue
+                log.warning("OpenAI TTS failed for ZH segment — falling back to Piper")
             result = subprocess.run(
-                [PIPER_CMD, "--model", voice, "-f", part_path, "-q"],
+                [PIPER_CMD, "--model", PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN,
+                 "-f", part_path, "-q"],
                 input=seg_text.encode("utf-8"),
                 capture_output=True, env=PIPER_ENV,
             )
