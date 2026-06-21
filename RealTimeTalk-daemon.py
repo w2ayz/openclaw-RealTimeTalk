@@ -78,6 +78,11 @@ OPENAI_TTS_VOICE_ZH   = "nova"
 OPENAI_TTS_SAMPLE_RATE = 24000     # OpenAI TTS outputs 24 kHz; resampled to PIPER_SAMPLE_RATE
 _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 
+ELEVENLABS_VOICE_ID    = "21m00Tcm4TlvDq8ikWAM"   # Rachel — multilingual v2
+ELEVENLABS_MODEL       = "eleven_multilingual_v2"
+ELEVENLABS_SECRETS_FILE = os.path.expanduser("~/.openclaw/secrets/elevenlabs")
+_elevenlabs_key: str   = ""        # populated lazily from secrets file
+
 _oww_confirm_pending: list = [False]  # OWW fired in silent mode; next transcript triggers "Yes?"
 _oww_confirm_t:       list = [0.0]    # epoch time OWW set the flag (guard against stale transcripts)
 _OWW_CONFIRM_WINDOW        = 3.0      # seconds after OWW fire to accept the wake-word transcript
@@ -1562,6 +1567,48 @@ def _openai_tts(text: str, output_path: str) -> bool:
         return False
 
 
+def _elevenlabs_tts(text: str, output_path: str) -> bool:
+    """Call ElevenLabs TTS API for Chinese text, write WAV to output_path.
+    Uses pcm_22050 output — no resampling needed. Falls back to _openai_tts on failure."""
+    import urllib.request as _ureq, json as _json, wave as _wv
+    global _elevenlabs_key
+    if not _elevenlabs_key:
+        try:
+            with open(ELEVENLABS_SECRETS_FILE) as _f:
+                _elevenlabs_key = _f.read().strip()
+        except Exception as e:
+            log.error("ElevenLabs: cannot load API key from %s: %s", ELEVENLABS_SECRETS_FILE, e)
+            return False
+    payload = _json.dumps({
+        "text": text,
+        "model_id": ELEVENLABS_MODEL,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }).encode("utf-8")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=pcm_22050"
+    req = _ureq.Request(
+        url, data=payload,
+        headers={"xi-api-key": _elevenlabs_key, "Content-Type": "application/json", "Accept": "audio/pcm"},
+        method="POST",
+    )
+    try:
+        with _ureq.urlopen(req, timeout=15) as resp:
+            pcm_bytes = resp.read()
+    except Exception as e:
+        log.error("ElevenLabs TTS request failed: %s", e)
+        return False
+    try:
+        data = np.frombuffer(pcm_bytes, dtype=np.int16)
+        with _wv.open(output_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(PIPER_SAMPLE_RATE)
+            wf.writeframes(data.tobytes())
+        return True
+    except Exception as e:
+        log.error("ElevenLabs TTS WAV write failed: %s", e)
+        return False
+
+
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False, interruptible: bool = False):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
@@ -1594,6 +1641,10 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         for seg_text, lang in segments:
             part_path = tempfile.mktemp(suffix=".wav")
             if lang == 'zh':
+                if _elevenlabs_tts(seg_text, part_path):
+                    wav_parts.append(part_path)
+                    continue
+                log.warning("ElevenLabs TTS failed for ZH segment — falling back to OpenAI TTS")
                 if _openai_tts(seg_text, part_path):
                     wav_parts.append(part_path)
                     continue
