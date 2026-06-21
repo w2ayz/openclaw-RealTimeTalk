@@ -989,7 +989,8 @@ CALIBRATE_PHRASES = {
 
 WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on",
                  "five 醒来", "five 醒", "five 开始", "wake up five", "wake up 5",
-                 "hey jarvis", "hey jarvis wake up"}  # also caught by openwakeword in SLEEP state
+                 "hey jarvis", "hey jarvis wake up",
+                 "hej jarvis", "hay jarvis", "jarvis"}  # also caught by openwakeword in SLEEP state
 SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
                  "five 睡觉", "five 休息", "five 停", "sleep five"}
 MONITOR_ON_PHRASES  = {"five start monitoring", "start monitoring", "five monitor on",
