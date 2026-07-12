@@ -462,7 +462,7 @@ quiet USB mic, and a Piper TTS truncation bug.
   read from stdin to ~few words, then exits. The daemon's `speak()` was piping `text → piper.stdin`
   via `subprocess.PIPE`, which is why long replies played as one word. `speak()` now writes
   the text to a temp file and invokes `piper -i <file> -f <wav>`, producing the full WAV which
-  is then played via `aplay`. This was the root cause of Victor hearing only one word per reply.
+  is then played via `aplay`. This was the root cause of only one word per reply being heard.
 
 - **USB mic gain + noise gate.** PCM2902-based USB mics (the common "C-Media USB PnP Sound Device"
   adapter) output ~6× quieter than browsers receive, because browsers apply WebRTC AGC
