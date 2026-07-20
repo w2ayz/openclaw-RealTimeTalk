@@ -150,6 +150,8 @@ The dashboard auto-refreshes every 3 s and shows:
 | Multi-lang: ON/OFF | Toggle language filter (OFF = EN/ZH only, drop noise hallucinations) |
 | Calibrate mic | Measure ambient noise and set optimal noise gate |
 | Speaker cal | Acoustic sweep to find minimum comfortable speaker volume |
+| Owner Only / Everyone | Toggle owner-only mode — only the enrolled voice is obeyed |
+| Voice ID | Open the voice enrollment / test page |
 | Restart | Restart the daemon |
 
 ### Voice commands
@@ -166,6 +168,52 @@ The dashboard auto-refreshes every 3 s and shows:
 | "Calibrate mic" / "Calibrate microphone" | Run mic noise calibration |
 
 **Wake confirmation:** When Five is in Silent or Monitoring mode, a wake phrase triggers a confirmation prompt ("Yes?") rather than immediate activation. Five waits up to 8 seconds for an affirmative reply. If no clear "yes" is received the event is logged as a mis-fire and Five stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.
+
+---
+
+## Speaker verification (owner-only mode)
+
+When enabled, Five only acts on the enrolled owner's voice — every transcript's audio segment is embedded with a bilingual (EN/ZH) speaker-recognition model and compared against the enrolled profile by cosine similarity. Non-matching speech is silently ignored and logged to the dashboard with its similarity score.
+
+### Setup
+
+```bash
+# 1. Install sherpa-onnx into the daemon's venv
+~/.local/realtimetalk-venv/bin/pip install sherpa-onnx
+
+# 2. Download the 3D-Speaker CAM++ zh-en model (~28 MB)
+mkdir -p ~/.local/share/rtt/speaker
+wget -O ~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+# (the release tag really is spelled "recongition" upstream)
+
+# 3. Restart, then enroll at http://<pi-ip>:19000/voice-enroll
+```
+
+### Enrollment
+
+Open `/voice-enroll` and record the three 5-second samples (English, Chinese, free speech) **on the Pi's own mic** — this keeps the audio channel identical to runtime. Save, then use **Test my voice** to check your similarity score (expect ≥ ~0.6 for yourself, ≤ ~0.4 for others). Enable **Owner Only** from the dashboard or by saying "only listen to me".
+
+### Voice commands
+
+| Say | Effect |
+|-----|--------|
+| "Only listen to me" / "只听我的" | Enable owner-only mode (requires enrolled profile) |
+| "Listen to everyone" / "听大家的" | Disable owner-only mode |
+
+In owner-only mode **everything** — wake phrases, sleep, monitor toggles, and the mode toggles themselves — requires the owner's voice.
+
+### Tuning
+
+- Threshold defaults to **0.50** cosine similarity; adjust live with `/ownermode/threshold?value=0.55` or at startup with `--spk-threshold`. Every pass/reject is logged with its score (`journalctl --user -u openclaw-realtimetalk | grep "Voice check"`).
+- Segments shorter than ~0.8 s can't be verified and are ignored in owner-only mode — prefer "yes please" over a bare "yes" for wake confirmation.
+
+### Known limitations
+
+- The web dashboard buttons and radio DTMF sequences bypass verification by design (local-network fallback).
+- The "Hey Jarvis" deep-sleep wake word is not speaker-verified, but it only reconnects into Silent mode — actual activation still requires the owner's verified voice.
+- Verification resists other *people*, not a **recording** of the owner's voice (replay attack) — this is out of scope.
+- If the profile, model, or library is missing, the daemon accepts all speakers and the dashboard shows an amber warning.
 
 ---
 

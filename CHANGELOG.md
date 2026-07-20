@@ -1,3 +1,21 @@
+## v3.0.0 — 2026-07-19
+
+### Added
+
+- **Speaker verification (owner-only mode)** — Five can now recognize the owner's voice and obey only it. Each VAD speech segment is mirrored locally (500 ms pre-roll matching the server VAD's `prefix_padding_ms`), embedded with the bilingual 3D-Speaker CAM++ zh-en model via sherpa-onnx (192-dim, ~110 ms per utterance on Pi 5), and scored against the enrolled profile by max cosine similarity over the mean + per-sample embeddings. Non-owner speech is silently ignored and logged with its score.
+
+- **Voice enrollment page (`/voice-enroll`)** — records three 5-second samples (English / Chinese / free speech) on the Pi's mic, with live level meter, "Test my voice" scoring, and profile clear. Profile persists in `~/.openclaw/workspace/rtt_voice_profile.json`.
+
+- **Owner-mode controls** — dashboard `Owner Only / Everyone` toggle + `Voice ID` button; `/ownermode[/on|/off]` and `/ownermode/threshold?value=` endpoints; voice phrases "only listen to me" / "listen to everyone" (只听我的 / 听大家的); `--spk-threshold` CLI override. Mode + threshold persist in `rtt_voice_mode.json`.
+
+- **Strict gating** — in owner-only mode *everything* (wake/sleep/monitor/control phrases included) requires the owner's voice; the gate runs before all control-phrase handling. Web buttons and DTMF bypass by design; segments too short to verify (< 0.8 s) are rejected fail-safe. Missing lib/model/profile degrades to accept-all with an amber dashboard banner.
+
+### Why v3.0.0
+
+Behavioral major: with owner-only mode enabled, voice input that previously worked (any speaker) is intentionally rejected.
+
+---
+
 ## v2.11.0 — 2026-07-19
 
 ### Added
