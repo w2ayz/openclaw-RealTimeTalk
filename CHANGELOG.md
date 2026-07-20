@@ -1,3 +1,11 @@
+## v3.0.1 — 2026-07-20
+
+### Changed
+
+- **Moved the `Voice ID` button** from the dashboard nav to the Calibrate page (next to the Radio/Monitor/DTMF buttons) — enrollment is a one-time/rare action, not something used every day. `/voice-enroll` itself is unchanged; its "back" link now points to `/calibration` instead of `/dashboard`. The `Owner Only`/`Everyone` toggle stays on the dashboard since it's the frequently-used control.
+
+---
+
 ## v3.0.0 — 2026-07-19
 
 ### Added

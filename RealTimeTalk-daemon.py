@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.0.0"
+__version__ = "3.0.1"
 
 import argparse
 import asyncio
@@ -3286,7 +3286,7 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 .meter>div{{height:100%;width:0;background:var(--gn)}}
 </style></head><body>
 <h3>&#127908; Voice ID enrollment</h3>
-<p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/dashboard">&larr; dashboard</a></p>
+<p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/calibration">&larr; calibration</a></p>
 <div class="meter"><div id="meter"></div></div>
 <div class="card"><b>Sample 1 — English</b>
 <p class="info">Read aloud: &ldquo;Hey Jarvis, Five wake up. Please check my calendar and read me the news for today.&rdquo;</p>
@@ -3511,6 +3511,25 @@ Restart daemon after training to reload profiles.</p>
                     'color:#a78bfa;background:#0e0820;" title="Retrain specific digits">'
                     '&#8635; DTMF Retrain</a>'
                 ) if _radio_profile_active[0] else ""
+                _voice_enrolled = _owner_profile[0] is not None
+                _voice_owner_only = _owner_only[0]
+                _voice_id_btn = (
+                    '<a href="/voice-enroll" style="padding:4px 11px;font-size:13px;'
+                    'text-decoration:none;border:1px solid {c};border-radius:8px;'
+                    'color:{c};background:{bg};" title="{title}">'
+                    '&#127908; Voice ID{chk}</a>'
+                ).format(
+                    c="#dc2626" if _voice_owner_only and not _voice_enrolled
+                      else "#34d399" if _voice_owner_only
+                      else "#38bdf8" if _voice_enrolled
+                      else "#334155",
+                    bg="#3b0000" if _voice_owner_only and not _voice_enrolled
+                       else "#021a0e" if _voice_owner_only
+                       else "#051928" if _voice_enrolled
+                       else "transparent",
+                    title="Enroll or test the owner voice profile",
+                    chk="&nbsp;&#10003;" if _voice_owner_only else "",
+                )
                 ds = _get_device_status()
                 gate = _mic_gate_ref[0]
                 prev = _speaker_cal_result
@@ -3636,6 +3655,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
+  {_voice_id_btn}
   {_dtmf_btns}
 </div>
 {spk_adj_section}
@@ -4855,7 +4875,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else ('Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)' if enrolled else 'Enroll a voice profile first (Voice ID)')}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/voice-enroll" class="btn" data-hint="Enroll or test the owner voice profile">&#127908; Voice ID</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else ('Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)' if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)')}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>

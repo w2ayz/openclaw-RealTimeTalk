@@ -25,9 +25,8 @@ Icons use BMP Unicode symbols (render on Pi/Chromium without a color emoji font)
 | ⊕ | **Lang: EN/ZH** | multilang = en-zh (highlighted) | Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS) |
 | ⊕ | **Lang: List** | multilang = whitelist (highlighted) | Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language |
 | ⊕ | **Lang: Any** | multilang = any (highlighted) | Now: Any language — auto-sleep off. Click → OFF |
-| 👤 | **Everyone** | owner_only = off | Now: Everyone. Click → owner-only (only your enrolled voice is obeyed) — or "Enroll a voice profile first (Voice ID)" when not enrolled |
+| 👤 | **Everyone** | owner_only = off | Now: Everyone. Click → owner-only (only your enrolled voice is obeyed) — or "Enroll a voice profile first (Calibrate → Voice ID)" when not enrolled |
 | 👤 | **Owner Only** | owner_only = on (highlighted) | Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone |
-| 🎤 | **Voice ID** | — | Enroll or test the owner voice profile |
 | ✖ | **Clear Log** | danger style | Clear the conversation log (does not affect the agent's memory) |
 | ↻ | **Restart** | — | Restart the RealTimeTalk daemon (reconnects OpenAI and gateway) |
 | ⚠ | **Gateway Reset** | danger style | Drop and reconnect the OpenClaw gateway WebSocket without restarting |
@@ -72,6 +71,8 @@ Icons use BMP Unicode symbols (render on Pi/Chromium without a color emoji font)
 | **Headset** | Force headset mode (mic + speaker on same device) |
 | **Speaker** | Force speaker mode (external speaker, acoustic calibration available) |
 | **Auto** | Auto-detect mode from device names |
+
+Same row also carries secondary, infrequently-used buttons: 📻 Radio, 🔊 Monitor, 🎤 **Voice ID** (opens `/voice-enroll` — enroll/test the owner voice profile; color reflects owner-only + enrollment state), and DTMF Mon/Train/Retrain when a radio profile is active.
 
 ### Device Panel (expand toggle)
 

@@ -151,8 +151,9 @@ The dashboard auto-refreshes every 3 s and shows:
 | Calibrate mic | Measure ambient noise and set optimal noise gate |
 | Speaker cal | Acoustic sweep to find minimum comfortable speaker volume |
 | Owner Only / Everyone | Toggle owner-only mode — only the enrolled voice is obeyed |
-| Voice ID | Open the voice enrollment / test page |
 | Restart | Restart the daemon |
+
+Voice ID (enrollment / test page) lives on the **Calibrate** page, next to the Radio/Monitor/DTMF buttons — it's not something you touch often, so it's tucked away rather than in the main nav.
 
 ### Voice commands
 
