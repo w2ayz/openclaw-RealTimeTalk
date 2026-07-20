@@ -1,3 +1,27 @@
+## v2.11.0 — 2026-07-19
+
+### Added
+
+- **ElevenLabs multilingual v2 for Chinese TTS** — Chinese and mixed Chinese/English replies now use ElevenLabs `eleven_multilingual_v2` (voice: Rachel) for consistent voice across languages. Mixed-language text is sent as full sentences rather than per-segment, so the voice no longer switches mid-reply. OpenAI TTS (`tts-1-hd`/nova) remains the fallback when the ElevenLabs key is missing or the request fails, and it too now receives the full mixed-language text.
+
+- **OpenAI TTS for Chinese** — before the ElevenLabs integration, Chinese TTS moved from Piper to OpenAI `tts-1-hd` (voice: nova), with Piper retained as offline fallback.
+
+- **MIT license** — repository is now public under the MIT license.
+
+### Fixed
+
+- **Wake confirmation in silent mode now driven by OWW detection** — the openWakeWord detector, not just transcript phrase matching, triggers the "Yes?" confirmation flow, so wake works even when the transcript mangles the wake phrase.
+
+- **Wake phrase variants** — added "hej jarvis" / "hay jarvis" / "jarvis" to catch common transcription spellings.
+
+### Changed
+
+- **Wake confirmation timeout extended to 15 s** (was 8 s) and **"yes please" added** to the affirmative replies.
+
+- **`__version__` constant resynced** — the daemon reported `1.8.1` since that release; it now tracks the changelog version.
+
+---
+
 ## v2.10.0 — 2026-06-08
 
 ### Added
