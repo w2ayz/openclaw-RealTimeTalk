@@ -1,3 +1,11 @@
+## v3.5.1 — 2026-07-22
+
+### Fixed
+
+- **Reverted the v3.5.0 AIOC volume boost — it broke Playback and the over-the-air DTMF listener.** Boosting `AIOC_SOURCE_VOLUME_PCT` to 130% pushed the idle noise floor from ~112 to ~500 (measured directly on the live device), well above `DTMF_COS_THRESHOLD` (200) — squelch read as permanently "open," so it could never detect a clean transmission start/end. Confirmed even 100% alone already crosses unsafe (~225 measured). Reverted to 80% (the pre-v3.5.0 value); confirmed idle noise floor is back to ~116 and no false transmissions are detected while idle. Raising input gain again safely would require also raising `DTMF_COS_THRESHOLD` to match, which needs a live transmission to verify real signal peaks still clear the new threshold with margin — not something verifiable from noise-floor measurements alone.
+
+---
+
 ## v3.5.0 — 2026-07-22
 
 ### Fixed

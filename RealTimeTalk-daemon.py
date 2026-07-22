@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.5.0"
+__version__ = "3.5.1"
 
 import argparse
 import asyncio
@@ -117,9 +117,16 @@ AIOC_USB_VID       = 0x1209
 AIOC_USB_PID       = 0x7388
 AIOC_PTT_PREKEY_MS = 250   # ms to hold PTT before audio starts (radio key-up time)
 AIOC_PTT_TAIL_MS   = 400   # ms to hold PTT after audio ends (prevents TX clipping)
-AIOC_SOURCE_VOLUME_PCT = 130   # PipeWire source (mic-in) volume applied to the AIOC — ALSA
-                                # hw capture is already maxed at 100%, this is extra digital
-                                # gain on top since the raw RX signal runs quiet
+AIOC_SOURCE_VOLUME_PCT = 80    # PipeWire source (mic-in) volume applied to the AIOC.
+                                # REVERTED from 130 (v3.5.0): that pushed the idle noise floor
+                                # from ~112 to ~500 (measured), above DTMF_COS_THRESHOLD (200),
+                                # permanently stuck squelch "open" — broke Playback AND the
+                                # over-the-air DTMF wake/sleep listener, both of which key off
+                                # this same threshold. 100% alone already crosses unsafe (~225
+                                # measured). Raising this again requires raising
+                                # DTMF_COS_THRESHOLD to match — and that needs a live
+                                # transmission to verify real "open squelch" peaks still clear
+                                # the new threshold with margin, not just noise-floor math.
 
 # Languages accepted in multi-lang WHITELIST mode.
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
