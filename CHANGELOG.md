@@ -1,3 +1,12 @@
+## v3.6.0 — 2026-07-22
+
+### Changed
+
+- **Playback now transmits on-air instead of replaying on the Monitor device.** Once a detected transmission (squelch/COS, unchanged) finishes recording, Playback keys PTT (`AIOC_PTT_PREKEY_MS`/`AIOC_PTT_TAIL_MS`, same choreography `speak()` uses), transmits the recording back out over the radio, then releases PTT — an automatic echo/repeat of what it just heard. If PTT/radio isn't available, the capture is dropped rather than falling back to local playback. New `PLAYBACK_COOLDOWN_S` (2s) window after each on-air replay during which the listener ignores incoming audio, to avoid re-capturing our own tail/echo (or a repeater's echo of us) as a fresh transmission and looping.
+- **Known risk:** on a repeater or any path where your own retransmission can reach your own receiver, this can still set up a longer-period echo loop that the 2s cooldown doesn't fully rule out — worth testing on simplex first, and keeping an eye on it before leaving it running unattended.
+
+---
+
 ## v3.5.1 — 2026-07-22
 
 ### Fixed

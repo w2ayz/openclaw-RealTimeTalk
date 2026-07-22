@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.5.1"
+__version__ = "3.6.0"
 
 import argparse
 import asyncio
@@ -428,6 +428,9 @@ DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~
 DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops
 PLAYBACK_MIN_SECS  = 0.6     # shorter captures are noise/squelch-flap, not a real transmission — discard
 PLAYBACK_MAX_SECS  = 30.0    # cap a single capture so a stuck-open squelch can't grow memory unbounded
+PLAYBACK_COOLDOWN_S = 2.0    # after transmitting a replay on-air, ignore new segments for this long —
+                             # guards against re-capturing our own tail/echo (or a repeater's echo of
+                             # us) as a "new transmission" and looping forever
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
@@ -448,6 +451,7 @@ _playback_active:     list = [False] # True while the Playback listener thread i
 _playback_stop_flag:  list = [False] # set True to stop the Playback listener thread
 _playback_thread:     list = [None]  # running Playback listener Thread handle (avoid double-spawn)
 _playback_queue = queue.Queue(maxsize=3)  # captured (secs, pcm_bytes) segments awaiting replay
+_playback_cooldown_until: list = [0.0]  # epoch time; listener ignores new segments until this passes
 _tx_display_until:    list = [0.0]   # epoch until which Manual Adjustment shows TX (AIOC) levels
 _owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
 _owner_only_pre_radio: list = [None]  # owner_only state to restore when radio mode turns off; None = no override pending
@@ -3564,7 +3568,7 @@ Restart daemon after training to reload profiles.</p>
                     + ('color:#34d399;border-color:#34d399;background:#021a0e;'
                        if _playback_active[0] else
                        'color:#475569;border-color:#334155;')
-                    + '" title="Detect a radio transmission (squelch), record it, and replay it on the Monitor device (never on-air)">'
+                    + '" title="Detect a radio transmission (squelch), record it, and transmit it back on-air by keying PTT until playback finishes">'
                     + '&#9654; Playback' + ('&nbsp;&#10003;' if _playback_active[0] else '')
                     + '</button>'
                 ) if _radio_profile_active[0] else ""
@@ -5272,18 +5276,23 @@ def _dtmf_listener() -> None:
 
 
 def _playback_worker() -> None:
-    """Single always-on daemon thread: serially replays captured segments from
-    _playback_queue onto whatever sink Monitor is currently pointed at (read
-    fresh per-segment, so changing the Monitor device mid-session is picked up
-    automatically). Never transmits on-air — if Monitor is off, the segment is
-    just dropped with a log line. Runs for the life of the process; harmless
-    and idle when the queue is empty."""
-    import wave as _pw_wave, tempfile as _pw_tf, os as _pw_os
+    """Single always-on daemon thread: serially transmits captured segments
+    from _playback_queue back out over the radio — keys PTT, plays the clip
+    to the AIOC's TX sink, releases PTT once playback finishes. If PTT/radio
+    isn't available, the segment is just dropped with a log line (never
+    falls back to local playback). Sets a cooldown after each transmission
+    so _playback_listener doesn't immediately re-capture our own tail/echo
+    (or a repeater's echo of us) as a new transmission. Runs for the life of
+    the process; harmless and idle when the queue is empty."""
+    import wave as _pw_wave, tempfile as _pw_tf, os as _pw_os, time as _pw_time
     while True:
         secs, pcm_bytes = _playback_queue.get()
-        sink = _aioc_monitor_sink[0]
-        if _aioc_monitor_module[0] is None or not sink:
-            log.debug("Playback: captured %.1fs but Monitor is off — dropped (no on-air fallback)", secs)
+        if not (_ptt_alive() and _radio_profile_active[0]):
+            log.debug("Playback: captured %.1fs but radio/PTT unavailable — dropped", secs)
+            continue
+        sink = _find_aioc_sink()
+        if not sink:
+            log.debug("Playback: captured %.1fs but no AIOC sink found — dropped", secs)
             continue
         wav_path = _pw_tf.mktemp(suffix=".wav")
         try:
@@ -5292,15 +5301,21 @@ def _playback_worker() -> None:
                 wf.setsampwidth(2)          # int16
                 wf.setframerate(48000)      # native pacat capture rate
                 wf.writeframes(pcm_bytes)
+            _ptt_key()
+            _pw_time.sleep(AIOC_PTT_PREKEY_MS / 1000)
+            log.info("Playback: PTT keyed — transmitting %.1fs on-air", secs)
             rc = subprocess.call(["paplay", f"--device={sink}", wav_path], stderr=subprocess.DEVNULL)
+            _pw_time.sleep(AIOC_PTT_TAIL_MS / 1000)
+            _ptt_release()
+            log.info("Playback: PTT released")
             if rc == 0:
-                _log_entry("system", f"Playback: replayed {secs:.1f}s radio transmission on {sink.split('.')[-1][:30]}")
-                log.info("Playback: replayed %.1fs on %s", secs, sink)
+                _log_entry("system", f"Playback: transmitted {secs:.1f}s radio recording on-air")
             else:
-                log.warning("Playback: paplay failed (rc=%d) on %s", rc, sink)
+                log.warning("Playback: paplay failed (rc=%d) during on-air transmit", rc)
         except Exception as exc:
-            log.warning("Playback: replay failed: %s", exc)
+            log.warning("Playback: on-air transmit failed: %s", exc)
         finally:
+            _playback_cooldown_until[0] = _pw_time.time() + PLAYBACK_COOLDOWN_S
             try: _pw_os.remove(wav_path)
             except Exception: pass
 
@@ -5308,10 +5323,12 @@ def _playback_worker() -> None:
 def _playback_listener(stop_flag: list) -> None:
     """Background thread: detect a radio transmission via the same squelch
     (COS) technique as _dtmf_listener — raw peak > DTMF_COS_THRESHOLD with
-    DTMF_COS_TAIL_S hangover — and hand the captured audio to _playback_worker
-    for replay on the Monitor device. No PTT, no on-air transmission, no
-    OpenAI/transcription involvement; independent pacat reader from the DTMF
-    listener's so neither can affect the other."""
+    DTMF_COS_TAIL_S hangover — and hand the captured audio to _playback_worker,
+    which transmits it back out over the radio (on-air) via PTT. No OpenAI/
+    transcription involvement; independent pacat reader from the DTMF
+    listener's so neither can affect the other. Ignores new segments during
+    the post-transmit cooldown window (_playback_cooldown_until) so it
+    doesn't re-capture our own tail/echo as another transmission."""
     import time as _pl_time
     import numpy as _pl_np
 
@@ -5324,7 +5341,7 @@ def _playback_listener(stop_flag: list) -> None:
         if not aioc_src:
             _pl_time.sleep(3); continue
 
-        log.info("Playback listener ready (COS>=%d, tail=%.1fs, min=%.1fs)",
+        log.info("Playback listener ready (COS>=%d, tail=%.1fs, min=%.1fs) — on-air replay",
                  DTMF_COS_THRESHOLD, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
         proc = None
         try:
@@ -5342,9 +5359,15 @@ def _playback_listener(stop_flag: list) -> None:
                 chunk = proc.stdout.read(_CHUNK48)
                 if not chunk:
                     break
+                now = _pl_time.time()
+                if now < _playback_cooldown_until[0]:
+                    # In post-transmit cooldown — ignore audio so we don't
+                    # re-capture our own tail/echo as a fresh transmission.
+                    was_open = False
+                    seg_buf = bytearray()
+                    continue
                 raw  = _pl_np.frombuffer(chunk, dtype=_pl_np.int16)
                 peak = int(_pl_np.max(_pl_np.abs(raw))) if len(raw) else 0
-                now  = _pl_time.time()
                 if peak > DTMF_COS_THRESHOLD:
                     cos_until = now + DTMF_COS_TAIL_S
                 cos_open = now < cos_until
