@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 
 import argparse
 import asyncio
@@ -416,7 +416,8 @@ DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled 
 DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
 DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
 DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops
-PLAYBACK_RECORD_SECS = 5.0   # fixed capture window per record→replay cycle
+PLAYBACK_MIN_SECS  = 0.6     # shorter captures are noise/squelch-flap, not a real transmission — discard
+PLAYBACK_MAX_SECS  = 30.0    # cap a single capture so a stuck-open squelch can't grow memory unbounded
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
@@ -3550,7 +3551,7 @@ Restart daemon after training to reload profiles.</p>
                     + ('color:#34d399;border-color:#34d399;background:#021a0e;'
                        if _playback_active[0] else
                        'color:#475569;border-color:#334155;')
-                    + '" title="Record 5s of radio RX audio on a loop and replay each clip on the Monitor device (never on-air)">'
+                    + '" title="Detect a radio transmission (squelch), record it, and replay it on the Monitor device (never on-air)">'
                     + '&#9654; Playback' + ('&nbsp;&#10003;' if _playback_active[0] else '')
                     + '</button>'
                 ) if _radio_profile_active[0] else ""
@@ -5292,25 +5293,26 @@ def _playback_worker() -> None:
 
 
 def _playback_listener(stop_flag: list) -> None:
-    """Background thread: while active, repeatedly records a fixed
-    PLAYBACK_RECORD_SECS window of whatever is coming through the radio's RX
-    audio (no transmission detection — just a rolling record→replay loop) and
-    hands each window to _playback_worker for replay on the Monitor device.
-    No PTT, no on-air transmission, no OpenAI/transcription involvement;
-    independent pacat reader from the DTMF listener's so neither can affect
-    the other."""
+    """Background thread: detect a radio transmission via the same squelch
+    (COS) technique as _dtmf_listener — raw peak > DTMF_COS_THRESHOLD with
+    DTMF_COS_TAIL_S hangover — and hand the captured audio to _playback_worker
+    for replay on the Monitor device. No PTT, no on-air transmission, no
+    OpenAI/transcription involvement; independent pacat reader from the DTMF
+    listener's so neither can affect the other."""
     import time as _pl_time
+    import numpy as _pl_np
 
     _RATE48    = 48000
     _CHUNK48   = _RATE48 * 2 * 50 // 1000   # 50ms chunk at 48kHz mono s16le = 4800 bytes
-    _SEG_BYTES = int(PLAYBACK_RECORD_SECS * _RATE48 * 2)
+    _MAX_BYTES = int(PLAYBACK_MAX_SECS * _RATE48 * 2)
 
     while not stop_flag[0]:
         aioc_src = _find_aioc_source()
         if not aioc_src:
             _pl_time.sleep(3); continue
 
-        log.info("Playback listener ready (%.0fs fixed-window record→replay)", PLAYBACK_RECORD_SECS)
+        log.info("Playback listener ready (COS>=%d, tail=%.1fs, min=%.1fs)",
+                 DTMF_COS_THRESHOLD, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
         proc = None
         try:
             proc = subprocess.Popen(
@@ -5319,18 +5321,35 @@ def _playback_listener(stop_flag: list) -> None:
                  f"--device={aioc_src}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            seg_buf = bytearray()
+            cos_until   = 0.0
+            was_open    = False
+            seg_buf     = bytearray()
+
             while not stop_flag[0] and _find_aioc_source():
                 chunk = proc.stdout.read(_CHUNK48)
                 if not chunk:
                     break
-                seg_buf.extend(chunk)
-                if len(seg_buf) >= _SEG_BYTES:
-                    try:
-                        _playback_queue.put_nowait((PLAYBACK_RECORD_SECS, bytes(seg_buf[:_SEG_BYTES])))
-                    except queue.Full:
-                        log.warning("Playback: queue full — dropping %.0fs capture", PLAYBACK_RECORD_SECS)
-                    seg_buf = bytearray(seg_buf[_SEG_BYTES:])
+                raw  = _pl_np.frombuffer(chunk, dtype=_pl_np.int16)
+                peak = int(_pl_np.max(_pl_np.abs(raw))) if len(raw) else 0
+                now  = _pl_time.time()
+                if peak > DTMF_COS_THRESHOLD:
+                    cos_until = now + DTMF_COS_TAIL_S
+                cos_open = now < cos_until
+
+                if cos_open and not was_open:
+                    seg_buf = bytearray(chunk)
+                elif cos_open and was_open:
+                    if len(seg_buf) < _MAX_BYTES:
+                        seg_buf.extend(chunk)
+                elif not cos_open and was_open:
+                    secs = len(seg_buf) / 2 / _RATE48
+                    if secs >= PLAYBACK_MIN_SECS:
+                        try:
+                            _playback_queue.put_nowait((secs, bytes(seg_buf)))
+                        except queue.Full:
+                            log.warning("Playback: queue full — dropping %.1fs capture", secs)
+                    seg_buf = bytearray()
+                was_open = cos_open
         except Exception as exc:
             log.warning("Playback listener error: %s", exc)
         finally:

@@ -1,3 +1,11 @@
+## v3.4.0 — 2026-07-22
+
+### Changed
+
+- **Reverted Playback to squelch (COS)-based transmission detection**, undoing v3.3.0's fixed 5-second window. A hardware-PTT-line detection mode was investigated (the AIOC's actual COS mechanism requires an external hardware input wired into a specific PCB revision, read via a HID feature-report protocol — not a simple serial control line — and depends on firmware version) and shelved for now since it needs hardware/firmware details only confirmable on the physical unit. Squelch mode is back to exactly its v3.1.0/v3.2.0 behavior: raw peak > `DTMF_COS_THRESHOLD` with `DTMF_COS_TAIL_S` hangover, `PLAYBACK_MIN_SECS`/`PLAYBACK_MAX_SECS` bounds restored.
+
+---
+
 ## v3.3.0 — 2026-07-22
 
 ### Changed
