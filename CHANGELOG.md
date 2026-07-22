@@ -1,3 +1,11 @@
+## v3.1.0 — 2026-07-22
+
+### Added
+
+- **Playback button (Calibrate page)** — next to Monitor, shown only when a radio profile is active. Where Monitor streams incoming radio audio live (and can sound choppy/low-quality), Playback instead detects a transmission using the same carrier-operated-squelch (COS) technique already used for DTMF signaling (raw peak > 200, 0.5s hangover), records it, and replays the clean captured clip on whatever device Monitor is currently pointed at once the transmission ends. It never transmits back over the air — if Monitor is off, the capture is just dropped with a log line rather than falling back to on-air playback. New `/aioc-playback` toggle endpoint (mirrors `/aioc-monitor`'s shape, no sink argument — it always follows Monitor's current device). Captures shorter than 0.6s are discarded as squelch noise; a single capture is capped at 30s.
+
+---
+
 ## v3.0.1 — 2026-07-20
 
 ### Changed

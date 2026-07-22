@@ -72,7 +72,7 @@ Icons use BMP Unicode symbols (render on Pi/Chromium without a color emoji font)
 | **Speaker** | Force speaker mode (external speaker, acoustic calibration available) |
 | **Auto** | Auto-detect mode from device names |
 
-Same row also carries secondary, infrequently-used buttons: 📻 Radio, 🔊 Monitor, 🎤 **Voice ID** (opens `/voice-enroll` — enroll/test the owner voice profile; color reflects owner-only + enrollment state), and DTMF Mon/Train/Retrain when a radio profile is active.
+Same row also carries secondary, infrequently-used buttons: 📻 Radio, 🔊 Monitor, ▶ **Playback** (detects a radio transmission via squelch/COS detection, records it, and replays it on whatever device Monitor is currently set to — never transmits on-air; shown only when a radio profile is active), 🎤 **Voice ID** (opens `/voice-enroll` — enroll/test the owner voice profile; color reflects owner-only + enrollment state), and DTMF Mon/Train/Retrain when a radio profile is active.
 
 ### Device Panel (expand toggle)
 

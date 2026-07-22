@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.0.1"
+__version__ = "3.1.0"
 
 import argparse
 import asyncio
@@ -34,6 +34,7 @@ import datetime
 import json
 import logging
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -415,6 +416,8 @@ DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled 
 DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
 DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
 DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops
+PLAYBACK_MIN_SECS  = 0.6     # shorter captures are noise/squelch-flap, not a real transmission — discard
+PLAYBACK_MAX_SECS  = 30.0    # cap a single capture so a stuck-open squelch can't grow memory unbounded
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
 _last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
@@ -431,6 +434,10 @@ _pre_aioc_mic:        list = [None]   # mic source active before AIOC connected;
 _radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
 _aioc_monitor_module: list = [None]  # PipeWire loopback module ID when AIOC monitor is active
 _aioc_monitor_sink:   list = [None]  # sink name currently used for AIOC monitor loopback
+_playback_active:     list = [False] # True while the Playback listener thread is running
+_playback_stop_flag:  list = [False] # set True to stop the Playback listener thread
+_playback_thread:     list = [None]  # running Playback listener Thread handle (avoid double-spawn)
+_playback_queue = queue.Queue(maxsize=3)  # captured (secs, pcm_bytes) segments awaiting replay
 _tx_display_until:    list = [0.0]   # epoch until which Manual Adjustment shows TX (AIOC) levels
 _owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
 _spk_threshold:       list = [SPK_THRESHOLD_DEFAULT]  # cosine pass mark
@@ -3511,6 +3518,16 @@ Restart daemon after training to reload profiles.</p>
                     'color:#a78bfa;background:#0e0820;" title="Retrain specific digits">'
                     '&#8635; DTMF Retrain</a>'
                 ) if _radio_profile_active[0] else ""
+                _playback_btn = (
+                    '<button id="playbackbtn" onclick="toggleAiocPlayback()" '
+                    'style="padding:4px 11px;font-size:13px;'
+                    + ('color:#34d399;border-color:#34d399;background:#021a0e;'
+                       if _playback_active[0] else
+                       'color:#475569;border-color:#334155;')
+                    + '" title="Detect a radio transmission, record it, and replay it on the Monitor device (never on-air)">'
+                    + '&#9654; Playback' + ('&nbsp;&#10003;' if _playback_active[0] else '')
+                    + '</button>'
+                ) if _radio_profile_active[0] else ""
                 _voice_enrolled = _owner_profile[0] is not None
                 _voice_owner_only = _owner_only[0]
                 _voice_id_btn = (
@@ -3655,6 +3672,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
+  {_playback_btn}
   {_voice_id_btn}
   {_dtmf_btns}
 </div>
@@ -3808,6 +3826,19 @@ function toggleAiocMonitor(){{
     }} else {{
       mb.innerHTML='&#128266; Monitor';
       mb.style.color='#475569';mb.style.borderColor='#334155';mb.style.background='';
+    }}
+  }});
+}}
+function toggleAiocPlayback(){{
+  fetch('/aioc-playback').then(r=>r.json()).then(d=>{{
+    const pb=document.getElementById('playbackbtn');
+    if(!pb) return;
+    if(d.active){{
+      pb.innerHTML='&#9654; Playback&nbsp;&#10003;';
+      pb.style.color='#34d399';pb.style.borderColor='#34d399';pb.style.background='#021a0e';
+    }} else {{
+      pb.innerHTML='&#9654; Playback';
+      pb.style.color='#475569';pb.style.borderColor='#334155';pb.style.background='';
     }}
   }});
 }}
@@ -4439,6 +4470,31 @@ setInterval(upd, 2000);
                     "active": _aioc_monitor_module[0] is not None,
                     "sink":   _aioc_monitor_sink[0],
                 }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            elif self.path == "/aioc-playback":
+                import json as _json
+                if _playback_active[0]:
+                    _playback_stop_flag[0] = True
+                    _t = _playback_thread[0]
+                    if _t is not None:
+                        _t.join(timeout=3)
+                    _playback_active[0] = False
+                    _playback_thread[0] = None
+                    log.info("Playback listener stopped")
+                else:
+                    _playback_stop_flag[0] = False
+                    _t = _threading.Thread(target=_playback_listener, args=(_playback_stop_flag,),
+                                            daemon=True, name="playback-listener")
+                    _playback_thread[0] = _t
+                    _t.start()
+                    _playback_active[0] = True
+                    log.info("Playback listener started")
+                resp = _json.dumps({"active": _playback_active[0]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
@@ -5175,6 +5231,109 @@ def _dtmf_listener() -> None:
         _td.sleep(5)
 
 
+def _playback_worker() -> None:
+    """Single always-on daemon thread: serially replays captured segments from
+    _playback_queue onto whatever sink Monitor is currently pointed at (read
+    fresh per-segment, so changing the Monitor device mid-session is picked up
+    automatically). Never transmits on-air — if Monitor is off, the segment is
+    just dropped with a log line. Runs for the life of the process; harmless
+    and idle when the queue is empty."""
+    import wave as _pw_wave, tempfile as _pw_tf, os as _pw_os
+    while True:
+        secs, pcm_bytes = _playback_queue.get()
+        sink = _aioc_monitor_sink[0]
+        if _aioc_monitor_module[0] is None or not sink:
+            log.debug("Playback: captured %.1fs but Monitor is off — dropped (no on-air fallback)", secs)
+            continue
+        wav_path = _pw_tf.mktemp(suffix=".wav")
+        try:
+            with _pw_wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)          # int16
+                wf.setframerate(48000)      # native pacat capture rate
+                wf.writeframes(pcm_bytes)
+            rc = subprocess.call(["paplay", f"--device={sink}", wav_path], stderr=subprocess.DEVNULL)
+            if rc == 0:
+                _log_entry("system", f"Playback: replayed {secs:.1f}s radio transmission on {sink.split('.')[-1][:30]}")
+                log.info("Playback: replayed %.1fs on %s", secs, sink)
+            else:
+                log.warning("Playback: paplay failed (rc=%d) on %s", rc, sink)
+        except Exception as exc:
+            log.warning("Playback: replay failed: %s", exc)
+        finally:
+            try: _pw_os.remove(wav_path)
+            except Exception: pass
+
+
+def _playback_listener(stop_flag: list) -> None:
+    """Background thread: detect a radio transmission via the same squelch
+    (COS) technique as _dtmf_listener — raw peak > DTMF_COS_THRESHOLD with
+    DTMF_COS_TAIL_S hangover — and hand the captured audio to _playback_worker
+    for replay on the Monitor device. No PTT, no on-air transmission, no
+    OpenAI/transcription involvement; independent pacat reader from the DTMF
+    listener's so neither can affect the other."""
+    import time as _pl_time
+    import numpy as _pl_np
+
+    _RATE48    = 48000
+    _CHUNK48   = _RATE48 * 2 * 50 // 1000   # 50ms chunk at 48kHz mono s16le = 4800 bytes
+    _MAX_BYTES = int(PLAYBACK_MAX_SECS * _RATE48 * 2)
+
+    while not stop_flag[0]:
+        aioc_src = _find_aioc_source()
+        if not aioc_src:
+            _pl_time.sleep(3); continue
+
+        log.info("Playback listener ready (COS>=%d, tail=%.1fs, min=%.1fs)",
+                 DTMF_COS_THRESHOLD, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["pacat", "--record", "--raw", "--format=s16le",
+                 "--rate=48000", "--channels=1", "--latency-msec=50",
+                 f"--device={aioc_src}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+            cos_until   = 0.0
+            was_open    = False
+            seg_buf     = bytearray()
+
+            while not stop_flag[0] and _find_aioc_source():
+                chunk = proc.stdout.read(_CHUNK48)
+                if not chunk:
+                    break
+                raw  = _pl_np.frombuffer(chunk, dtype=_pl_np.int16)
+                peak = int(_pl_np.max(_pl_np.abs(raw))) if len(raw) else 0
+                now  = _pl_time.time()
+                if peak > DTMF_COS_THRESHOLD:
+                    cos_until = now + DTMF_COS_TAIL_S
+                cos_open = now < cos_until
+
+                if cos_open and not was_open:
+                    seg_buf = bytearray(chunk)
+                elif cos_open and was_open:
+                    if len(seg_buf) < _MAX_BYTES:
+                        seg_buf.extend(chunk)
+                elif not cos_open and was_open:
+                    secs = len(seg_buf) / 2 / _RATE48
+                    if secs >= PLAYBACK_MIN_SECS:
+                        try:
+                            _playback_queue.put_nowait((secs, bytes(seg_buf)))
+                        except queue.Full:
+                            log.warning("Playback: queue full — dropping %.1fs capture", secs)
+                    seg_buf = bytearray()
+                was_open = cos_open
+        except Exception as exc:
+            log.warning("Playback listener error: %s", exc)
+        finally:
+            if proc is not None:
+                try: proc.kill()
+                except Exception: pass
+
+        if not stop_flag[0]:
+            _pl_time.sleep(3)
+
+
 def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     """Background thread: always-on local wake word detection via openwakeword.
 
@@ -5355,6 +5514,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         name="oww-wakeword",
     ).start()
     _thr.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
+    _thr.Thread(target=_playback_worker, daemon=True, name="playback-worker").start()
 
     # Restore sleep state persisted across service restarts (e.g. mic device change)
     if _load_sleep_state():

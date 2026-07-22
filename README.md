@@ -153,7 +153,7 @@ The dashboard auto-refreshes every 3 s and shows:
 | Owner Only / Everyone | Toggle owner-only mode — only the enrolled voice is obeyed |
 | Restart | Restart the daemon |
 
-Voice ID (enrollment / test page) lives on the **Calibrate** page, next to the Radio/Monitor/DTMF buttons — it's not something you touch often, so it's tucked away rather than in the main nav.
+Voice ID (enrollment / test page) lives on the **Calibrate** page, next to the Radio/Monitor/Playback/DTMF buttons — it's not something you touch often, so it's tucked away rather than in the main nav.
 
 ### Voice commands
 
@@ -349,6 +349,10 @@ The daemon watches connected audio devices via a PipeWire fingerprint polled eve
 
 - **Plugged in** — saves current mic source, switches AGC to the radio profile (no voice detection, no transient suppression), sets AIOC as PipeWire default sink, applies AIOC calibration
 - **Unplugged** — restores previous mic source, switches back to regular mic AGC profile, stops any active AIOC monitor loopback, clears PTT state; serial port number change (`ttyACM0` → `ttyACM1`) handled automatically
+
+**Monitor vs. Playback (Calibrate page):** both work off the AIOC's RX audio, but differently —
+- **Monitor** is a live PipeWire loopback (`module-loopback`, ~20ms latency) straight to a speaker you pick from the Audio Devices table. Real-time, but only as clean as the raw radio audio.
+- **Playback** detects an actual transmission (carrier-operated squelch: raw peak > `DTMF_COS_THRESHOLD` with a hangover tail — the same technique the DTMF listener already uses), records it, and replays the captured clip on whatever device Monitor is currently set to once the transmission ends. It's a discrete, clean replay rather than a live stream, and it never transmits anything back over the air — if Monitor is off when a transmission finishes, the capture is just dropped. Captures under 0.6s are treated as squelch noise and discarded; a single capture is capped at 30s.
 
 **HDMI changes** are silently ignored — display-source connect/disconnect triggers HDMI audio appearance/disappearance but is not a real speaker change and produces no announcement.
 
