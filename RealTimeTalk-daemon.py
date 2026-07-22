@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
 
 import argparse
 import asyncio
@@ -117,6 +117,9 @@ AIOC_USB_VID       = 0x1209
 AIOC_USB_PID       = 0x7388
 AIOC_PTT_PREKEY_MS = 250   # ms to hold PTT before audio starts (radio key-up time)
 AIOC_PTT_TAIL_MS   = 400   # ms to hold PTT after audio ends (prevents TX clipping)
+AIOC_SOURCE_VOLUME_PCT = 130   # PipeWire source (mic-in) volume applied to the AIOC — ALSA
+                                # hw capture is already maxed at 100%, this is extra digital
+                                # gain on top since the raw RX signal runs quiet
 
 # Languages accepted in multi-lang WHITELIST mode.
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
@@ -687,6 +690,9 @@ def _apply_agc_profile(radio: bool) -> None:
             if aioc_sink:
                 subprocess.run(["pactl", "set-default-sink", aioc_sink], capture_output=True)
                 _apply_device_cal(aioc_sink)
+            subprocess.run(["pactl", "set-source-volume", aioc_src, f"{AIOC_SOURCE_VOLUME_PCT}%"],
+                           capture_output=True)
+            log.info("AIOC source volume set to %d%%", AIOC_SOURCE_VOLUME_PCT)
         else:
             usb_spk = next((
                 l.split()[1] for l in subprocess.run(
@@ -5499,6 +5505,10 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         if _is_radio_conf:
             globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO
             _radio_profile_active[0] = True
+            _aioc_src_startup = _find_aioc_source()
+            if _aioc_src_startup:
+                subprocess.run(["pactl", "set-source-volume", _aioc_src_startup,
+                                f"{AIOC_SOURCE_VOLUME_PCT}%"], capture_output=True)
             log.info("AIOC present at startup — radio profile active, MIC_GAIN=%.0fx",
                      AGC_MIC_GAIN_RADIO)
         else:

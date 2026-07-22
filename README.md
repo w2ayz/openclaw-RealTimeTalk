@@ -347,7 +347,7 @@ The daemon watches connected audio devices via a PipeWire fingerprint polled eve
 
 **AIOC (radio interface) plug/unplug:**
 
-- **Plugged in** — saves current mic source, switches AGC to the radio profile (no voice detection, no transient suppression), sets AIOC as PipeWire default sink, applies AIOC calibration
+- **Plugged in** — saves current mic source, switches AGC to the radio profile (no voice detection, no transient suppression), sets AIOC as PipeWire default sink, applies AIOC calibration, sets the AIOC's PipeWire source volume to `AIOC_SOURCE_VOLUME_PCT` (130%) — the ALSA hardware capture level is already maxed at 100%/0dB, so this is extra digital gain since the raw RX signal runs quiet
 - **Unplugged** — restores previous mic source, switches back to regular mic AGC profile, stops any active AIOC monitor loopback, clears PTT state; serial port number change (`ttyACM0` → `ttyACM1`) handled automatically
 
 **Monitor vs. Playback (Calibrate page):** both work off the AIOC's RX audio, but differently —

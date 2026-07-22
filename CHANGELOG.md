@@ -1,3 +1,11 @@
+## v3.5.0 — 2026-07-22
+
+### Fixed
+
+- **AIOC mic input was quieter than it needed to be** — the ALSA hardware capture level was already maxed at 100%/0dB, but PipeWire's software volume on top was sitting at 80% (actually attenuating the signal below unity). Radio mode now sets the AIOC's PipeWire source volume to a fixed `AIOC_SOURCE_VOLUME_PCT` (130%, +6.8dB) whenever it activates — on manual toggle, hotplug auto-detect, and daemon startup restore — giving real extra gain on top of the maxed-out hardware level. This affects everything reading from the AIOC source: live conversation audio, Monitor, and Playback.
+
+---
+
 ## v3.4.0 — 2026-07-22
 
 ### Changed
