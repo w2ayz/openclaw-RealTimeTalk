@@ -352,7 +352,7 @@ The daemon watches connected audio devices via a PipeWire fingerprint polled eve
 
 **Monitor vs. Playback (Calibrate page):** both work off the AIOC's RX audio, but differently —
 - **Monitor** is a live PipeWire loopback (`module-loopback`, ~20ms latency) straight to a speaker you pick from the Audio Devices table. Real-time, but only as clean as the raw radio audio.
-- **Playback** detects an actual transmission (carrier-operated squelch: raw peak > `DTMF_COS_THRESHOLD` with a hangover tail — the same technique the DTMF listener already uses), records it, and replays the captured clip on whatever device Monitor is currently set to once the transmission ends. It's a discrete, clean replay rather than a live stream, and it never transmits anything back over the air — if Monitor is off when a transmission finishes, the capture is just dropped. Captures under 0.6s are treated as squelch noise and discarded; a single capture is capped at 30s.
+- **Playback** records a fixed 5-second window of whatever is coming through the radio's RX audio, then replays that clip on whatever device Monitor is currently set to — then immediately starts recording the next 5-second window, looping continuously while Playback is on. It's not transmission-detection — every window plays, regardless of content — just a rolling record→replay cycle, and it never transmits anything back over the air. If Monitor is off, each capture is just dropped instead.
 
 **HDMI changes** are silently ignored — display-source connect/disconnect triggers HDMI audio appearance/disappearance but is not a real speaker change and produces no announcement.
 

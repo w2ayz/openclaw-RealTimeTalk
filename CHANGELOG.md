@@ -1,3 +1,11 @@
+## v3.3.0 — 2026-07-22
+
+### Changed
+
+- **Simplified Playback to a fixed 5-second record→replay loop** — no longer detects transmissions via squelch/COS; while Playback is on, it just repeatedly records a fixed `PLAYBACK_RECORD_SECS` (5s) window of whatever is coming through the radio's RX audio and replays each clip on the Monitor device, back to back, regardless of content. Removes the transmission-detection logic and its `PLAYBACK_MIN_SECS`/`PLAYBACK_MAX_SECS` bounds entirely — every window is played, not just ones that cross a squelch threshold.
+
+---
+
 ## v3.2.0 — 2026-07-22
 
 ### Changed
