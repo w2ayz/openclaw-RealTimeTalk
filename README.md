@@ -150,10 +150,10 @@ The dashboard auto-refreshes every 3 s and shows:
 | Multi-lang: ON/OFF | Toggle language filter (OFF = EN/ZH only, drop noise hallucinations) |
 | Calibrate mic | Measure ambient noise and set optimal noise gate |
 | Speaker cal | Acoustic sweep to find minimum comfortable speaker volume |
-| Owner Only / Everyone | Toggle owner-only mode — only the enrolled voice is obeyed |
+| Owner Only / Everyone | Toggle owner-only mode — only the enrolled voice is obeyed. **Auto-disabled while Radio mode is on** (voice verification is unreliable over radio audio) and restored once radio mode turns back off; manually re-enabling it while radio mode is active is refused. |
 | Restart | Restart the daemon |
 
-Voice ID (enrollment / test page) lives on the **Calibrate** page, next to the Radio/Monitor/Playback/DTMF buttons — it's not something you touch often, so it's tucked away rather than in the main nav.
+Voice ID (enrollment / test page) lives on the **Calibrate** page, as the **first** button in the Radio/Monitor/Playback/DTMF group.
 
 ### Voice commands
 

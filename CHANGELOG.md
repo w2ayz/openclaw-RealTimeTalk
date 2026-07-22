@@ -1,3 +1,12 @@
+## v3.2.0 — 2026-07-22
+
+### Changed
+
+- **Owner-only voice mode is now auto-disabled while Radio mode is on** — voice verification can't reliably recognize an enrolled profile over radio audio (different frequency response/compression than the mic samples it was trained on), so entering radio mode now automatically switches owner-only off, restoring whatever the prior state was when radio mode turns back off. Attempting to manually re-enable owner-only (voice phrase or dashboard button) while radio mode is active is refused with an explanation, so it can't silently defeat the auto-disable.
+- **Calibrate page button order** — `Voice ID` now comes first (before Radio/Monitor/Playback/DTMF).
+
+---
+
 ## v3.1.0 — 2026-07-22
 
 ### Added

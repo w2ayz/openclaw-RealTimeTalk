@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 import argparse
 import asyncio
@@ -440,6 +440,7 @@ _playback_thread:     list = [None]  # running Playback listener Thread handle (
 _playback_queue = queue.Queue(maxsize=3)  # captured (secs, pcm_bytes) segments awaiting replay
 _tx_display_until:    list = [0.0]   # epoch until which Manual Adjustment shows TX (AIOC) levels
 _owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
+_owner_only_pre_radio: list = [None]  # owner_only state to restore when radio mode turns off; None = no override pending
 _spk_threshold:       list = [SPK_THRESHOLD_DEFAULT]  # cosine pass mark
 _spk_extractor:       list = [None]   # lazy sherpa_onnx.SpeakerEmbeddingExtractor singleton
 _owner_profile:       list = [None]   # {"mean": ndarray, "samples": [ndarray,...]} or None
@@ -702,6 +703,23 @@ def _apply_agc_profile(radio: bool) -> None:
         log.info("AGC profile → %s (gain_control=%s, MIC_GAIN=%.0fx)",
                  "radio" if radio else "mic", not radio,
                  AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN)
+
+        # Owner-only voice verification can't reliably recognize a voice profile
+        # over radio audio (different frequency response/compression than the
+        # enrolled mic samples) — auto-disable while radio mode is active, and
+        # restore whatever the prior state was once radio mode turns back off.
+        if radio and _owner_only[0]:
+            _owner_only_pre_radio[0] = True
+            _owner_only[0] = False
+            _save_voice_mode()
+            log.info("Radio mode: owner-only voice verification disabled (unreliable over radio audio)")
+            _log_entry("system", "Radio mode on — owner-only voice mode disabled (voice verification is unreliable over radio audio).")
+        elif not radio and _owner_only_pre_radio[0]:
+            _owner_only[0] = True
+            _owner_only_pre_radio[0] = None
+            _save_voice_mode()
+            log.info("Radio mode off — owner-only voice verification restored")
+            _log_entry("system", "Radio mode off — owner-only voice mode restored.")
     except Exception as exc:
         log.warning("AGC profile switch failed: %s", exc)
 
@@ -2738,6 +2756,12 @@ class RealtimeSession:
                     "No voice profile enrolled yet. Use the web portal to enroll first.",
                     self.alsa_output)
                 return
+            if _radio_profile_active[0]:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak,
+                    "Owner only mode is disabled while radio mode is on — voice verification isn't reliable over radio audio.",
+                    self.alsa_output)
+                return
             if not _owner_only[0]:
                 _owner_only[0] = True
                 _save_voice_mode()
@@ -3146,6 +3170,9 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 if want and not _verification_available():
                     _log_entry("system", "Cannot enable owner-only mode — no voice profile enrolled.")
                     log.info("HTTP ownermode: refused — not enrolled")
+                elif want and _radio_profile_active[0]:
+                    _log_entry("system", "Cannot enable owner-only mode — disabled while radio mode is on (voice verification unreliable over radio audio).")
+                    log.info("HTTP ownermode: refused — radio mode active")
                 elif want != _owner_only[0]:
                     _owner_only[0] = want
                     _save_voice_mode()
@@ -3670,10 +3697,10 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
+  {_voice_id_btn}
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
   {_playback_btn}
-  {_voice_id_btn}
   {_dtmf_btns}
 </div>
 {spk_adj_section}
@@ -4931,7 +4958,7 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else ('Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)' if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)')}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else ('Disabled while Radio mode is on — voice verification is unreliable over radio audio' if _radio_profile_active[0] else ('Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)' if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)'))}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
