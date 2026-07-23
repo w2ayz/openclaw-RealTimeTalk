@@ -7,7 +7,7 @@ in supporting more than one type of radio dongle.
 
 ## Overview
 
-RealTimeTalk can bridge Five to a ham radio, letting it be used as a
+RealTimeTalk can bridge an agentic AI assistant to a ham radio, letting it be used as a
 base-station voice assistant reachable over the air, not just via local mic.
 Two USB radio dongles are supported today — **AIOC** (All-In-One-Cable) and
 **Digirig Mobile** — auto-detected on hotplug via a shared registry in
