@@ -1,3 +1,23 @@
+## v3.7.0 — 2026-07-23
+
+### Added
+
+- **Digirig Mobile support as a second radio interface, alongside AIOC.** New shared `radio_interfaces.py` module holds both interfaces' USB VID:PID, PTT line (DTR for AIOC, RTS for Digirig), and per-interface tuning — auto-detected on hotplug exactly like AIOC always has been, no manual selector. Digirig's CM108 audio codec reports the identical USB product string as an unrelated desk mic already on this Pi (confirmed on real hardware, not theoretical); resolved by correlating the ALSA card's `usbid` (`/proc/asound/cardN/usbid`) to its PipeWire `alsa.card` property instead of name matching, which isn't unique enough for this chip.
+- **Background radio-hotplug watcher thread.** Plugging in a radio interface now reliably switches PipeWire's default input/output to it and activates Radio Mode within a few seconds, independent of anyone viewing the dashboard — previously this only ran as a side effect of loading `/dashboard`, so it could go undetected indefinitely with nobody watching the browser.
+
+### Fixed
+
+- **Digirig's onboard CM108 "Auto Gain Control" pumps its idle noise floor up into a noisy, non-stationary band (~114-372 measured over 30s)**, landing on top of the old shared `DTMF_COS_THRESHOLD` (200, tuned for AIOC's much quieter floor) and causing spurious squelch-open + garbage DTMF digit reads. `cos_threshold` is now per-interface instead of one global constant shared across both radios: Digirig runs AGC-on with threshold 500, AIOC is unchanged at 200. (AGC-off was also tried and gives a much larger safety margin — ~45-90 idle floor — and is documented as the more robust fallback in `radio_interfaces.py` if 500 proves insufficient once Digirig sees real transmissions.)
+- **PipeWire's `set-source-volume` was silently fighting the ALSA-level gain tuning on Digirig.** Its PipeWire source is `HARDWARE`-flagged, meaning `pactl set-source-volume` writes to the exact same physical ALSA "Mic" capture register as the new ALSA-mixer fixups — the two code paths were clobbering each other on every profile switch and daemon startup. Aligned Digirig's `source_volume_pct` to match the ALSA-level target so they no longer fight.
+- **EchoTest (renamed from "Playback" this release) echo-chamber loop.** Digirig has measurable TX-into-RX audio crosstalk, and the listener wasn't gated on an active transmission at all — only on the cooldown *after* one finished. It would watch through the entire duration of its own transmission, capture the bleed-through as a same-length "new" signal, and queue it for replay the instant PTT released, cascading into a multi-cycle decaying echo loop. Now ignores audio for the full duration of any PTT-keyed transmission (not just its own), plus a settle window afterward regardless of what triggered the release.
+- **Transmitted/retransmitted audio could reach OpenAI's transcription API during EchoTest's on-air replay.** Its PTT keying runs from a background thread outside the conversational session object and never set the session's existing mic-mute flag (used to fully protect normal TTS replies from being sent for transcription). Mic capture now also checks the shared PTT-active flag directly, closing the gap for any PTT source, not just conversational replies.
+
+### Changed
+
+- **"Playback" button renamed to "EchoTest"** on the Calibrate page (label only — routes/JS function names unchanged).
+
+---
+
 ## v3.6.0 — 2026-07-22
 
 ### Changed

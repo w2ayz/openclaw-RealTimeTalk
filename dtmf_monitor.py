@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-AIOC Real-Time DTMF Monitor with training mode.
+Real-Time DTMF Monitor with training mode. Works over any registered radio
+interface (AIOC, Digirig, ...) — see radio_interfaces.py.
 
 Normal:   python3 dtmf_monitor.py
 Training: python3 dtmf_monitor.py --train
 Profiles: ~/.config/rtt/dtmf_profiles.json
 
-COS detection via raw AIOC audio (pacat, bypasses AGC).
+COS detection via raw radio-interface audio (pacat, bypasses AGC).
 Detection: custom Goertzel with learned profiles, or multimon-ng fallback.
 """
 import subprocess, threading, time, re, sys, argparse, os, json, numpy as np
 from pathlib import Path
 from collections import defaultdict
+from radio_interfaces import find_radio_source, find_radio_source_with_iface, RADIO_INTERFACES
 
 # ── Config ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -25,7 +27,10 @@ parser.add_argument('--deepsleep',     default='987')
 parser.add_argument('--monitor-on',    default='456')
 parser.add_argument('--monitor-off',   default='654')
 parser.add_argument('--wake-silent',   default='789')
-parser.add_argument('--cos-threshold', type=int,   default=200,  help='Raw int16 COS threshold (default 200)')
+parser.add_argument('--cos-threshold', type=int,   default=None,
+                     help='Raw int16 COS threshold (default: whichever radio interface is '
+                          'currently connected uses its own tuned value from radio_interfaces.py; '
+                          'falls back to 200 if none detected)')
 parser.add_argument('--cos-tail',      type=float, default=0.5,  help='COS hold-open seconds (default 0.5)')
 parser.add_argument('--profiles',      default=os.path.expanduser('~/.config/rtt/dtmf_profiles.json'))
 args = parser.parse_args()
@@ -36,7 +41,11 @@ DEEPSLEEP_SEQ   = args.deepsleep
 MONITOR_ON_SEQ   = args.monitor_on
 MONITOR_OFF_SEQ  = args.monitor_off
 WAKE_SILENT_SEQ  = args.wake_silent
-COS_THRESHOLD = args.cos_threshold
+if args.cos_threshold is not None:
+    COS_THRESHOLD = args.cos_threshold
+else:
+    _cos_found = find_radio_source_with_iface()
+    COS_THRESHOLD = _cos_found[0].cos_threshold if _cos_found else 200
 COS_TAIL_S    = args.cos_tail
 SEQ_TIMEOUT   = 8.0
 DIGIT_COOLDOWN= 0.4
@@ -115,17 +124,6 @@ def decode_frame_fft(frame):
         return None, None
     return float(row_freq), float(col_freq)
 
-# ── AIOC source finder ─────────────────────────────────────────────────────
-def find_aioc_source():
-    try:
-        out = subprocess.run(["pactl","list","short","sources"],
-                             capture_output=True, text=True).stdout
-        for l in out.splitlines():
-            if ("AIOC" in l or "All-In-One" in l) and "monitor" not in l:
-                return l.split()[1]
-    except: pass
-    return None
-
 # ── Shared state ───────────────────────────────────────────────────────────
 state = {'cos':False,'level':0,'digits':[],'seq':'','last_digit':None,
          'last_time':0.0,'actions':[]}
@@ -141,7 +139,7 @@ def raw_capture_thread(src):
     global _pacat_proc
     while True:
         if not src:
-            src = find_aioc_source()
+            src = find_radio_source()
             if not src: time.sleep(2); continue
         try:
             proc = subprocess.Popen(
@@ -207,7 +205,7 @@ def dtmf_thread(profiles):
     else:
         # Fallback: multimon-ng
         while True:
-            src = find_aioc_source()
+            src = find_radio_source()
             if not src: time.sleep(2); continue
             try:
                 pacat = subprocess.Popen(
@@ -328,9 +326,10 @@ def _ask(prompt, default='y'):
 
 
 def run_training():
-    src = find_aioc_source()
+    src = find_radio_source()
     if not src:
-        print("AIOC not connected."); sys.exit(1)
+        print("No radio interface connected (looked for: " +
+              ", ".join(i.name for i in RADIO_INTERFACES) + ")."); sys.exit(1)
 
     profiles = load_profiles()
     digits   = list(args.digits)
@@ -522,9 +521,10 @@ def run_retrain():
 # NORMAL MONITOR MODE
 # ══════════════════════════════════════════════════════════════════════════
 def run_monitor():
-    src = find_aioc_source()
+    src = find_radio_source()
     if not src:
-        print("AIOC not connected."); sys.exit(1)
+        print("No radio interface connected (looked for: " +
+              ", ".join(i.name for i in RADIO_INTERFACES) + ")."); sys.exit(1)
 
     profiles = load_profiles()
     mode = "LEARNED PROFILES" if profiles else "STANDARD (multimon-ng fallback)"
@@ -556,6 +556,14 @@ def run_monitor():
     if profiles:
         print(_row(f"Profiles : {len(profiles)} digits trained"))
     print(_row(f"Wake={WAKE_SEQ}  Silent={SLEEP_SEQ}  DeepSleep={DEEPSLEEP_SEQ}/{WAKE_SILENT_SEQ}  Mon={MONITOR_ON_SEQ}/{MONITOR_OFF_SEQ}"))
+    print(f"├{HR}┤")
+    print(_row("DTMF Command Reference:"))
+    print(_row(f"  {WAKE_SEQ:<4} Wake         activate (cancels Sleep, goes fully active)"))
+    print(_row(f"  {SLEEP_SEQ:<4} Sleep        go Silent (passive, 10-min idle disconnect)"))
+    print(_row(f"  {DEEPSLEEP_SEQ:<4} Deep Sleep   disconnect immediately (skip 10-min wait)"))
+    print(_row(f"  {WAKE_SILENT_SEQ:<4} Wake-Silent  wake from Deep Sleep into Silent (no routing)"))
+    print(_row(f"  {MONITOR_ON_SEQ:<4} Monitor ON   start passive transcription monitoring"))
+    print(_row(f"  {MONITOR_OFF_SEQ:<4} Monitor OFF  stop monitoring"))
     print(f"└{HR}┘")
 
     threading.Thread(target=raw_capture_thread, args=(src,), daemon=True).start()

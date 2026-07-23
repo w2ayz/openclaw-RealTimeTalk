@@ -110,23 +110,14 @@ RECONNECT_DELAY   = 5
 IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
 OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
-# AIOC ham radio interface — PTT control via serial DTR.
-# Port is found dynamically by USB VID:PID (1209:7388) so the ttyACM number
-# does not need to be hardcoded (it changes across plug/unplug cycles).
-AIOC_USB_VID       = 0x1209
-AIOC_USB_PID       = 0x7388
-AIOC_PTT_PREKEY_MS = 250   # ms to hold PTT before audio starts (radio key-up time)
-AIOC_PTT_TAIL_MS   = 400   # ms to hold PTT after audio ends (prevents TX clipping)
-AIOC_SOURCE_VOLUME_PCT = 80    # PipeWire source (mic-in) volume applied to the AIOC.
-                                # REVERTED from 130 (v3.5.0): that pushed the idle noise floor
-                                # from ~112 to ~500 (measured), above DTMF_COS_THRESHOLD (200),
-                                # permanently stuck squelch "open" — broke Playback AND the
-                                # over-the-air DTMF wake/sleep listener, both of which key off
-                                # this same threshold. 100% alone already crosses unsafe (~225
-                                # measured). Raising this again requires raising
-                                # DTMF_COS_THRESHOLD to match — and that needs a live
-                                # transmission to verify real "open squelch" peaks still clear
-                                # the new threshold with margin, not just noise-floor math.
+# Ham radio interfaces (AIOC, Digirig, ...) — see radio_interfaces.py for each
+# interface's USB VID:PID, PTT line (DTR/RTS), PTT timing, and how its audio
+# device is identified. Port is found dynamically (never hardcoded) so the
+# ttyACM/ttyUSB number doesn't matter across plug/unplug cycles.
+from radio_interfaces import (
+    RADIO_INTERFACES, find_radio_port, find_radio_sink, find_radio_source,
+    find_radio_source_with_iface, is_radio_device_name, apply_alsa_mixer_fixups,
+)
 
 # Languages accepted in multi-lang WHITELIST mode.
 # Add/remove langdetect codes as needed.  Special tokens used for script matching:
@@ -437,16 +428,20 @@ _last_five_reply:     list = [""]     # last reply returned from Five — used t
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
-_ptt_serial:          list = [None]   # open serial.Serial for AIOC PTT; None when unavailable
+_ptt_serial:          list = [None]   # open serial.Serial for the connected radio's PTT; None when unavailable
+_active_radio_iface:  list = [None]   # RadioInterface currently connected (AIOC/Digirig/...), or None
+_resolved_radio_names: list = [set()]  # exact pactl names most recently resolved via audio_usbid
+                                        # correlation (Digirig-style) — is_radio_device_name can't
+                                        # recognize these by substring alone
 _dtmf_force_silent:   list = [False]  # set True by DTMF 321 to silence current session immediately
 _dtmf_force_active:    list = [False]  # set True by DTMF 123 to activate current silent session immediately
 _dtmf_force_deepsleep: list = [False]  # set True by DTMF 987 to disconnect from OpenAI immediately
 _dtmf_force_monitor:   list = [None]   # set True/False by DTMF 456/654 to toggle monitoring mode
 _is_tx:               list = [False]  # True while PTT is asserted (suppresses mic transcripts)
-_pre_aioc_mic:        list = [None]   # mic source active before AIOC connected; restored on unplug
-_radio_profile_active: list = [False] # True when AGC is routing AIOC (radio mode)
-_aioc_monitor_module: list = [None]  # PipeWire loopback module ID when AIOC monitor is active
-_aioc_monitor_sink:   list = [None]  # sink name currently used for AIOC monitor loopback
+_pre_radio_mic:       list = [None]   # mic source active before the radio connected; restored on unplug
+_radio_profile_active: list = [False] # True when AGC is routing the radio interface (radio mode)
+_radio_monitor_module: list = [None]  # PipeWire loopback module ID when radio monitor is active
+_radio_monitor_sink:   list = [None]  # sink name currently used for radio monitor loopback
 _playback_active:     list = [False] # True while the Playback listener thread is running
 _playback_stop_flag:  list = [False] # set True to stop the Playback listener thread
 _playback_thread:     list = [None]  # running Playback listener Thread handle (avoid double-spawn)
@@ -533,72 +528,56 @@ def _cal_capture(n_samples: int, sample_rate: int) -> "np.ndarray":
         return np.zeros(n_samples, dtype=np.int16)
 
 
-def _find_aioc_sink() -> str | None:
-    """Return the PipeWire sink name for the AIOC if currently connected, else None."""
-    try:
-        out = subprocess.run(["pactl", "list", "short", "sinks"],
-                             capture_output=True, text=True, timeout=3).stdout
-        for line in out.splitlines():
-            if "AIOC" in line or "All-In-One-Cable" in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    return parts[1]
-    except Exception:
-        pass
-    return None
+def _find_radio_sink() -> str | None:
+    """Return the PipeWire sink name for the currently-active radio interface, else None."""
+    return find_radio_sink(_active_radio_iface[0])
 
 
-def _find_aioc_source() -> str | None:
-    """Return the PipeWire source name for the AIOC mic if currently connected, else None."""
-    try:
-        out = subprocess.run(["pactl", "list", "short", "sources"],
-                             capture_output=True, text=True, timeout=3).stdout
-        for line in out.splitlines():
-            if ("AIOC" in line or "All-In-One-Cable" in line) and "monitor" not in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    return parts[1]
-    except Exception:
-        pass
-    return None
+def _find_radio_source() -> str | None:
+    """Return the PipeWire source name for the currently-active radio interface, else None."""
+    return find_radio_source(_active_radio_iface[0])
 
 
-def _find_aioc_port() -> str | None:
-    """Return the ttyACM device path for the AIOC by USB VID:PID, or None if absent."""
-    try:
-        from serial.tools import list_ports as _lp
-        for p in _lp.comports():
-            if p.vid == AIOC_USB_VID and p.pid == AIOC_USB_PID:
-                return p.device
-    except Exception:
-        pass
-    return None
+def _ptt_prekey_s() -> float:
+    iface = _active_radio_iface[0]
+    return (iface.ptt_prekey_ms if iface else 250) / 1000
+
+
+def _ptt_tail_s() -> float:
+    iface = _active_radio_iface[0]
+    return (iface.ptt_tail_ms if iface else 400) / 1000
 
 
 def _ptt_open() -> None:
-    """Open AIOC serial port for PTT. Non-fatal — logs warning if unavailable."""
+    """Open the connected radio interface's serial port for PTT. Non-fatal —
+    logs a warning if no registered interface (AIOC, Digirig, ...) is found."""
     import serial as _ser
-    port = _find_aioc_port()
-    if not port:
-        log.warning("AIOC PTT unavailable (device 1209:7388 not found) — PTT disabled")
+    found = find_radio_port()
+    if not found:
+        log.warning("Radio PTT unavailable (no known radio interface found) — PTT disabled")
         _ptt_serial[0] = None
+        _active_radio_iface[0] = None
         return
+    iface, port = found
     try:
         s = _ser.Serial(port, timeout=0)
         s.dtr = False   # PTT released at open
         s.rts = False
         _ptt_serial[0] = s
-        log.info("AIOC PTT ready on %s — audio output will transmit over the air", port)
+        _active_radio_iface[0] = iface
+        log.info("%s PTT ready on %s (%s line) — audio output will transmit over the air",
+                 iface.name, port, iface.ptt_line.upper())
     except Exception as exc:
-        log.warning("AIOC PTT unavailable (%s) — PTT disabled", exc)
+        log.warning("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
         _ptt_serial[0] = None
+        _active_radio_iface[0] = None
 
 
 _AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
 _AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
 
 _AGC_PROFILE_RADIO = """\
-# RealTimeTalk AGC — Radio mode (AIOC).
+# RealTimeTalk AGC — Radio mode (active radio interface: AIOC, Digirig, ...).
 # voice_detection=false: WebRTC VAD suppresses audio that doesn't match
 #   its close-mic speech model; radio audio (FM pre-emphasis, weak signals,
 #   pauses between words) gets falsely attenuated, causing choppy playback.
@@ -613,7 +592,7 @@ context.modules = [
             aec.method = webrtc
             source.props = {{ node.name = "rtt_agc_source" node.description = "RTT AGC Mic (WebRTC)" }}
             sink.props   = {{ node.name = "rtt_agc_sink"   node.description = "RTT AGC Sink (unused reference)" }}
-            capture.props = {{ target.object = "{aioc_src}" }}
+            capture.props = {{ target.object = "{radio_src}" }}
             aec.args = {{
                 webrtc.gain_control = true webrtc.noise_suppression = true
                 webrtc.high_pass_filter = true webrtc.voice_detection = false
@@ -648,23 +627,24 @@ def _apply_agc_profile(radio: bool) -> None:
     and mic mode (gain_control=true), then hot-reload the echo-cancel module."""
     import time as _ta
     try:
-        # Reliable fallback sources — physical device names are stable across reboots
+        # Reliable fallback mic — physical device name is stable across reboots
         _FALLBACK_MIC  = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
-        _FALLBACK_AIOC = "alsa_input.usb-AIOC_All-In-One-Cable_f5250b7a-00.mono-fallback"
+        iface = _active_radio_iface[0]
         if radio:
-            aioc_src = _find_aioc_source() or _FALLBACK_AIOC
-            content = _AGC_PROFILE_RADIO.format(aioc_src=aioc_src)
+            radio_src = (find_radio_source(iface) if iface else find_radio_source()) \
+                        or (iface.fallback_source if iface else None) or _FALLBACK_MIC
+            content = _AGC_PROFILE_RADIO.format(radio_src=radio_src)
         else:
-            # Prefer: saved pre-AIOC source → any running physical mic → known C-Media fallback
+            # Prefer: saved pre-radio source → any running physical mic → known C-Media fallback
             # Never allow the virtual AGC source itself as source_master (self-referential loop)
             _candidates = [
-                _pre_aioc_mic[0],
+                _pre_radio_mic[0],
                 _find_always_on_mic_source(),
                 _FALLBACK_MIC,
             ]
             mic_src = next(
                 (s for s in _candidates
-                 if s and "rtt_agc" not in s and "AIOC" not in s and "All-In-One" not in s),
+                 if s and "rtt_agc" not in s and not is_radio_device_name(s, _resolved_radio_names[0])),
                 _FALLBACK_MIC
             )
             content = _AGC_PROFILE_MIC.format(mic_src=mic_src)
@@ -683,7 +663,7 @@ def _apply_agc_profile(radio: bool) -> None:
         subprocess.run(["pactl", "load-module", "module-echo-cancel",
                         "aec_method=webrtc",
                         f"source_name={AGC_SOURCE_NAME}",
-                        f"source_master={aioc_src if radio else mic_src}",
+                        f"source_master={radio_src if radio else mic_src}",
                         "sink_name=rtt_agc_sink",
                         f"aec_args=webrtc.gain_control=1 "
                         "webrtc.noise_suppression=1 webrtc.high_pass_filter=1 "
@@ -695,26 +675,36 @@ def _apply_agc_profile(radio: bool) -> None:
                        ], capture_output=True)
         _ta.sleep(0.3)
         subprocess.run(["pactl", "set-default-source", AGC_SOURCE_NAME], capture_output=True)
-        # Restore default sink: AIOC when radio, USB speaker when mic
+        # Restore default sink: radio interface when radio, USB speaker when mic
         if radio:
-            aioc_sink = _find_aioc_sink()
-            if aioc_sink:
-                subprocess.run(["pactl", "set-default-sink", aioc_sink], capture_output=True)
-                _apply_device_cal(aioc_sink)
-            subprocess.run(["pactl", "set-source-volume", aioc_src, f"{AIOC_SOURCE_VOLUME_PCT}%"],
+            radio_sink = find_radio_sink(iface) if iface else find_radio_sink()
+            if radio_sink:
+                subprocess.run(["pactl", "set-default-sink", radio_sink], capture_output=True)
+                _apply_device_cal(radio_sink)
+            vol_pct = iface.source_volume_pct if iface else 80
+            subprocess.run(["pactl", "set-source-volume", radio_src, f"{vol_pct}%"],
                            capture_output=True)
-            log.info("AIOC source volume set to %d%%", AIOC_SOURCE_VOLUME_PCT)
+            log.info("%s source volume set to %d%%", iface.name if iface else "Radio", vol_pct)
+            # Cache resolved names — needed so is_radio_device_name can recognize
+            # this device later even for usbid-correlated interfaces (Digirig)
+            # whose name isn't recognizable by substring alone.
+            _names = {radio_src}
+            if radio_sink:
+                _names.add(radio_sink)
+            _resolved_radio_names[0] = _names
         else:
             usb_spk = next((
-                l.split()[1] for l in subprocess.run(
+                _n for l in subprocess.run(
                     ["pactl", "list", "short", "sinks"], capture_output=True, text=True
                 ).stdout.splitlines()
-                if "Generic_USB2.0" in l or ("USB2.0" in l and "AIOC" not in l)
+                if len(l.split()) > 1 and (_n := l.split()[1])
+                and ("Generic_USB2.0" in _n
+                     or ("USB2.0" in _n and not is_radio_device_name(_n, _resolved_radio_names[0])))
             ), None)
             if usb_spk:
                 subprocess.run(["pactl", "set-default-sink", usb_spk], capture_output=True)
                 _apply_device_cal(usb_spk)
-        globals()['RAW_MIC_SOURCE'] = aioc_src if radio else mic_src
+        globals()['RAW_MIC_SOURCE'] = radio_src if radio else mic_src
         globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN
         _radio_profile_active[0] = radio
         log.info("AGC profile → %s (gain_control=%s, MIC_GAIN=%.0fx)",
@@ -742,14 +732,18 @@ def _apply_agc_profile(radio: bool) -> None:
 
 
 def _ptt_alive() -> bool:
-    """Return True if the AIOC serial port is open and the device is still connected.
-    Auto-opens and switches AGC mic to AIOC on hotplug; restores previous mic on unplug.
-    Reopens if the ttyACM port number changed after a reconnect."""
-    current_port = _find_aioc_port()
+    """Return True if a registered radio interface's serial port is open and the
+    device is still connected. Auto-opens and switches AGC mic to the radio
+    interface on hotplug; restores previous mic on unplug. Reopens if the port
+    path changed after a reconnect."""
+    found = find_radio_port()
+    current_port = found[1] if found else None
     if _ptt_serial[0]:
         # Check if port path changed (e.g. ttyACM0 → ttyACM1 after replug)
         if current_port and _ptt_serial[0].port != current_port:
-            log.info("AIOC port changed %s → %s — reopening", _ptt_serial[0].port, current_port)
+            log.info("%s port changed %s → %s — reopening",
+                     _active_radio_iface[0].name if _active_radio_iface[0] else "Radio",
+                     _ptt_serial[0].port, current_port)
             try: _ptt_serial[0].close()
             except Exception: pass
             _ptt_serial[0] = None
@@ -757,47 +751,63 @@ def _ptt_alive() -> bool:
         if current_port:
             _ptt_open()
             if _ptt_serial[0]:
-                # AIOC just appeared — save current mic, switch AGC to AIOC + radio profile
-                _pre_aioc_mic[0] = globals().get("RAW_MIC_SOURCE")
+                # Radio interface just appeared — save current mic, switch AGC to radio profile
+                apply_alsa_mixer_fixups(_active_radio_iface[0])
+                _pre_radio_mic[0] = globals().get("RAW_MIC_SOURCE")
                 _radio_profile_active[0] = True
-                aioc_src = _find_aioc_source()
-                if aioc_src:
+                radio_src = find_radio_source(_active_radio_iface[0])
+                if radio_src:
+                    _names = {radio_src}
+                    radio_snk = find_radio_sink(_active_radio_iface[0])
+                    if radio_snk:
+                        _names.add(radio_snk)
+                    _resolved_radio_names[0] = _names
                     import threading as _tptt
                     _tptt.Thread(target=_apply_agc_profile, args=(True,), daemon=True).start()
         return _ptt_serial[0] is not None
-    if not _find_aioc_port():
+    if not find_radio_port():
         try:
             _ptt_serial[0].close()
         except Exception:
             pass
+        _iface_name = _active_radio_iface[0].name if _active_radio_iface[0] else "Radio"
         _ptt_serial[0] = None
+        _active_radio_iface[0] = None
+        _resolved_radio_names[0] = set()
         _is_tx[0] = False
-        log.info("AIOC disconnected — PTT disabled, restoring mic AGC profile")
+        log.info("%s disconnected — PTT disabled, restoring mic AGC profile", _iface_name)
         _radio_profile_active[0] = False
         # Stop monitor loopback — source device is gone
-        if _aioc_monitor_module[0] is not None:
+        if _radio_monitor_module[0] is not None:
             try:
                 subprocess.run(["pactl", "unload-module",
-                                str(_aioc_monitor_module[0])], capture_output=True)
+                                str(_radio_monitor_module[0])], capture_output=True)
             except Exception:
                 pass
-            _aioc_monitor_module[0] = None
-            _aioc_monitor_sink[0] = None
-            log.info("AIOC monitor loopback stopped (AIOC disconnected)")
+            _radio_monitor_module[0] = None
+            _radio_monitor_sink[0] = None
+            log.info("Radio monitor loopback stopped (%s disconnected)", _iface_name)
         import threading as _tptt2
         _tptt2.Thread(target=_apply_agc_profile, args=(False,), daemon=True).start()
-        _pre_aioc_mic[0] = None
+        _pre_radio_mic[0] = None
         return False
     return True
 
 
 def _ptt_key() -> None:
-    """Assert PTT via AIOC serial DTR. Sets _is_tx so transcripts are suppressed."""
+    """Assert PTT via the active radio interface's serial line (DTR or RTS,
+    per its RadioInterface.ptt_line). Sets _is_tx so transcripts are suppressed."""
     s = _ptt_serial[0]
+    iface = _active_radio_iface[0]
+    line = iface.ptt_line if iface else "dtr"
+    def _assert(sr):
+        if line == "rts":
+            sr.rts = True; sr.dtr = False
+        else:
+            sr.dtr = True; sr.rts = False
     if s:
         try:
-            s.dtr = True
-            s.rts = False
+            _assert(s)
         except Exception as exc:
             log.warning("PTT key failed: %s — reopening port", exc)
             try: s.close()
@@ -806,21 +816,26 @@ def _ptt_key() -> None:
             _ptt_open()   # reopen on new port number
             s2 = _ptt_serial[0]
             if s2:
-                try: s2.dtr = True; s2.rts = False
+                try: _assert(s2)
                 except Exception as exc2: log.warning("PTT key retry failed: %s", exc2)
     _is_tx[0] = True
 
 
 def _ptt_release() -> None:
-    """Release PTT via AIOC serial DTR."""
+    """Release PTT via the active radio interface's serial line."""
     import time as _ptr
     if _is_tx[0] and _radio_profile_active[0]:
         # Only trigger the TX display window when we were actually transmitting
         _tx_display_until[0] = _ptr.time() + 10
     s = _ptt_serial[0]
+    iface = _active_radio_iface[0]
+    line = iface.ptt_line if iface else "dtr"
     if s:
         try:
-            s.dtr = False
+            if line == "rts":
+                s.rts = False
+            else:
+                s.dtr = False
         except Exception as exc:
             log.warning("PTT release failed: %s", exc)
     _is_tx[0] = False
@@ -2000,16 +2015,16 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 else:
                     consec = 0
 
-        # If AIOC PTT is available, route audio to the AIOC sink and key the radio.
+        # If a radio interface's PTT is available, route audio to its sink and key the radio.
         import time as _ptt_t
-        _aioc_sink = _find_aioc_sink() if (_ptt_alive() and _radio_profile_active[0]) else None
-        _use_ptt   = bool(_aioc_sink)
+        _radio_sink = _find_radio_sink() if (_ptt_alive() and _radio_profile_active[0]) else None
+        _use_ptt   = bool(_radio_sink)
 
         # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
         # Bluetooth handling than aplay -D default (ALSA compat layer).
-        # When AIOC is active, always route through its PipeWire sink via paplay.
+        # When a radio interface is active, always route through its PipeWire sink via paplay.
         if _use_ptt:
-            _play_cmd = ["paplay", f"--device={_aioc_sink}", final_wav]
+            _play_cmd = ["paplay", f"--device={_radio_sink}", final_wav]
         elif alsa_output in ("default", "pulse"):
             _play_cmd = ["paplay", final_wav]
         else:
@@ -2018,7 +2033,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
 
         if _use_ptt:
             _ptt_key()
-            _ptt_t.sleep(AIOC_PTT_PREKEY_MS / 1000)
+            _ptt_t.sleep(_ptt_prekey_s())
             log.info("PTT keyed — transmitting")
 
         _is_speaking[0] = True
@@ -2039,7 +2054,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _is_speaking[0] = False
 
         if _use_ptt:
-            _ptt_t.sleep(AIOC_PTT_TAIL_MS / 1000)
+            _ptt_t.sleep(_ptt_tail_s())
             _ptt_release()
             log.info("PTT released")
 
@@ -2401,6 +2416,12 @@ class RealtimeSession:
         import time as _tcb2
         if self._busy.is_set() or _tcb2.time() < _post_busy_until[0]:
             return  # discard mic input while Five is speaking or during echo gate
+        if _is_tx[0]:
+            return  # PTT asserted by something outside this session (e.g. Playback's
+                     # on-air retransmit, which keys PTT from its own background
+                     # thread and never sets self._busy) — mute here too, or that
+                     # audio (and any TX->RX crosstalk) gets sent to OpenAI before
+                     # the transcript-level _is_tx check downstream discards the text
         if _enroll_active[0]:
             return  # enrollment recording in progress — keep it out of transcription
         if raw_peak < MIC_GATE_PEAK:
@@ -3480,6 +3501,24 @@ async function clearProfile() {{
                 _prof_html = (f"<table style='border-collapse:collapse;font-size:13px;margin:10px 0;'>"
                               f"<tr><th>Digit</th><th>Row Hz</th><th>Col Hz</th><th>Samples</th></tr>"
                               f"{_prof_rows}</table>") if _prof_rows else "<p style='color:#475569'>No profiles trained yet.</p>"
+                _dtmf_ref_rows = "".join(
+                    f"<tr><td style='padding:3px 10px;font-weight:bold'>{_seq}</td>"
+                    f"<td style='padding:3px 10px;'>{_name}</td>"
+                    f"<td style='padding:3px 10px;'>{_effect}</td></tr>"
+                    for _seq, _name, _effect in (
+                        (DTMF_WAKE_SEQ,         "Wake",         "activate (cancels Sleep, goes fully active)"),
+                        (DTMF_SLEEP_SEQ,        "Sleep",        "go Silent (passive, 10-min idle disconnect)"),
+                        (DTMF_DEEPSLEEP_SEQ,    "Deep Sleep",   "disconnect immediately (skip 10-min wait)"),
+                        (DTMF_WAKE_SILENT_SEQ,  "Wake-Silent",  "wake from Deep Sleep into Silent (no routing)"),
+                        (DTMF_MONITOR_ON_SEQ,   "Monitor ON",   "start passive transcription monitoring"),
+                        (DTMF_MONITOR_OFF_SEQ,  "Monitor OFF",  "stop monitoring"),
+                    ))
+                _dtmf_ref_html = (
+                    "<h3 style='color:#94a3b8;font-size:14px;margin:18px 0 6px;'>DTMF Command Reference</h3>"
+                    "<table style='border-collapse:collapse;font-size:13px;margin:6px 0;'>"
+                    "<tr><th>Seq</th><th>Name</th><th>Effect</th></tr>"
+                    f"{_dtmf_ref_rows}</table>"
+                ) if _mode == "monitor" else ""
                 _cmd_map = {"monitor": f"python3 {_script}",
                             "train":   f"python3 {_script} --train",
                             "retrain": f"python3 {_script} --retrain"}
@@ -3506,6 +3545,7 @@ table{{border:1px solid #1a2535;}} th{{background:#0d1119;padding:6px 12px;color
 <h2>{_titles[_mode]}</h2>
 <p>Profiles: <b>{_n} digit(s) trained</b>  |  File: <code style='font-size:11px'>{DTMF_PROFILE_FILE}</code></p>
 {_prof_html}
+{_dtmf_ref_html}
 <hr style='border-color:#1a2535;margin:14px 0;'>
 {'<p style="color:#34d399;">&#10003; Terminal launched (xterm)</p>' if _launched else '<p style="color:#64748b;font-size:12px;">xterm not available — run from terminal:</p>'}
 <div class='cmd'><span id='cmd'>{_cmd_map[_mode]}</span><button class='copybtn' onclick='copyCmd()'>Copy</button></div>
@@ -3569,7 +3609,7 @@ Restart daemon after training to reload profiles.</p>
                        if _playback_active[0] else
                        'color:#475569;border-color:#334155;')
                     + '" title="Detect a radio transmission (squelch), record it, and transmit it back on-air by keying PTT until playback finishes">'
-                    + '&#9654; Playback' + ('&nbsp;&#10003;' if _playback_active[0] else '')
+                    + '&#9654; EchoTest' + ('&nbsp;&#10003;' if _playback_active[0] else '')
                     + '</button>'
                 ) if _radio_profile_active[0] else ""
                 _voice_enrolled = _owner_profile[0] is not None
@@ -3716,7 +3756,7 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   {_voice_id_btn}
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
-  <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _aioc_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _aioc_monitor_module[0] is not None else ''}</button>
+  <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _radio_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _radio_monitor_module[0] is not None else ''}</button>
   {_playback_btn}
   {_dtmf_btns}
 </div>
@@ -3878,10 +3918,10 @@ function toggleAiocPlayback(){{
     const pb=document.getElementById('playbackbtn');
     if(!pb) return;
     if(d.active){{
-      pb.innerHTML='&#9654; Playback&nbsp;&#10003;';
+      pb.innerHTML='&#9654; EchoTest&nbsp;&#10003;';
       pb.style.color='#34d399';pb.style.borderColor='#34d399';pb.style.background='#021a0e';
     }} else {{
-      pb.innerHTML='&#9654; Playback';
+      pb.innerHTML='&#9654; EchoTest';
       pb.style.color='#475569';pb.style.borderColor='#334155';pb.style.background='';
     }}
   }});
@@ -3942,8 +3982,8 @@ function loadDevices(){{
     if(d.error){{out.innerHTML='<span style="color:#f55">Error: '+d.error+'</span>';return;}}
     let h='';
     const monSink=d.monitor_sink||null;
-    const aiocAvail=!!(d.sinks||[]).find(s=>s.name.includes('AIOC')||s.name.includes('All-In-One'));
-    const showMonCol=aiocAvail||!!monSink; // show Monitor column if AIOC present OR loopback active
+    const radioSink=d.radio_sink||null;
+    const showMonCol=!!radioSink||!!monSink; // show Monitor column if a radio interface is present OR loopback active
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
     h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th>'
       +(showMonCol?'<th style="color:#34d399;white-space:nowrap">&#128266; Monitor</th>':'')
@@ -3952,7 +3992,7 @@ function loadDevices(){{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
       const active=(s.name===d.default_sink);
       const monitoring=(s.name===monSink);
-      const isAioc=(s.name.includes('AIOC')||s.name.includes('All-In-One'));
+      const isRadio=(s.name===radioSink);
       const stateLabel=monitoring
         ?'<span style="color:#34d399;font-weight:bold">Monitoring</span>'
         :s.state==='SUSPENDED'?'Idle'
@@ -3962,13 +4002,13 @@ function loadDevices(){{
         +'<td>'+(s.desc||s.name)+(active?' <span style="color:#5f5">✓</span>':'')+'</td>'
         +'<td style="white-space:nowrap">'+(s.card?'card '+s.card:'BT')+'</td>'
         +'<td>'+stateLabel+'</td>'
-        +'<td>'+(isAioc?'':('<button class="use-btn'+(active?' active':'')+'"'
+        +'<td>'+(isRadio?'':('<button class="use-btn'+(active?' active':'')+'"'
           +' data-dtype="sink" data-dname="'+s.name+'"'
           +' onclick="setDevice(this.dataset.dtype,this.dataset.dname)"'
           +(active?' disabled':'')
           +'>'+(active?'Active':'Use')+'</button>'))+'</td>'
         +(showMonCol?'<td style="text-align:center">'
-          +(isAioc?'—':('<button class="use-btn'+(monitoring?' active':'')+'"'
+          +(isRadio?'—':('<button class="use-btn'+(monitoring?' active':'')+'"'
             +' data-sink="'+s.name+'"'
             +' onclick="setAiocMonitor(this.dataset.sink)" style="padding:3px 10px;'
             +(monitoring?'color:#34d399;border-color:#34d399;background:#021a0e;':'')
@@ -4323,8 +4363,8 @@ setInterval(upd, 2000);
                 # When Radio profile is active, keys PTT before each playback iteration.
                 _headset_cal_loop[0] = True
                 _use_radio  = _radio_profile_active[0]
-                _aioc_sink_name  = _find_aioc_sink() if _use_radio else None
-                _mon_sink_name   = _aioc_monitor_sink[0]   # monitor device if active
+                _aioc_sink_name  = _find_radio_sink() if _use_radio else None
+                _mon_sink_name   = _radio_monitor_sink[0]   # monitor device if active
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 def _loop(alsa=alsa, radio=_use_radio,
                           aioc_sink=_aioc_sink_name, mon_sink=_mon_sink_name):
@@ -4341,7 +4381,7 @@ setInterval(upd, 2000);
                             if radio and aioc_sink:
                                 # Radio profile active → PTT + transmit over AIOC
                                 _ptt_key()
-                                _tl.sleep(AIOC_PTT_PREKEY_MS / 1000)
+                                _tl.sleep(_ptt_prekey_s())
                                 proc = _sp.Popen(["paplay", f"--device={aioc_sink}", _pre],
                                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             elif mon_sink:
@@ -4355,7 +4395,7 @@ setInterval(upd, 2000);
                             proc.wait()
                             _headset_cal_proc[0] = None
                             if radio and aioc_sink:
-                                _tl.sleep(AIOC_PTT_TAIL_MS / 1000)
+                                _tl.sleep(_ptt_tail_s())
                                 _ptt_release()
                                 _tl.sleep(1.0)   # pause between transmissions
                     finally:
@@ -4395,10 +4435,10 @@ setInterval(upd, 2000);
                 _in_tx = _tx_display_until[0] > _tadj.time() or _is_tx[0]
                 # Target: TX window → AIOC sink; monitor active → monitor sink; else → default
                 if _in_tx:
-                    sink = _find_aioc_sink() or subprocess.run(
+                    sink = _find_radio_sink() or subprocess.run(
                         ["pactl","get-default-sink"], capture_output=True,text=True).stdout.strip()
-                elif _aioc_monitor_sink[0]:
-                    sink = _aioc_monitor_sink[0]
+                elif _radio_monitor_sink[0]:
+                    sink = _radio_monitor_sink[0]
                 else:
                     sink = subprocess.run(["pactl","get-default-sink"],
                                           capture_output=True,text=True).stdout.strip()
@@ -4446,7 +4486,8 @@ setInterval(upd, 2000);
                 _trad.Thread(target=_apply_agc_profile, args=(go_radio,), daemon=True).start()
                 resp = _json.dumps({
                     "profile": "radio" if go_radio else "mic",
-                    "aioc_connected": _ptt_serial[0] is not None,
+                    "radio_connected": _ptt_serial[0] is not None,
+                    "radio_interface": _active_radio_iface[0].name if _active_radio_iface[0] else None,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -4460,7 +4501,7 @@ setInterval(upd, 2000);
                 _req_sink = _qs_am.get("sink", [None])[0]  # specific sink or None
 
                 def _start_loopback(target_sink):
-                    aioc_src = _find_aioc_source()
+                    aioc_src = _find_radio_source()
                     if not aioc_src or not target_sink:
                         return False
                     result = subprocess.run(
@@ -4470,24 +4511,24 @@ setInterval(upd, 2000);
                         capture_output=True, text=True)
                     mod_id = result.stdout.strip()
                     if mod_id.isdigit():
-                        _aioc_monitor_module[0] = int(mod_id)
-                        _aioc_monitor_sink[0]   = target_sink
-                        log.info("AIOC monitor → %s (module %s)",
+                        _radio_monitor_module[0] = int(mod_id)
+                        _radio_monitor_sink[0]   = target_sink
+                        log.info("Radio monitor → %s (module %s)",
                                  target_sink.split(".")[-1][:30], mod_id)
                         return True
                     return False
 
                 def _stop_loopback():
-                    if _aioc_monitor_module[0] is not None:
+                    if _radio_monitor_module[0] is not None:
                         subprocess.run(["pactl", "unload-module",
-                                        str(_aioc_monitor_module[0])], capture_output=True)
-                        _aioc_monitor_module[0] = None
-                        _aioc_monitor_sink[0]   = None
-                        log.info("AIOC monitor loopback stopped")
+                                        str(_radio_monitor_module[0])], capture_output=True)
+                        _radio_monitor_module[0] = None
+                        _radio_monitor_sink[0]   = None
+                        log.info("Radio monitor loopback stopped")
 
                 if _req_sink:
                     # Specific sink requested — toggle: if already on this sink, stop; else switch
-                    if _aioc_monitor_sink[0] == _req_sink:
+                    if _radio_monitor_sink[0] == _req_sink:
                         _stop_loopback()
                         active = False
                     else:
@@ -4495,24 +4536,25 @@ setInterval(upd, 2000);
                         active = _start_loopback(_req_sink)
                 else:
                     # No sink specified — toggle on/off using last sink or USB speaker fallback
-                    if _aioc_monitor_module[0] is not None:
+                    if _radio_monitor_module[0] is not None:
                         _stop_loopback()
                         active = False
                     else:
-                        # Use first available non-AIOC, non-monitor, non-agc sink
+                        # Use first available sink that isn't the radio interface itself,
+                        # a monitor, or the AGC's own sink
                         fallback = next(
-                            (l.split()[1] for l in subprocess.run(
+                            (_n for l in subprocess.run(
                                 ["pactl","list","short","sinks"],
                                 capture_output=True, text=True).stdout.splitlines()
-                             if l.split()[1:2] and
-                                "AIOC" not in l and "All-In-One" not in l and
-                                "monitor" not in l and "rtt_agc" not in l),
+                             if len(l.split()) > 1 and (_n := l.split()[1])
+                                and not is_radio_device_name(_n, _resolved_radio_names[0])
+                                and "monitor" not in _n and "rtt_agc" not in _n),
                             None)
                         active = _start_loopback(fallback) if fallback else False
 
                 resp = _json.dumps({
-                    "active": _aioc_monitor_module[0] is not None,
-                    "sink":   _aioc_monitor_sink[0],
+                    "active": _radio_monitor_module[0] is not None,
+                    "sink":   _radio_monitor_sink[0],
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -4593,11 +4635,14 @@ setInterval(upd, 2000);
                             if m and m.group(1) not in _seen_cards:
                                 _seen_cards.add(m.group(1))
                                 alsa_cards.append({"num": m.group(1), "id": m.group(2), "name": m.group(3)})
+                    _di = _active_radio_iface[0]
                     data = {
                         "default_sink":   default_sink,
                         "default_source": default_source,
                         "raw_mic_source": RAW_MIC_SOURCE,  # physical mic behind AGC
-                        "monitor_sink":   _aioc_monitor_sink[0],  # active AIOC loopback sink
+                        "monitor_sink":   _radio_monitor_sink[0],  # active radio loopback sink
+                        "radio_sink":     (_find_radio_sink() if _di else None),  # active radio interface's own sink, if any
+                        "radio_source":   (_find_radio_source() if _di else None),
                         "agc_source":     AGC_SOURCE_NAME,
                         "sinks":   sinks,
                         "sources": sources,
@@ -4699,7 +4744,7 @@ setInterval(upd, 2000);
 
                 if _in_tx_window or _is_tx[0]:
                     # Show AIOC TX levels in red during and for 10s after transmission
-                    _aioc_snk = _find_aioc_sink()
+                    _aioc_snk = _find_radio_sink()
                     if _aioc_snk:
                         _vo = subprocess.run(["pactl","get-sink-volume",_aioc_snk],
                                              capture_output=True,text=True).stdout
@@ -4708,9 +4753,9 @@ setInterval(upd, 2000);
                         _status["speaker_name"] = "All-In-One-Cable (TX)"
                     _status["tx_mode"] = True
                     _status["tx_remaining"] = _tx_remaining
-                elif _aioc_monitor_sink[0]:
+                elif _radio_monitor_sink[0]:
                     # Show monitor device levels so user can adjust monitoring volume
-                    _mon = _aioc_monitor_sink[0]
+                    _mon = _radio_monitor_sink[0]
                     _vo = subprocess.run(["pactl","get-sink-volume",_mon],
                                          capture_output=True,text=True).stdout
                     _vm = _rvol.search(r'(\d+)%', _vo)
@@ -4828,11 +4873,12 @@ setInterval(upd, 2000);
                     )
                     _device_change_msg[0] = ""
                 elif _radio_profile_active[0]:
-                    # Persistent warning only when Radio profile is active (not just AIOC connected)
+                    # Persistent warning only when Radio profile is active (not just the radio interface connected)
+                    _banner_iface = _active_radio_iface[0].name if _active_radio_iface[0] else "RADIO"
                     device_banner = (
                         '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
                         'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
-                        '&#128225; AIOC ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
+                        f'&#128225; {_banner_iface.upper()} ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
                         '</div>'
                     )
                 elif _owner_only[0] and not _verification_available():
@@ -5080,8 +5126,24 @@ def _decode_with_profiles(frame, profiles: dict):
     return best
 
 
+def _radio_hotplug_watcher() -> None:
+    """Background thread: periodically calls _ptt_alive() so plugging in a
+    radio interface (AIOC, Digirig, ...) reliably switches PipeWire's default
+    source/sink to it and activates Radio Mode, independent of anyone loading
+    the /dashboard page. Previously _ptt_alive() only ran as a side effect of
+    that page's own device-change check, so hotplug went undetected — and
+    Radio Mode stayed off — until someone happened to open the dashboard."""
+    import time as _hpw_time
+    while True:
+        try:
+            _ptt_alive()
+        except Exception as exc:
+            log.warning("Radio hotplug watcher error: %s", exc)
+        _hpw_time.sleep(3)
+
+
 def _dtmf_listener() -> None:
-    """Monitor AIOC audio for DTMF sequences.
+    """Monitor the active radio interface's audio for DTMF sequences.
 
     When learned profiles exist (~/.config/rtt/dtmf_profiles.json):
       Uses custom Goertzel detector with radio-specific frequencies.
@@ -5090,7 +5152,7 @@ def _dtmf_listener() -> None:
     When no profiles:
       Falls back to pacat → sox → multimon-ng pipeline.
 
-    Runs as a daemon thread; restarts automatically on AIOC disconnect.
+    Runs as a daemon thread; restarts automatically on radio disconnect.
     """
     import time as _td, re as _re_dtmf
     import numpy as _np_dtmf
@@ -5178,17 +5240,19 @@ def _dtmf_listener() -> None:
     _cos_until  = [0.0]
 
     while True:
-        aioc_src = _find_aioc_source()
-        if not aioc_src:
+        found = find_radio_source_with_iface()
+        if not found:
             _td.sleep(3); continue
+        _dtmf_iface, aioc_src = found
+        _dtmf_cos_thr = _dtmf_iface.cos_threshold
 
         profiles = _load_dtmf_profiles()
 
         if profiles:
             # ── Goertzel path with learned profiles ──────────────────────
             log.info("DTMF listener ready via learned profiles "
-                     "(wake=%s sleep=%s COS≥%d)",
-                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ, DTMF_COS_THRESHOLD)
+                     "(wake=%s sleep=%s %s COS≥%d)",
+                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ, _dtmf_iface.name, _dtmf_cos_thr)
             try:
                 proc = subprocess.Popen(
                     ["pacat", "--record", "--raw", "--format=s16le",
@@ -5200,14 +5264,14 @@ def _dtmf_listener() -> None:
                 prev_dig = [None]; hold = [0]
                 acc = _np_dtmf.array([], dtype=_np_dtmf.int16)  # rolling 48kHz accumulator
 
-                while _find_aioc_source():
+                while _find_radio_source():
                     chunk = proc.stdout.read(_CHUNK48)
                     if not chunk: break
                     raw   = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
                     peak  = int(_np_dtmf.max(_np_dtmf.abs(raw)))
                     now   = _td.time()
                     # COS detection on raw 48kHz level
-                    if peak > DTMF_COS_THRESHOLD:
+                    if peak > _dtmf_cos_thr:
                         _cos_until[0] = now + DTMF_COS_TAIL_S
                     cos_open = now < _cos_until[0]
                     if not cos_open:
@@ -5264,7 +5328,7 @@ def _dtmf_listener() -> None:
                     m    = _DTMF_PAT.match(line)
                     if not m: continue
                     seq_ref[0] = _handle_digit(m.group(1), now, seq_ref)
-                    if not _find_aioc_source(): break
+                    if not _find_radio_source(): break
             except Exception as exc:
                 log.warning("DTMF multimon-ng error: %s", exc)
             finally:
@@ -5278,7 +5342,7 @@ def _dtmf_listener() -> None:
 def _playback_worker() -> None:
     """Single always-on daemon thread: serially transmits captured segments
     from _playback_queue back out over the radio — keys PTT, plays the clip
-    to the AIOC's TX sink, releases PTT once playback finishes. If PTT/radio
+    to the radio interface's TX sink, releases PTT once playback finishes. If PTT/radio
     isn't available, the segment is just dropped with a log line (never
     falls back to local playback). Sets a cooldown after each transmission
     so _playback_listener doesn't immediately re-capture our own tail/echo
@@ -5290,9 +5354,9 @@ def _playback_worker() -> None:
         if not (_ptt_alive() and _radio_profile_active[0]):
             log.debug("Playback: captured %.1fs but radio/PTT unavailable — dropped", secs)
             continue
-        sink = _find_aioc_sink()
+        sink = _find_radio_sink()
         if not sink:
-            log.debug("Playback: captured %.1fs but no AIOC sink found — dropped", secs)
+            log.debug("Playback: captured %.1fs but no radio sink found — dropped", secs)
             continue
         wav_path = _pw_tf.mktemp(suffix=".wav")
         try:
@@ -5302,10 +5366,10 @@ def _playback_worker() -> None:
                 wf.setframerate(48000)      # native pacat capture rate
                 wf.writeframes(pcm_bytes)
             _ptt_key()
-            _pw_time.sleep(AIOC_PTT_PREKEY_MS / 1000)
+            _pw_time.sleep(_ptt_prekey_s())
             log.info("Playback: PTT keyed — transmitting %.1fs on-air", secs)
             rc = subprocess.call(["paplay", f"--device={sink}", wav_path], stderr=subprocess.DEVNULL)
-            _pw_time.sleep(AIOC_PTT_TAIL_MS / 1000)
+            _pw_time.sleep(_ptt_tail_s())
             _ptt_release()
             log.info("Playback: PTT released")
             if rc == 0:
@@ -5326,9 +5390,14 @@ def _playback_listener(stop_flag: list) -> None:
     DTMF_COS_TAIL_S hangover — and hand the captured audio to _playback_worker,
     which transmits it back out over the radio (on-air) via PTT. No OpenAI/
     transcription involvement; independent pacat reader from the DTMF
-    listener's so neither can affect the other. Ignores new segments during
-    the post-transmit cooldown window (_playback_cooldown_until) so it
-    doesn't re-capture our own tail/echo as another transmission."""
+    listener's so neither can affect the other. Ignores audio both during any
+    active PTT-keyed transmission (_is_tx) and for a cooldown window after one
+    ends (_playback_cooldown_until) — confirmed necessary, not just belt-and-
+    suspenders: Digirig has measurable TX-into-RX crosstalk, and without the
+    _is_tx gate the listener kept watching through the ENTIRE duration of our
+    own transmission, capturing the bleed-through as a same-length "new"
+    segment that queued the instant PTT released — a self-sustaining echo
+    chamber that decayed over several cycles rather than being blocked outright."""
     import time as _pl_time
     import numpy as _pl_np
 
@@ -5337,12 +5406,14 @@ def _playback_listener(stop_flag: list) -> None:
     _MAX_BYTES = int(PLAYBACK_MAX_SECS * _RATE48 * 2)
 
     while not stop_flag[0]:
-        aioc_src = _find_aioc_source()
-        if not aioc_src:
+        found = find_radio_source_with_iface()
+        if not found:
             _pl_time.sleep(3); continue
+        _pb_iface, aioc_src = found
+        _pb_cos_thr = _pb_iface.cos_threshold
 
-        log.info("Playback listener ready (COS>=%d, tail=%.1fs, min=%.1fs) — on-air replay",
-                 DTMF_COS_THRESHOLD, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
+        log.info("Playback listener ready via %s (COS>=%d, tail=%.1fs, min=%.1fs) — on-air replay",
+                 _pb_iface.name, _pb_cos_thr, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
         proc = None
         try:
             proc = subprocess.Popen(
@@ -5351,24 +5422,43 @@ def _playback_listener(stop_flag: list) -> None:
                  f"--device={aioc_src}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            cos_until   = 0.0
-            was_open    = False
-            seg_buf     = bytearray()
+            cos_until       = 0.0
+            was_open        = False
+            seg_buf         = bytearray()
+            _prev_tx        = False
+            _ext_tx_grace_until = 0.0
 
-            while not stop_flag[0] and _find_aioc_source():
+            while not stop_flag[0] and _find_radio_source():
                 chunk = proc.stdout.read(_CHUNK48)
                 if not chunk:
                     break
                 now = _pl_time.time()
-                if now < _playback_cooldown_until[0]:
-                    # In post-transmit cooldown — ignore audio so we don't
-                    # re-capture our own tail/echo as a fresh transmission.
+                # Any PTT release (not just our own worker's on-air retransmit —
+                # speak() replies, the calibration test loop, etc. all key the
+                # same shared _is_tx) can leave a brief crosstalk/decay tail on
+                # Digirig that outlasts the moment _is_tx clears. Give every
+                # PTT-release a grace window here too, not just our own worker's
+                # (which sets _playback_cooldown_until separately) — confirmed
+                # necessary: without it, a release with no cooldown of its own
+                # let one spurious short segment through immediately afterward.
+                if _is_tx[0]:
+                    _prev_tx = True
+                elif _prev_tx:
+                    _prev_tx = False
+                    _ext_tx_grace_until = now + PLAYBACK_COOLDOWN_S
+                if _is_tx[0] or now < _playback_cooldown_until[0] or now < _ext_tx_grace_until:
+                    # Either a transmission is actively in progress (any PTT source,
+                    # not just our own — TX-into-RX crosstalk means we'd otherwise
+                    # hear ourselves for the full duration), in our own worker's
+                    # post-transmit cooldown, or in the grace window after some
+                    # other PTT release — ignore audio in all cases so we don't
+                    # capture our own bleed/tail/echo as a fresh transmission.
                     was_open = False
                     seg_buf = bytearray()
                     continue
                 raw  = _pl_np.frombuffer(chunk, dtype=_pl_np.int16)
                 peak = int(_pl_np.max(_pl_np.abs(raw))) if len(raw) else 0
-                if peak > DTMF_COS_THRESHOLD:
+                if peak > _pb_cos_thr:
                     cos_until = now + DTMF_COS_TAIL_S
                 cos_open = now < cos_until
 
@@ -5512,8 +5602,8 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             _snk = _snk_m.group(1) if _snk_m else None
             if _src and _src in _source_names:
                 # Valid loopback — restore tracking state
-                _aioc_monitor_module[0] = int(_mid)
-                _aioc_monitor_sink[0]   = _snk
+                _radio_monitor_module[0] = int(_mid)
+                _radio_monitor_sink[0]   = _snk
                 log.info("Restored monitor loopback module %s → %s",
                          _mid, (_snk or '?').split('.')[-1][:30])
             else:
@@ -5522,29 +5612,39 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                 log.info("Cleaned up stale loopback module %s (source gone)", _mid)
     except Exception:
         pass
-    _ptt_open()                 # open AIOC serial port if present; non-fatal if absent
+    _ptt_open()                 # open connected radio interface's serial port if present; non-fatal if absent
     if _ptt_serial[0] is not None:
+        _iface = _active_radio_iface[0]
+        _iface_name = _iface.name if _iface else "Radio"
+        if _iface:
+            apply_alsa_mixer_fixups(_iface)
         # Check conf file to determine actual profile (user may have switched to mic mode)
         try:
-            import re as _re_agc
             _agc_content = open(_AGC_CONF).read()
             _is_radio_conf = ("gain_control = false" in _agc_content or
+                              (_iface and _iface.name in _agc_content) or
                               "AIOC" in _agc_content or "All-In-One" in _agc_content)
         except Exception:
             _is_radio_conf = True  # default to radio if can't read conf
         if _is_radio_conf:
             globals()['MIC_GAIN'] = AGC_MIC_GAIN_RADIO
             _radio_profile_active[0] = True
-            _aioc_src_startup = _find_aioc_source()
-            if _aioc_src_startup:
-                subprocess.run(["pactl", "set-source-volume", _aioc_src_startup,
-                                f"{AIOC_SOURCE_VOLUME_PCT}%"], capture_output=True)
-            log.info("AIOC present at startup — radio profile active, MIC_GAIN=%.0fx",
-                     AGC_MIC_GAIN_RADIO)
+            _radio_src_startup = _find_radio_source()
+            if _radio_src_startup:
+                _vol_pct = _iface.source_volume_pct if _iface else 80
+                subprocess.run(["pactl", "set-source-volume", _radio_src_startup,
+                                f"{_vol_pct}%"], capture_output=True)
+                _names = {_radio_src_startup}
+                _radio_snk_startup = _find_radio_sink()
+                if _radio_snk_startup:
+                    _names.add(_radio_snk_startup)
+                _resolved_radio_names[0] = _names
+            log.info("%s present at startup — radio profile active, MIC_GAIN=%.0fx",
+                     _iface_name, AGC_MIC_GAIN_RADIO)
         else:
             _radio_profile_active[0] = False
-            log.info("AIOC present at startup — mic profile active (conf file), MIC_GAIN=%.0fx",
-                     AGC_MIC_GAIN)
+            log.info("%s present at startup — mic profile active (conf file), MIC_GAIN=%.0fx",
+                     _iface_name, AGC_MIC_GAIN)
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -5582,6 +5682,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     ).start()
     _thr.Thread(target=_dtmf_listener, daemon=True, name="dtmf-radio").start()
     _thr.Thread(target=_playback_worker, daemon=True, name="playback-worker").start()
+    _thr.Thread(target=_radio_hotplug_watcher, daemon=True, name="radio-hotplug").start()
 
     # Restore sleep state persisted across service restarts (e.g. mic device change)
     if _load_sleep_state():
