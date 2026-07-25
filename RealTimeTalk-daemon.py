@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.6.0"
+__version__ = "3.8.0"
 
 import argparse
 import asyncio
@@ -187,14 +187,16 @@ SPK_MIN_SECS      = 0.8          # segments shorter than this can't be verified 
 SPK_PREROLL_MS    = 500          # matches server VAD prefix_padding_ms so onsets aren't lost
 SPK_MAX_SEGMENT_SECS   = 25      # cap capture buffer growth on runaway VAD segments
 SPK_SEGMENT_STALE_SECS = 60      # drop unmatched segments older than this
-VOICE_PROFILE_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile.json")
-VOICE_MODE_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_voice_mode.json")
+VOICE_PROFILE_FILE       = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile.json")
+VOICE_PROFILE_RADIO_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_voice_profile_radio.json")
+VOICE_MODE_FILE          = os.path.expanduser("~/.openclaw/workspace/rtt_voice_mode.json")
 CAL_NEW_DEV_PW    = 1      # PipeWire % for unknown device (minimum safe)
 CAL_NEW_DEV_SW    = 0.10   # SW for unknown device (10% — clearly audible but not loud)
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
 # the interrupt threshold while Five is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 4000  # raw mic peak to trigger interrupt (AGC speech >> background)
 SPEAK_INTERRUPT_BLOCKS = 6     # × 50 ms = 300 ms sustained speech → interrupt
+SPEAK_COUPLING_EMA     = 0.15  # how fast the post-guard echo/coupling estimate tracks change
 
 CONVERSATION_LOG: list[dict] = []   # {"role":"you"/"five"/"system", "text":...}
 
@@ -449,12 +451,13 @@ _playback_queue = queue.Queue(maxsize=3)  # captured (secs, pcm_bytes) segments 
 _playback_cooldown_until: list = [0.0]  # epoch time; listener ignores new segments until this passes
 _tx_display_until:    list = [0.0]   # epoch until which Manual Adjustment shows TX (AIOC) levels
 _owner_only:          list = [False]  # owner-only mode: gate all voice on the enrolled profile
-_owner_only_pre_radio: list = [None]  # owner_only state to restore when radio mode turns off; None = no override pending
 _spk_threshold:       list = [SPK_THRESHOLD_DEFAULT]  # cosine pass mark
 _spk_extractor:       list = [None]   # lazy sherpa_onnx.SpeakerEmbeddingExtractor singleton
-_owner_profile:       list = [None]   # {"mean": ndarray, "samples": [ndarray,...]} or None
+_owner_profile:       list = [None]   # mic profile: {"mean": ndarray, "samples": [ndarray,...]} or None
+_owner_profile_radio: list = [None]   # radio-mode profile, same shape — used when radio is active
 _enroll_active:       list = [False]  # True while enrollment records; _mic_cb discards audio
 _enroll_staging:      dict = {}       # slot -> {"embedding": list, "secs": float, "lang": str}
+_enroll_staging_radio: dict = {}      # same, staged for the radio-mode profile
 _spk_threshold_cli:   list = [None]   # --spk-threshold override; wins over the mode file
 
 
@@ -711,22 +714,10 @@ def _apply_agc_profile(radio: bool) -> None:
                  "radio" if radio else "mic", not radio,
                  AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN)
 
-        # Owner-only voice verification can't reliably recognize a voice profile
-        # over radio audio (different frequency response/compression than the
-        # enrolled mic samples) — auto-disable while radio mode is active, and
-        # restore whatever the prior state was once radio mode turns back off.
-        if radio and _owner_only[0]:
-            _owner_only_pre_radio[0] = True
-            _owner_only[0] = False
-            _save_voice_mode()
-            log.info("Radio mode: owner-only voice verification disabled (unreliable over radio audio)")
-            _log_entry("system", "Radio mode on — owner-only voice mode disabled (voice verification is unreliable over radio audio).")
-        elif not radio and _owner_only_pre_radio[0]:
-            _owner_only[0] = True
-            _owner_only_pre_radio[0] = None
-            _save_voice_mode()
-            log.info("Radio mode off — owner-only voice verification restored")
-            _log_entry("system", "Radio mode off — owner-only voice mode restored.")
+        # Owner-only voice verification is less reliable over radio audio
+        # (different frequency response/compression than the enrolled mic
+        # samples), but it's the owner's call whether to keep it on — no
+        # auto-disable here. See _owner_only[0] toggles for the manual switch.
     except Exception as exc:
         log.warning("AGC profile switch failed: %s", exc)
 
@@ -1467,37 +1458,41 @@ def _compute_embedding(pcm_int16: np.ndarray, rate: int) -> np.ndarray | None:
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))   # inputs are L2-normalized
 
-def _owner_score(emb: np.ndarray) -> float:
+def _owner_score(emb: np.ndarray, radio: bool = False) -> float:
     """Max cosine over the profile mean + per-sample embeddings — max keeps
-    cross-language scoring robust since enrollment mixes EN and ZH samples."""
-    prof = _owner_profile[0]
+    cross-language scoring robust since enrollment mixes EN and ZH samples.
+    radio=True scores against the separate radio-mode profile."""
+    prof = _owner_profile_radio[0] if radio else _owner_profile[0]
     refs = [prof["mean"]] + prof["samples"]
     return max(_cosine(emb, r) for r in refs)
 
-def _load_voice_profile() -> bool:
+def _load_voice_profile(radio: bool = False) -> bool:
+    path   = VOICE_PROFILE_RADIO_FILE if radio else VOICE_PROFILE_FILE
+    target = _owner_profile_radio if radio else _owner_profile
     try:
-        with open(VOICE_PROFILE_FILE) as f:
+        with open(path) as f:
             data = json.load(f)
         samples = [np.asarray(s["embedding"], dtype=np.float32) for s in data["samples"]]
-        _owner_profile[0] = {"mean": np.asarray(data["mean"], dtype=np.float32),
-                             "samples": samples, "created": data.get("created", 0)}
-        log.info("Loaded voice profile: %d sample(s)", len(samples))
+        target[0] = {"mean": np.asarray(data["mean"], dtype=np.float32),
+                     "samples": samples, "created": data.get("created", 0)}
+        log.info("Loaded %s voice profile: %d sample(s)", "radio" if radio else "mic", len(samples))
         return True
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        _owner_profile[0] = None
+        target[0] = None
         return False
 
-def _save_voice_profile(samples: list[dict]) -> None:
+def _save_voice_profile(samples: list[dict], radio: bool = False) -> None:
     """samples: [{"lang","prompt","secs","embedding":[...]}]. Computes the mean."""
     embs = np.stack([np.asarray(s["embedding"], dtype=np.float32) for s in samples])
     mean = embs.mean(axis=0)
     mean = mean / np.linalg.norm(mean)
     data = {"version": 1, "model": "campplus_zh_en_advanced", "dim": int(embs.shape[1]),
             "created": time.time(), "samples": samples, "mean": mean.tolist()}
-    os.makedirs(os.path.dirname(VOICE_PROFILE_FILE), exist_ok=True)
-    with open(VOICE_PROFILE_FILE, "w") as f:
+    path = VOICE_PROFILE_RADIO_FILE if radio else VOICE_PROFILE_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump(data, f)
-    _load_voice_profile()
+    _load_voice_profile(radio)
 
 def _save_voice_mode() -> None:
     try:
@@ -1517,8 +1512,9 @@ def _load_voice_mode() -> None:
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         pass
 
-def _verification_available() -> bool:
-    return _owner_profile[0] is not None and _get_spk_extractor() is not None
+def _verification_available(radio: bool = False) -> bool:
+    prof = _owner_profile_radio[0] if radio else _owner_profile[0]
+    return prof is not None and _get_spk_extractor() is not None
 
 def _record_pcm_blocking(secs: float) -> np.ndarray:
     """Record from the default mic for enrollment/testing. Sets _enroll_active
@@ -1951,13 +1947,34 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _interrupted   = [False]
         _aplay_rc      = [0]
 
-        def _monitor_and_play(cmd):
+        def _monitor_and_play(cmd, radio_tx=False):
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+
+            if radio_tx:
+                # Known TX→RX crosstalk on this hardware (see the _is_tx guard in
+                # _mic_cb) makes the mic signal untrustworthy for barge-in detection
+                # while transmitting — the same reason transcription is muted during
+                # PTT. Don't self-interrupt on it; /interrupt still works.
+                while True:
+                    try:
+                        _aplay_rc[0] = proc.wait(timeout=0.05)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if _http_interrupt[0]:
+                        _http_interrupt[0] = False
+                        _interrupted[0] = True
+                        try: proc.kill()
+                        except Exception: pass
+                        break
+                return
+
             consec      = 0
             guard       = _GUARD_TICKS
             guard_max_out = 0   # peak output PCM during guard
             guard_max_mic = 0   # peak mic echo during guard
             interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
+            coupling: float | None = None
             tick_idx    = 0
             while True:
                 try:
@@ -1969,17 +1986,17 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                     p = _mic_level_current[0]
                 mic_peaks_during.append(p)
 
+                s0 = tick_idx * _TICK_SAMPLES
+                s1 = s0 + _TICK_SAMPLES
+                tick_out = (int(np.max(np.abs(_final_pcm[s0:s1])))
+                            if len(_final_pcm) and s1 <= len(_final_pcm) else 0)
+                tick_idx += 1
+
                 if guard > 0:
-                    # Measure output PCM for this tick to compute coupling
-                    s0 = tick_idx * _TICK_SAMPLES
-                    s1 = s0 + _TICK_SAMPLES
-                    if len(_final_pcm) and s1 <= len(_final_pcm):
-                        tick_out = int(np.max(np.abs(_final_pcm[s0:s1])))
-                        if tick_out > guard_max_out:
-                            guard_max_out = tick_out
+                    if tick_out > guard_max_out:
+                        guard_max_out = tick_out
                     if p > guard_max_mic:
                         guard_max_mic = p
-                    tick_idx += 1
                     guard -= 1
                     if guard == 0:
                         if guard_max_out > 200:
@@ -1995,6 +2012,17 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                             log.info("TTS no coupling data → threshold=%d (floor)",
                                      interrupt_threshold[0])
                     continue
+
+                # Keep tracking coupling past the initial 1s guard so a long or
+                # unevenly-loud reply doesn't outrun a threshold frozen from the
+                # start — but never learn from a tick that already looks like a
+                # real interruption, or a genuine barge-in would just get EMA'd away.
+                if tick_out > 200 and p <= interrupt_threshold[0]:
+                    local = p / tick_out
+                    coupling = local if coupling is None else (
+                        coupling * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                    interrupt_threshold[0] = max(
+                        int(_output_peak * coupling * _SAFETY), SPEAK_INTERRUPT_PEAK)
 
                 if _http_interrupt[0]:
                     _http_interrupt[0] = False
@@ -2039,12 +2067,12 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _is_speaking[0] = True
         if interruptible:
             _m = _threading.Thread(daemon=True, target=_monitor_and_play,
-                                   args=(_play_cmd,))
+                                   args=(_play_cmd,), kwargs={"radio_tx": _use_ptt})
             _m.start(); _m.join()
             if not _interrupted[0] and _aplay_rc[0] != 0 and _play_cmd != _play_fallback:
                 log.warning("playback failed on %s, retrying via paplay", alsa_output)
                 _m2 = _threading.Thread(daemon=True, target=_monitor_and_play,
-                                        args=(_play_fallback,))
+                                        args=(_play_fallback,), kwargs={"radio_tx": _use_ptt})
                 _m2.start(); _m2.join()
         else:
             # Non-interruptible: play to completion, no interrupt monitor
@@ -2613,8 +2641,9 @@ class RealtimeSession:
         segment = self._pop_segment()
         if not _owner_only[0]:
             return True
-        if not _verification_available():
-            return True   # not enrolled / model missing — dashboard banner covers this
+        radio = _radio_profile_active[0]
+        if not _verification_available(radio):
+            return True   # not enrolled for this audio path / model missing — dashboard banner covers this
         if segment is None:
             _log_entry("system", f"Voice check: no audio segment — ignored ({transcript[:40]!r})")
             return False
@@ -2627,7 +2656,7 @@ class RealtimeSession:
         if emb is None:
             log.warning("Voice check: embedding failed — accepting (fail-open)")
             return True
-        score = _owner_score(emb)
+        score = _owner_score(emb, radio)
         if score >= _spk_threshold[0]:
             log.info("Voice check PASS %.3f (%.1fs): %r", score, secs, transcript[:60])
             return True
@@ -2794,12 +2823,6 @@ class RealtimeSession:
                     "No voice profile enrolled yet. Use the web portal to enroll first.",
                     self.alsa_output)
                 return
-            if _radio_profile_active[0]:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak,
-                    "Owner only mode is disabled while radio mode is on — voice verification isn't reliable over radio audio.",
-                    self.alsa_output)
-                return
             if not _owner_only[0]:
                 _owner_only[0] = True
                 _save_voice_mode()
@@ -2808,6 +2831,14 @@ class RealtimeSession:
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Owner only mode on. I'll only listen to you.",
                     self.alsa_output)
+                if _radio_profile_active[0] and _owner_profile_radio[0] is None:
+                    _log_entry("system", "Note: no radio voice profile enrolled — "
+                                          "accepting all speakers over radio until you add one.")
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak,
+                        "Note: you haven't enrolled a radio voice profile, so I'll accept "
+                        "anyone over radio until you add one.",
+                        self.alsa_output)
             return
         if _matches_phrase(normalized, OWNER_ONLY_OFF_PHRASES):
             if _owner_only[0]:
@@ -3208,15 +3239,15 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 if want and not _verification_available():
                     _log_entry("system", "Cannot enable owner-only mode — no voice profile enrolled.")
                     log.info("HTTP ownermode: refused — not enrolled")
-                elif want and _radio_profile_active[0]:
-                    _log_entry("system", "Cannot enable owner-only mode — disabled while radio mode is on (voice verification unreliable over radio audio).")
-                    log.info("HTTP ownermode: refused — radio mode active")
                 elif want != _owner_only[0]:
                     _owner_only[0] = want
                     _save_voice_mode()
                     label = "Owner-only mode on." if want else "Everyone mode — listening to all voices."
                     log.info("HTTP ownermode: %s", "ON" if want else "OFF")
                     _log_entry("system", label)
+                    if want and _radio_profile_active[0] and _owner_profile_radio[0] is None:
+                        _log_entry("system", "Note: no radio voice profile enrolled — "
+                                              "accepting all speakers over radio until you add one.")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -3241,11 +3272,16 @@ def start_http_server(port: int, on_stop, session_ref: list):
 
             elif self.path.startswith("/voice-enroll/record"):
                 import json as _json, urllib.parse as _up
-                qs   = _up.parse_qs(_up.urlparse(self.path).query)
-                slot = qs.get("slot", ["0"])[0]
-                secs = max(2.0, min(10.0, float(qs.get("secs", ["5"])[0])))
-                lang = qs.get("lang", ["en"])[0]
-                if _get_spk_extractor() is None:
+                qs     = _up.parse_qs(_up.urlparse(self.path).query)
+                slot   = qs.get("slot", ["0"])[0]
+                secs   = max(2.0, min(10.0, float(qs.get("secs", ["5"])[0])))
+                lang   = qs.get("lang", ["en"])[0]
+                radio  = qs.get("target", ["mic"])[0] == "radio"
+                staging = _enroll_staging_radio if radio else _enroll_staging
+                if radio and not _radio_profile_active[0]:
+                    out = {"ok": False, "error": "Radio mode is off — turn it on (with a live "
+                                                  "signal coming in) before recording radio samples"}
+                elif _get_spk_extractor() is None:
                     out = {"ok": False, "error": "sherpa-onnx or model unavailable"}
                 elif _is_speaking[0]:
                     out = {"ok": False, "error": "Five is speaking — try again"}
@@ -3258,10 +3294,9 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     elif peak < 500:
                         out = {"ok": False, "error": f"too quiet (peak {peak}) — speak closer to the mic"}
                     else:
-                        _enroll_staging[slot] = {"embedding": emb.tolist(),
-                                                 "secs": secs, "lang": lang}
+                        staging[slot] = {"embedding": emb.tolist(), "secs": secs, "lang": lang}
                         out = {"ok": True, "slot": slot, "secs": secs, "peak": peak,
-                               "staged": len(_enroll_staging)}
+                               "staged": len(staging)}
                 resp = _json.dumps(out).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3269,18 +3304,22 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.end_headers()
                 self.wfile.write(resp)
 
-            elif self.path == "/voice-enroll/save":
-                import json as _json
-                if len(_enroll_staging) < 3:
-                    out = {"ok": False, "error": f"need 3 samples, have {len(_enroll_staging)}"}
+            elif self.path.startswith("/voice-enroll/save"):
+                import json as _json, urllib.parse as _up
+                qs      = _up.parse_qs(_up.urlparse(self.path).query)
+                radio   = qs.get("target", ["mic"])[0] == "radio"
+                staging = _enroll_staging_radio if radio else _enroll_staging
+                if len(staging) < 3:
+                    out = {"ok": False, "error": f"need 3 samples, have {len(staging)}"}
                 else:
                     samples = [{"lang": v["lang"], "prompt": k, "secs": v["secs"],
                                 "embedding": v["embedding"]}
-                               for k, v in sorted(_enroll_staging.items())]
-                    _save_voice_profile(samples)
-                    _enroll_staging.clear()
-                    _log_entry("system", "Voice profile enrolled (3 samples).")
-                    log.info("Voice profile saved: %d samples", len(samples))
+                               for k, v in sorted(staging.items())]
+                    _save_voice_profile(samples, radio)
+                    staging.clear()
+                    label = "Radio" if radio else "Mic"
+                    _log_entry("system", f"{label} voice profile enrolled (3 samples).")
+                    log.info("%s voice profile saved: %d samples", label, len(samples))
                     out = {"ok": True, "samples": len(samples)}
                 resp = _json.dumps(out).encode()
                 self.send_response(200)
@@ -3291,8 +3330,10 @@ def start_http_server(port: int, on_stop, session_ref: list):
 
             elif self.path == "/voice-enroll/test":
                 import json as _json
-                if not _verification_available():
-                    out = {"ok": False, "error": "no profile enrolled or model unavailable"}
+                radio = _radio_profile_active[0]
+                if not _verification_available(radio):
+                    out = {"ok": False, "error": f"no {'radio' if radio else 'mic'} profile "
+                                                  f"enrolled or model unavailable"}
                 elif _is_speaking[0]:
                     out = {"ok": False, "error": "Five is speaking — try again"}
                 else:
@@ -3301,10 +3342,11 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     if emb is None:
                         out = {"ok": False, "error": "embedding failed"}
                     else:
-                        score = _owner_score(emb)
+                        score = _owner_score(emb, radio)
                         out = {"ok": True, "score": round(score, 3),
                                "threshold": _spk_threshold[0],
-                               "pass": score >= _spk_threshold[0]}
+                               "pass": score >= _spk_threshold[0],
+                               "profile": "radio" if radio else "mic"}
                 resp = _json.dumps(out).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3312,19 +3354,27 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.end_headers()
                 self.wfile.write(resp)
 
-            elif self.path == "/voice-enroll/clear":
-                import json as _json
+            elif self.path.startswith("/voice-enroll/clear"):
+                import json as _json, urllib.parse as _up
+                qs    = _up.parse_qs(_up.urlparse(self.path).query)
+                radio = qs.get("target", ["mic"])[0] == "radio"
                 try:
-                    os.remove(VOICE_PROFILE_FILE)
+                    os.remove(VOICE_PROFILE_RADIO_FILE if radio else VOICE_PROFILE_FILE)
                 except FileNotFoundError:
                     pass
-                _owner_profile[0] = None
-                _enroll_staging.clear()
-                if _owner_only[0]:
-                    _owner_only[0] = False
-                    _save_voice_mode()
-                _log_entry("system", "Voice profile cleared — everyone mode.")
-                log.info("Voice profile cleared")
+                if radio:
+                    _owner_profile_radio[0] = None
+                    _enroll_staging_radio.clear()
+                    _log_entry("system", "Radio voice profile cleared.")
+                    log.info("Radio voice profile cleared")
+                else:
+                    _owner_profile[0] = None
+                    _enroll_staging.clear()
+                    if _owner_only[0]:
+                        _owner_only[0] = False
+                        _save_voice_mode()
+                    _log_entry("system", "Mic voice profile cleared — everyone mode.")
+                    log.info("Mic voice profile cleared")
                 resp = _json.dumps({"ok": True}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -3343,6 +3393,19 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     f"Profile enrolled {enrolled_since}" if enrolled
                     else "No profile enrolled" if model_ok
                     else "Speaker model unavailable — install sherpa-onnx + model first")
+                enrolled_radio = _owner_profile_radio[0] is not None
+                enrolled_radio_since = ""
+                if enrolled_radio and _owner_profile_radio[0].get("created"):
+                    enrolled_radio_since = datetime.datetime.fromtimestamp(
+                        _owner_profile_radio[0]["created"]).strftime("%Y-%m-%d %H:%M")
+                radio_status_line = (
+                    f"Radio profile enrolled {enrolled_radio_since}" if enrolled_radio
+                    else "No radio profile enrolled")
+                radio_on = _radio_profile_active[0]
+                radio_hint = ("" if radio_on else
+                    '<p class="info" style="color:var(--rd)">Radio mode is off — turn it on '
+                    '(dashboard) with a live signal coming in before recording these, or you\'ll '
+                    'just capture mic audio mislabeled as radio.</p>')
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Voice ID — RealTimeTalk</title>
@@ -3360,38 +3423,61 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <h3>&#127908; Voice ID enrollment</h3>
 <p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/calibration">&larr; calibration</a></p>
 <div class="meter"><div id="meter"></div></div>
+
+<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Mic Voice Profile</h3>
 <div class="card"><b>Sample 1 — English</b>
 <p class="info">Read aloud: &ldquo;Hey Jarvis, Five wake up. Please check my calendar and read me the news for today.&rdquo;</p>
-<button onclick="rec(this,'1','en')">&#9210; Record 5s</button> <span id="s1"></span></div>
+<button onclick="rec(this,'1','en','mic')">&#9210; Record 5s</button> <span id="mic-s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
 <p class="info">Read aloud: &ldquo;Five 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
-<button onclick="rec(this,'2','zh')">&#9210; Record 5s</button> <span id="s2"></span></div>
+<button onclick="rec(this,'2','zh','mic')">&#9210; Record 5s</button> <span id="mic-s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
-<button onclick="rec(this,'3','mixed')">&#9210; Record 5s</button> <span id="s3"></span></div>
+<button onclick="rec(this,'3','mixed','mic')">&#9210; Record 5s</button> <span id="mic-s3"></span></div>
 <div class="card">
-<button id="save" onclick="save()">&#128190; Save profile</button>
-<button onclick="test(this)">&#127897; Test my voice</button>
-<button onclick="clearProfile()" style="border-color:var(--rd)">&#10006; Clear profile</button>
+<button onclick="save('mic')">&#128190; Save mic profile</button>
+<button onclick="clearProfile('mic')" style="border-color:var(--rd)">&#10006; Clear mic profile</button>
+<div id="mic-result" class="info"></div></div>
+
+<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Radio Voice Profile</h3>
+<p class="info">{radio_status_line} &mdash; used automatically whenever Radio mode is active.
+If missing, Owner-Only mode still works but accepts all speakers over radio.</p>
+{radio_hint}
+<div class="card"><b>Sample 1 — English</b>
+<p class="info">Read aloud: &ldquo;Hey Jarvis, Five wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<button onclick="rec(this,'1','en','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s1"></span></div>
+<div class="card"><b>Sample 2 — Chinese</b>
+<p class="info">Read aloud: &ldquo;Five 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<button onclick="rec(this,'2','zh','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s2"></span></div>
+<div class="card"><b>Sample 3 — free speech</b>
+<p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
+<button onclick="rec(this,'3','mixed','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s3"></span></div>
+<div class="card">
+<button onclick="save('radio')">&#128190; Save radio profile</button>
+<button onclick="clearProfile('radio')" style="border-color:var(--rd)">&#10006; Clear radio profile</button>
+<div id="radio-result" class="info"></div></div>
+
+<div class="card">
+<button onclick="test(this)">&#127897; Test my voice (uses whichever profile is live right now)</button>
 <div id="result" class="info"></div></div>
 <script>
 const es = new EventSource('/levels');
 es.onmessage = e => {{ const p = parseInt(e.data.split(',')[0]);
   document.getElementById('meter').style.width = Math.min(100, p/150) + '%'; }};
-async function rec(btn, slot, lang) {{
-  btn.disabled = true; const lbl = document.getElementById('s'+slot);
+async function rec(btn, slot, lang, target) {{
+  btn.disabled = true; const lbl = document.getElementById(target+'-s'+slot);
   let n = 5; lbl.textContent = 'Recording… speak now';
   const timer = setInterval(()=>{{ n--; if(n>0) lbl.textContent = 'Recording… '+n; }}, 1000);
   try {{
-    const r = await fetch(`/voice-enroll/record?slot=${{slot}}&secs=5&lang=${{lang}}`);
+    const r = await fetch(`/voice-enroll/record?slot=${{slot}}&secs=5&lang=${{lang}}&target=${{target}}`);
     const j = await r.json();
     lbl.innerHTML = j.ok ? `<span class="ok">&#10004; captured (peak ${{j.peak}})</span>`
                          : `<span class="bad">&#10006; ${{j.error}}</span>`;
-  }} finally {{ clearInterval(timer); btn.disabled = false; }}
+  }} finally {{ clearInterval(timer); btn.disabled = (target === 'radio' && {str(not radio_on).lower()}); }}
 }}
-async function save() {{
-  const r = await fetch('/voice-enroll/save'); const j = await r.json();
-  document.getElementById('result').innerHTML = j.ok
+async function save(target) {{
+  const r = await fetch(`/voice-enroll/save?target=${{target}}`); const j = await r.json();
+  document.getElementById(target+'-result').innerHTML = j.ok
     ? '<span class="ok">Profile saved. You can enable Owner Only on the dashboard.</span>'
     : `<span class="bad">${{j.error}}</span>`;
 }}
@@ -3401,13 +3487,13 @@ async function test(btn) {{
   try {{
     const r = await fetch('/voice-enroll/test'); const j = await r.json();
     document.getElementById('result').innerHTML = j.ok
-      ? `Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
+      ? `[${{j.profile}}] Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
       : `<span class="bad">${{j.error}}</span>`;
   }} finally {{ btn.disabled = false; }}
 }}
-async function clearProfile() {{
-  if (!confirm('Delete the enrolled voice profile?')) return;
-  await fetch('/voice-enroll/clear'); location.reload();
+async function clearProfile(target) {{
+  if (!confirm(`Delete the enrolled ${{target}} voice profile?`)) return;
+  await fetch(`/voice-enroll/clear?target=${{target}}`); location.reload();
 }}
 </script></body></html>"""
                 data = body.encode()
@@ -4875,10 +4961,14 @@ setInterval(upd, 2000);
                 elif _radio_profile_active[0]:
                     # Persistent warning only when Radio profile is active (not just the radio interface connected)
                     _banner_iface = _active_radio_iface[0].name if _active_radio_iface[0] else "RADIO"
+                    _radio_owner_warn = (
+                        ' &mdash; no radio voice profile enrolled, accepting ALL speakers'
+                        if _owner_only[0] and _owner_profile_radio[0] is None else '')
                     device_banner = (
                         '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
                         'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
                         f'&#128225; {_banner_iface.upper()} ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
+                        f'{_radio_owner_warn}'
                         '</div>'
                     )
                 elif _owner_only[0] and not _verification_available():
@@ -4991,8 +5081,8 @@ body{{font-family:'Outfit',system-ui,'Noto Color Emoji',sans-serif;font-size:16p
 .hrow{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
 .brand{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--tx);letter-spacing:.08em;text-transform:uppercase;}}
 .spill{{margin-left:10px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:5px 14px;border-radius:20px;border:2px solid transparent;white-space:nowrap;}}
-.nav{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px;}}
-a.btn{{display:inline-flex;align-items:center;gap:3px;padding:7px 14px;border-radius:8px;font-family:'Outfit','Noto Color Emoji',sans-serif;font-size:14px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:36px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
+.nav{{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:7px;}}
+a.btn{{display:inline-flex;align-items:center;gap:3px;padding:5px 9px;border-radius:7px;font-family:'Outfit','Noto Color Emoji',sans-serif;font-size:12px;font-weight:500;color:var(--mu);background:var(--sf2);border:1px solid var(--bd);text-decoration:none;min-height:28px;white-space:nowrap;transition:background .12s,border-color .12s,color .12s;}}
 a.btn:hover{{background:#1e2d3d;border-color:var(--you);color:var(--you);box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
 a.btn.on{{background:var(--gnb);border-color:var(--gn);color:var(--gn);}}
 a.btn.on:hover{{background:#053d20;color:#fff;box-shadow:0 0 0 2px rgba(52,211,153,.25);}}
@@ -5016,12 +5106,12 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 .spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
 .spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
 #dbanner{{min-height:1.2em;font-size:.8em;font-family:'JetBrains Mono',monospace;padding:3px 8px;transition:color .1s;}}
-@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:9px 12px;font-size:13px;}}}}
-@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:15px;padding:8px 16px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
+@media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:5px 8px;font-size:11px;}}}}
+@media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else ('Disabled while Radio mode is on — voice verification is unreliable over radio audio' if _radio_profile_active[0] else ('Now: Everyone. Click → owner-only (only your enrolled voice is obeyed)' if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)'))}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else (('Now: Everyone. Click → owner-only (verifies against your radio voice profile while Radio mode is on' + ('' if _owner_profile_radio[0] is not None else ', though no radio profile is enrolled yet — accepts all speakers over radio until you add one') + ')') if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)')}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
 {device_panel}{device_banner}</div>
 <div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
 <script>
@@ -5063,6 +5153,7 @@ setInterval(function(){{
                 body = json.dumps({"status": "running", "voice": "active" if active else "silent",
                                    "owner_mode": "owner-only" if _owner_only[0] else "everyone",
                                    "enrolled": _owner_profile[0] is not None,
+                                   "enrolled_radio": _owner_profile_radio[0] is not None,
                                    "spk_threshold": _spk_threshold[0]}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
@@ -5352,11 +5443,13 @@ def _playback_worker() -> None:
     while True:
         secs, pcm_bytes = _playback_queue.get()
         if not (_ptt_alive() and _radio_profile_active[0]):
-            log.debug("Playback: captured %.1fs but radio/PTT unavailable — dropped", secs)
+            log.warning("Playback: captured %.1fs but Radio Mode is off — dropped "
+                        "(EchoTest's listener runs regardless of profile, but "
+                        "transmitting requires Radio Mode to be explicitly on)", secs)
             continue
         sink = _find_radio_sink()
         if not sink:
-            log.debug("Playback: captured %.1fs but no radio sink found — dropped", secs)
+            log.warning("Playback: captured %.1fs but no radio sink found — dropped", secs)
             continue
         wav_path = _pw_tf.mktemp(suffix=".wav")
         try:
@@ -5693,14 +5786,16 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     _load_voice_mode()
     if _spk_threshold_cli[0] is not None:
         _spk_threshold[0] = _spk_threshold_cli[0]
-    enrolled = _load_voice_profile()
+    enrolled       = _load_voice_profile()
+    enrolled_radio = _load_voice_profile(radio=True)
     if not _HAVE_SHERPA or not os.path.exists(SPK_MODEL_PATH):
         log.info("Speaker verification: disabled — %s",
                  "sherpa-onnx not installed" if not _HAVE_SHERPA else "model file missing")
     else:
-        log.info("Speaker verification: %s, %s, threshold %.2f",
+        log.info("Speaker verification: %s, %s, radio: %s, threshold %.2f",
                  "owner-only" if _owner_only[0] else "everyone mode",
                  f"enrolled {len(_owner_profile[0]['samples'])} sample(s)" if enrolled else "no profile",
+                 f"enrolled {len(_owner_profile_radio[0]['samples'])} sample(s)" if enrolled_radio else "no profile",
                  _spk_threshold[0])
         # Pre-warm the extractor so the first utterance isn't slow.
         _thr.Thread(target=_get_spk_extractor, daemon=True, name="spk-prewarm").start()

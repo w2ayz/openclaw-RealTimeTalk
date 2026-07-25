@@ -1,3 +1,17 @@
+## v3.8.0 — 2026-07-24
+
+### Added
+
+- **Separate voice profile for Radio mode.** Owner-only verification no longer auto-disables while Radio mode is on — it now scores against a dedicated radio-enrolled profile (`rtt_voice_profile_radio.json`) instead of the mic profile, since radio audio's frequency response/compression makes cross-matching against a mic-enrolled profile unreliable. The Voice ID page (`/calibration` → Voice ID) gained a second enrollment section — record/save/clear/test all take a `target=mic|radio` parameter, and radio recording is disabled until Radio mode is actually on with a live signal. If Owner-Only is turned on while Radio mode is active with no radio profile enrolled yet, the dashboard banner and a spoken note warn that all speakers are accepted over radio until one is added.
+- **Continuous echo-coupling tracking during TTS playback.** The self-interrupt threshold used to be frozen from a 1-second guard window at the start of each reply; it now keeps an EMA of the output/mic coupling ratio for the whole reply, so a long or unevenly-loud response doesn't drift out of range of a threshold set from its first second. Ticks that already look like a real barge-in are excluded from the running estimate.
+
+### Changed
+
+- **Radio TX no longer runs the self-interrupt monitor at all.** Known TX→RX crosstalk on this hardware makes mic-based barge-in detection untrustworthy while transmitting (same reason transcription is already muted during PTT) — `/interrupt` still works, but the mic-peak monitor is skipped entirely during radio playback instead of just being more lenient.
+- **Dashboard buttons resized to stay on one row.** Nav button padding/font-size trimmed (`a.btn`, `.nav` gap) across all breakpoints so all 8 top-bar buttons — including Gateway Reset — reliably fit on a single line instead of occasionally wrapping.
+
+---
+
 ## v3.7.0 — 2026-07-23
 
 ### Added
