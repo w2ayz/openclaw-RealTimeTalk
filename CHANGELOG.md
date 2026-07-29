@@ -1,3 +1,11 @@
+## v3.9.1 — 2026-07-29
+
+### Fixed
+
+- **EchoTest (and the DTMF listener) could go permanently silent until the AIOC was physically unplugged and replugged.** A longstanding bug, not new to this release: the AIOC's `pacat` audio capture can go silently unresponsive without the process ever exiting and without the PipeWire source ever disappearing from `pactl list` — so neither of the listener loops' existing recovery checks (`if not chunk: break`, `_find_radio_source()` going falsy) ever caught it, leaving `proc.stdout.read()` blocked forever. New `_read_radio_chunk()` helper wraps that read with a 5s `select()`-based timeout; a stall is now treated exactly like EOF — the stuck `pacat` is killed and the listener's existing reconnect loop respawns it against a freshly-resolved source, without needing the physical replug. Applied to `_playback_listener` (EchoTest), `_dtmf_listener`'s Goertzel path, and its new COS sub-loop. Mirrors the same class of fix already in place on the mic-input side (`_watch_mic_stream`'s `_last_mic_cb` staleness check). The multimon-ng DTMF fallback's `for line in mmng.stdout` iteration has the same theoretical exposure but isn't covered by this fix yet — lower priority since it's only reached when no DTMF profiles are trained.
+
+---
+
 ## v3.9.0 — 2026-07-29
 
 ### Added

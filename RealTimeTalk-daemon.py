@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.9.0"
+__version__ = "3.9.1"
 
 import argparse
 import asyncio
@@ -36,6 +36,7 @@ import logging
 import os
 import queue
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -5361,7 +5362,11 @@ def _dtmf_listener() -> None:
                      f"--device={src}"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 while _find_radio_source():
-                    chunk = proc.stdout.read(_CHUNK48)
+                    chunk = _read_radio_chunk(proc, _CHUNK48)
+                    if chunk is None:
+                        log.warning("DTMF COS sampling: audio stream stalled "
+                                    "(%.0fs no data) — reconnecting", _RADIO_CHUNK_STALL_S)
+                        break
                     if not chunk: break
                     raw  = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
                     peak = int(_np_dtmf.max(_np_dtmf.abs(raw))) if len(raw) else 0
@@ -5403,7 +5408,11 @@ def _dtmf_listener() -> None:
                 acc = _np_dtmf.array([], dtype=_np_dtmf.int16)  # rolling 48kHz accumulator
 
                 while _find_radio_source():
-                    chunk = proc.stdout.read(_CHUNK48)
+                    chunk = _read_radio_chunk(proc, _CHUNK48)
+                    if chunk is None:
+                        log.warning("DTMF Goertzel: audio stream stalled "
+                                    "(%.0fs no data) — reconnecting", _RADIO_CHUNK_STALL_S)
+                        break
                     if not chunk: break
                     raw   = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
                     now   = _td.time()
@@ -5471,6 +5480,31 @@ def _dtmf_listener() -> None:
                     except Exception: pass
 
         _td.sleep(5)
+
+
+_RADIO_CHUNK_STALL_S = 5.0  # see _read_radio_chunk
+
+def _read_radio_chunk(proc, nbytes, timeout=_RADIO_CHUNK_STALL_S):
+    """Read up to `nbytes` from a pacat subprocess's stdout without blocking
+    longer than `timeout` for the next byte. Returns the chunk (may be
+    shorter than nbytes — none of these callers depend on exact framing),
+    b"" on EOF (pacat exited), or None if nothing arrived within `timeout`.
+
+    This is the fix for a longstanding bug: the AIOC's audio stream can go
+    silently unresponsive — pacat never exits, and the PipeWire source never
+    disappears from `pactl list` — so neither of this loop's existing exit
+    checks (`if not chunk: break`, `_find_radio_source()` going falsy) ever
+    caught it. Previously the only known recovery was physically unplugging
+    and replugging the AIOC. A None return here means "treat it exactly like
+    EOF" — kill the stuck pacat and let the caller's reconnect loop respawn
+    it against a freshly-resolved source, without needing the hardware
+    replug (see also the mic-side equivalent: `_watch_mic_stream`'s
+    `_last_mic_cb` staleness check, same class of problem on the sounddevice
+    path)."""
+    r, _, _ = select.select([proc.stdout], [], [], timeout)
+    if not r:
+        return None
+    return os.read(proc.stdout.fileno(), nbytes)
 
 
 def _playback_worker() -> None:
@@ -5564,7 +5598,11 @@ def _playback_listener(stop_flag: list) -> None:
             _ext_tx_grace_until = 0.0
 
             while not stop_flag[0] and _find_radio_source():
-                chunk = proc.stdout.read(_CHUNK48)
+                chunk = _read_radio_chunk(proc, _CHUNK48)
+                if chunk is None:
+                    log.warning("Playback listener: audio stream stalled "
+                                "(%.0fs no data) — reconnecting", _RADIO_CHUNK_STALL_S)
+                    break
                 if not chunk:
                     break
                 now = _pl_time.time()
