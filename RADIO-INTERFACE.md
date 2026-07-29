@@ -48,21 +48,38 @@ ends, then released — same choreography either way:
 | AIOC | DTR | custom composite USB device |
 | Digirig Mobile | RTS | Silicon Labs CP2102N |
 
-## No hardware squelch/COS feedback
+## No hardware squelch/COS feedback (yet)
 
 Neither interface gives RealTimeTalk a real "the radio thinks this is a valid
-signal" line. AIOC's true hardware carrier-operated-squelch requires a PCB
-revision (v1.1+) this project doesn't have; Digirig Mobile has no such input
-at all. So **all transmission detection is software-inferred from raw audio
-peak level** — both the DTMF wake/sleep listener and EchoTest (the automatic
+signal" line **in the current setup**. AIOC hardware v1.2+ (fw ≥1.3.0)
+genuinely does have this capability — two external GPIO input pins (IN1/IN2)
+that can be routed via its HID config interface to a real serial modem-control
+line (DCD) instead of guessing from audio — but it requires a physical wire
+from the radio's own busy/squelch-detect output into one of those pins. A
+Kenwood TH-D74 connected via its standard 2-pin/K-style speaker+mic jack (the
+setup this project actually runs on) doesn't expose that signal externally at
+all — no public pinout evidence of one, and getting it would mean opening the
+radio and tapping an internal test point, which hasn't been done. Digirig
+Mobile has no equivalent input hardware at all, on any radio. So **all
+transmission detection here is still software-inferred from raw audio peak
+level** — both the DTMF wake/sleep listener and EchoTest (the automatic
 on-air echo feature, renamed from "Playback" in v3.7.0) work by watching a
 peak threshold, not a real squelch signal.
 
 That threshold (`cos_threshold` in `radio_interfaces.py`) is **per-interface**,
-not a single global value, because each interface's idle noise floor differs:
+not a single global value, because each interface's idle noise floor differs —
+and as of the adaptive-squelch change, it's a **floor, not a fixed value**:
+`SquelchTracker` (`radio_interfaces.py`) tracks an EMA of the ambient peak
+level (only from ticks that don't already look like an open squelch) and lets
+the effective threshold rise above `cos_threshold` if ambient noise runs
+higher than expected, settling back down once things quiet down — it never
+goes *below* the hand-tuned floor. One shared class now backs all three
+squelch consumers (`dtmf_monitor.py`'s capture thread, and the daemon's DTMF
+listener and EchoTest listener), replacing three previously-independent
+copies of the same inline logic.
 
-- **AIOC**: threshold 200, idle floor ~112-116.
-- **Digirig**: threshold 500, with its onboard CM108 "Auto Gain Control" left
+- **AIOC**: floor 200, idle floor ~112-116.
+- **Digirig**: floor 500, with its onboard CM108 "Auto Gain Control" left
   on (idle floor is a noisier, non-stationary ~114-372 with AGC on — AGC-off
   gives a much larger safety margin, ~45-90, and is documented in
   `radio_interfaces.py` as the more robust fallback if 500 ever proves

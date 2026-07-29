@@ -13,7 +13,8 @@ Detection: custom Goertzel with learned profiles, or multimon-ng fallback.
 import subprocess, threading, time, re, sys, argparse, os, json, numpy as np
 from pathlib import Path
 from collections import defaultdict
-from radio_interfaces import find_radio_source, find_radio_source_with_iface, RADIO_INTERFACES
+from radio_interfaces import (find_radio_source, find_radio_source_with_iface,
+                               RADIO_INTERFACES, SquelchTracker)
 
 # ── Config ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -125,10 +126,9 @@ def decode_frame_fft(frame):
     return float(row_freq), float(col_freq)
 
 # ── Shared state ───────────────────────────────────────────────────────────
-state = {'cos':False,'level':0,'digits':[],'seq':'','last_digit':None,
-         'last_time':0.0,'actions':[]}
+state = {'cos':False,'level':0,'threshold':COS_THRESHOLD,'digits':[],'seq':'',
+         'last_digit':None,'last_time':0.0,'actions':[]}
 lock = threading.Lock()
-cos_until = [0.0]
 raw_buf = []
 raw_lock = threading.Lock()
 
@@ -137,6 +137,7 @@ _pacat_proc = [None]
 
 def raw_capture_thread(src):
     global _pacat_proc
+    squelch = SquelchTracker(COS_THRESHOLD, COS_TAIL_S)
     while True:
         if not src:
             src = find_radio_source()
@@ -160,8 +161,8 @@ def raw_capture_thread(src):
                     now   = time.time()
                     with lock:
                         state['level'] = peak
-                        if peak > COS_THRESHOLD: cos_until[0] = now + COS_TAIL_S
-                        state['cos'] = now < cos_until[0]
+                        state['cos'] = squelch.update(peak, now)
+                        state['threshold'] = squelch.threshold
                     with raw_lock:
                         raw_buf.append((now, frame.copy()))
                         # Keep 10s of audio
@@ -276,7 +277,7 @@ def display_thread(profiles):
 
     while True:
         with lock:
-            cos   = state['cos']; level = state['level']
+            cos   = state['cos']; level = state['level']; thr = state['threshold']
             digs  = [d for t,d in state['digits'] if time.time()-t<10]
             seq   = state['seq']
 
@@ -288,7 +289,7 @@ def display_thread(profiles):
 
         # Build plain line first so we know the exact visible width
         cos_p = "OPEN  " if cos else "CLOSED"
-        plain = f"  COS:{cos_p}[{bar}]{level:6d} | DTMF:{dig_s:<14}| Seq:{seq_s:<4} [{mode_lbl}]"
+        plain = f"  COS:{cos_p}[{bar}]{level:6d}/{thr:<4d} | DTMF:{dig_s:<14}| Seq:{seq_s:<4} [{mode_lbl}]"
         if len(plain) > cols - 1:
             plain = plain[:cols-1]
 

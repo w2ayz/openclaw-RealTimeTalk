@@ -1,3 +1,16 @@
+## v3.9.0 — 2026-07-29
+
+### Added
+
+- **Adaptive squelch/COS threshold.** New `SquelchTracker` class (`radio_interfaces.py`) replaces the static peak-threshold-plus-hangover logic that was independently duplicated three times (the daemon's DTMF listener and EchoTest listener, and `dtmf_monitor.py`'s capture thread). `cos_threshold` (per-interface, unchanged: AIOC 200, Digirig 500) is now a floor rather than a fixed value — the effective threshold can rise above it via an EMA of the ambient peak level (tracked only from ticks that don't already look like an open squelch, so it can't be fooled into raising the bar mid-transmission), and settles back down once the environment quiets. Never drops below the hand-tuned floor. Investigated using AIOC v1.2's new external hardware-COS-input capability (confirmed present and HID-configurable this session) instead, but the connected radio (Kenwood TH-D74) doesn't expose a squelch/busy signal on its standard 2-pin speaker+mic jack — no public pinout evidence of one — so real hardware COS isn't usable here without an unconfirmed internal radio mod; this adaptive-threshold approach was chosen instead.
+- **DTMF training dashboard** (`/dtmf-monitor`, `/dtmf-train`, `/dtmf-retrain`) now shows the live adaptive threshold value instead of a hardcoded constant that didn't reflect the connected interface.
+
+### Fixed
+
+- **The DTMF listener's multimon-ng fallback path never gated on COS at all** — unlike its own Goertzel path, and unlike `dtmf_monitor.py`'s equivalent fallback (which does gate). It piped `pacat → sox → multimon-ng` directly with no peak sampling on the Python side, so any decoded DTMF tone was accepted regardless of squelch state. Fixed by adding a dedicated always-running COS-sampling sub-loop (mirrors `dtmf_monitor.py`'s `raw_capture_thread` design) that both the Goertzel and multimon-ng branches now consult.
+
+---
+
 ## v3.8.0 — 2026-07-24
 
 ### Added

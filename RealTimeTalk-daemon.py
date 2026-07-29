@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.8.0"
+__version__ = "3.9.0"
 
 import argparse
 import asyncio
@@ -117,6 +117,7 @@ OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); ra
 from radio_interfaces import (
     RADIO_INTERFACES, find_radio_port, find_radio_sink, find_radio_source,
     find_radio_source_with_iface, is_radio_device_name, apply_alsa_mixer_fixups,
+    detect_hw_variant, SquelchTracker,
 )
 
 # Languages accepted in multi-lang WHITELIST mode.
@@ -432,6 +433,10 @@ _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mi
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for the connected radio's PTT; None when unavailable
 _active_radio_iface:  list = [None]   # RadioInterface currently connected (AIOC/Digirig/...), or None
+_dtmf_cos_state:      dict = {"open": False, "threshold": 0}  # live squelch state from _dtmf_listener's
+                                        # dedicated COS sub-loop — "threshold" is the SquelchTracker's
+                                        # current adaptive effective threshold, read by the DTMF training
+                                        # dashboard so its display isn't stuck on the static default
 _resolved_radio_names: list = [set()]  # exact pactl names most recently resolved via audio_usbid
                                         # correlation (Digirig-style) — is_radio_device_name can't
                                         # recognize these by substring alone
@@ -569,7 +574,7 @@ def _ptt_open() -> None:
         _ptt_serial[0] = s
         _active_radio_iface[0] = iface
         log.info("%s PTT ready on %s (%s line) — audio output will transmit over the air",
-                 iface.name, port, iface.ptt_line.upper())
+                 detect_hw_variant(iface), port, iface.ptt_line.upper())
     except Exception as exc:
         log.warning("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
         _ptt_serial[0] = None
@@ -3647,7 +3652,7 @@ function copyCmd(){{
 </script>
 <p style='color:#475569;font-size:12px;margin-top:12px;'>
 Wake={DTMF_WAKE_SEQ} &nbsp;|&nbsp; Sleep={DTMF_SLEEP_SEQ} &nbsp;|&nbsp;
-COS≥{DTMF_COS_THRESHOLD} &nbsp;|&nbsp; Tail={DTMF_COS_TAIL_S}s &nbsp;|&nbsp;
+COS≥{_dtmf_cos_state["threshold"] or DTMF_COS_THRESHOLD} (adaptive) &nbsp;|&nbsp; Tail={DTMF_COS_TAIL_S}s &nbsp;|&nbsp;
 Restart daemon after training to reload profiles.</p>
 </body></html>"""
                 _enc = _body.encode()
@@ -4960,7 +4965,8 @@ setInterval(upd, 2000);
                     _device_change_msg[0] = ""
                 elif _radio_profile_active[0]:
                     # Persistent warning only when Radio profile is active (not just the radio interface connected)
-                    _banner_iface = _active_radio_iface[0].name if _active_radio_iface[0] else "RADIO"
+                    _banner_iface = (detect_hw_variant(_active_radio_iface[0])
+                                      if _active_radio_iface[0] else "RADIO")
                     _radio_owner_warn = (
                         ' &mdash; no radio voice profile enrolled, accepting ALL speakers'
                         if _owner_only[0] and _owner_profile_radio[0] is None else '')
@@ -5328,14 +5334,54 @@ def _dtmf_listener() -> None:
         return seq
 
     _last_dig   = [None];  _last_dig_t = [0.0];  _state_time = [0.0]
-    _cos_until  = [0.0]
+
+    # Dedicated COS/squelch sampling loop, independent of which decode method
+    # (Goertzel vs multimon-ng) is active below — mirrors dtmf_monitor.py's
+    # raw_capture_thread. Previously the Goertzel branch computed its own COS
+    # inline from its own pacat stream, while the multimon-ng fallback had NO
+    # COS gating at all (unlike dtmf_monitor.py's equivalent fallback, which
+    # does gate). One shared source of truth fixes both: gives multimon-ng
+    # real gating and keeps a single adaptive threshold instead of two
+    # independently-drifting ones. Module-level (_dtmf_cos_state) so the DTMF
+    # training dashboard can also display the live adaptive threshold.
+    _cos_state = _dtmf_cos_state
+
+    def _cos_sub_loop():
+        while True:
+            found = find_radio_source_with_iface()
+            if not found:
+                _td.sleep(3); continue
+            _iface, src = found
+            _squelch = SquelchTracker(_iface.cos_threshold, DTMF_COS_TAIL_S)
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    ["pacat", "--record", "--raw", "--format=s16le",
+                     "--rate=48000", "--channels=1", "--latency-msec=50",
+                     f"--device={src}"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                while _find_radio_source():
+                    chunk = proc.stdout.read(_CHUNK48)
+                    if not chunk: break
+                    raw  = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
+                    peak = int(_np_dtmf.max(_np_dtmf.abs(raw))) if len(raw) else 0
+                    _cos_state["open"] = _squelch.update(peak, _td.time())
+                    _cos_state["threshold"] = _squelch.threshold
+            except Exception as exc:
+                log.warning("DTMF COS sampling error: %s", exc)
+            finally:
+                if proc is not None:
+                    try: proc.kill()
+                    except Exception: pass
+            _td.sleep(1)
+
+    threading.Thread(target=_cos_sub_loop, daemon=True, name="dtmf-cos").start()
 
     while True:
         found = find_radio_source_with_iface()
         if not found:
             _td.sleep(3); continue
         _dtmf_iface, aioc_src = found
-        _dtmf_cos_thr = _dtmf_iface.cos_threshold
 
         profiles = _load_dtmf_profiles()
 
@@ -5343,7 +5389,8 @@ def _dtmf_listener() -> None:
             # ── Goertzel path with learned profiles ──────────────────────
             log.info("DTMF listener ready via learned profiles "
                      "(wake=%s sleep=%s %s COS≥%d)",
-                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ, _dtmf_iface.name, _dtmf_cos_thr)
+                     DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ, _dtmf_iface.name,
+                     _dtmf_iface.cos_threshold)
             try:
                 proc = subprocess.Popen(
                     ["pacat", "--record", "--raw", "--format=s16le",
@@ -5359,13 +5406,8 @@ def _dtmf_listener() -> None:
                     chunk = proc.stdout.read(_CHUNK48)
                     if not chunk: break
                     raw   = _np_dtmf.frombuffer(chunk, dtype=_np_dtmf.int16)
-                    peak  = int(_np_dtmf.max(_np_dtmf.abs(raw)))
                     now   = _td.time()
-                    # COS detection on raw 48kHz level
-                    if peak > _dtmf_cos_thr:
-                        _cos_until[0] = now + DTMF_COS_TAIL_S
-                    cos_open = now < _cos_until[0]
-                    if not cos_open:
+                    if not _cos_state["open"]:
                         prev_dig[0] = None; hold[0] = 0
                         acc = _np_dtmf.array([], dtype=_np_dtmf.int16)
                         continue
@@ -5415,6 +5457,7 @@ def _dtmf_listener() -> None:
                 seq_ref = [""]
                 for raw_line in mmng.stdout:
                     now  = _td.time()
+                    if not _cos_state["open"]: continue
                     line = raw_line.decode(errors="ignore").strip()
                     m    = _DTMF_PAT.match(line)
                     if not m: continue
@@ -5503,10 +5546,10 @@ def _playback_listener(stop_flag: list) -> None:
         if not found:
             _pl_time.sleep(3); continue
         _pb_iface, aioc_src = found
-        _pb_cos_thr = _pb_iface.cos_threshold
+        _pb_squelch = SquelchTracker(_pb_iface.cos_threshold, DTMF_COS_TAIL_S)
 
         log.info("Playback listener ready via %s (COS>=%d, tail=%.1fs, min=%.1fs) — on-air replay",
-                 _pb_iface.name, _pb_cos_thr, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
+                 _pb_iface.name, _pb_squelch.base_threshold, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
         proc = None
         try:
             proc = subprocess.Popen(
@@ -5515,7 +5558,6 @@ def _playback_listener(stop_flag: list) -> None:
                  f"--device={aioc_src}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            cos_until       = 0.0
             was_open        = False
             seg_buf         = bytearray()
             _prev_tx        = False
@@ -5551,9 +5593,7 @@ def _playback_listener(stop_flag: list) -> None:
                     continue
                 raw  = _pl_np.frombuffer(chunk, dtype=_pl_np.int16)
                 peak = int(_pl_np.max(_pl_np.abs(raw))) if len(raw) else 0
-                if peak > _pb_cos_thr:
-                    cos_until = now + DTMF_COS_TAIL_S
-                cos_open = now < cos_until
+                cos_open = _pb_squelch.update(peak, now)
 
                 if cos_open and not was_open:
                     seg_buf = bytearray(chunk)

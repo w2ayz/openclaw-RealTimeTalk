@@ -23,7 +23,14 @@ Two audio-identification strategies are supported, chosen per interface:
 from dataclasses import dataclass
 import glob
 import re
+import struct
 import subprocess
+
+try:
+    import hid
+    _HAVE_HID = True
+except ImportError:
+    _HAVE_HID = False
 
 
 @dataclass
@@ -277,3 +284,92 @@ def is_radio_device_name(name: str, resolved_names: set[str] = frozenset()) -> b
         if iface.audio_name_hints and any(h in name for h in iface.audio_name_hints):
             return True
     return False
+
+
+# AIOC HID feature-report config interface (firmware >= 1.3.0, shipped starting
+# with hardware v1.2). Report format "<BBBL>" = [report_id, command, address,
+# value] — mirrors github.com/hrafnkelle/aioc-util, itself derived from
+# skuep/AIOC's own config protocol. Reading register 0x00 (MAGIC) back as
+# "AIOC" is just a liveness check: older AIOC units (hardware v1.0) run
+# firmware that predates this interface entirely and don't respond to it at
+# all, which is the actual signal used below — not the register value itself.
+_AIOC_HID_FMT      = struct.Struct("<BBBL")
+_AIOC_MAGIC_REG    = 0x00
+_AIOC_MAGIC_VALUE  = 0x434F4941  # "AIOC" packed little-endian
+
+_hw_variant_cache: dict[str, str] = {}  # USB serial number -> display label
+
+
+def detect_hw_variant(iface: RadioInterface) -> str:
+    """Best-effort hardware-revision label for `iface`, for display only —
+    never use this for detection logic (that stays on iface.name/audio hints).
+    Returns iface.name unchanged unless this is an AIOC that answers the HID
+    config interface, in which case it returns "AIOC v1.2+". Result is cached
+    per USB serial number so repeated dashboard refreshes don't re-open the
+    HID handle every time."""
+    if not _HAVE_HID or iface.name != "AIOC":
+        return iface.name
+    try:
+        devices = hid.enumerate(iface.usb_vid, iface.usb_pid)
+    except Exception:
+        return iface.name
+    if not devices:
+        return iface.name
+    serial = devices[0].get("serial_number") or ""
+    cached = _hw_variant_cache.get(serial)
+    if cached:
+        return cached
+    label = iface.name
+    try:
+        dev = hid.Device(iface.usb_vid, iface.usb_pid)
+        try:
+            dev.send_feature_report(_AIOC_HID_FMT.pack(0, 0x00, _AIOC_MAGIC_REG, 0))
+            data = dev.get_feature_report(0, 7)
+            _, _, _, value = _AIOC_HID_FMT.unpack(bytes(data))
+            if value == _AIOC_MAGIC_VALUE:
+                label = f"{iface.name} v1.2+"
+        finally:
+            dev.close()
+    except Exception:
+        pass
+    if serial:
+        _hw_variant_cache[serial] = label
+    return label
+
+
+class SquelchTracker:
+    """Adaptive squelch/COS state from raw audio peak samples. `base_threshold`
+    (RadioInterface.cos_threshold) is a floor, never lowered below — it was
+    hand-tuned against each interface's worst-case measured idle noise (see
+    RADIO-INTERFACE.md). The *effective* threshold can rise above that floor
+    via an EMA of the ambient peak level, tracked only from ticks that are
+    already below the current threshold (never learns from a tick that looks
+    like a real signal — same principle as SPEAK_COUPLING_EMA in the daemon's
+    speak() self-interrupt tracking), so a noisier environment / AGC drift
+    raises the bar instead of causing false opens, and it settles back down
+    once things quiet down.
+
+    One instance per listener/reconnect — no shared/cross-thread state."""
+
+    def __init__(self, base_threshold: int, tail_s: float,
+                 margin: float = 1.5, ema_alpha: float = 0.02):
+        self.base_threshold = base_threshold
+        self.tail_s = tail_s
+        self.margin = margin
+        self.ema_alpha = ema_alpha
+        self.ambient_ema = base_threshold / margin
+        self._cos_until = 0.0
+
+    @property
+    def threshold(self) -> int:
+        return max(self.base_threshold, int(self.ambient_ema * self.margin))
+
+    def update(self, peak: int, now: float) -> bool:
+        """Feed one peak sample, return whether squelch/COS is open now."""
+        thr = self.threshold
+        if peak > thr:
+            self._cos_until = now + self.tail_s
+        else:
+            self.ambient_ema = (self.ambient_ema * (1 - self.ema_alpha) +
+                                 peak * self.ema_alpha)
+        return now < self._cos_until
