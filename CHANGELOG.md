@@ -17,6 +17,14 @@
 
 ---
 
+## v3.10.1 — 2026-08-03
+
+### Fixed
+
+- **`_dtmf_listener`'s multimon-ng fallback branch crashed with `UnboundLocalError: cannot access local variable 'mmng'`** whenever `sox` or `multimon-ng` weren't installed. `pacat`, `sox`, and `mmng` were only ever assigned inside the `try:` block; if an early `Popen()` call raised (e.g. `FileNotFoundError` for a missing binary), the `finally:` block's `for p in (mmng, sox, pacat):` referenced names that were never bound. Neither package was an installer prerequisite despite the DTMF listener thread running — and probing for a radio interface — unconditionally on every install, radio hardware or not. Fixed the `UnboundLocalError` by pre-initializing all three to `None` before the `try:`, and added `sox`/`multimon-ng` to the installer's system packages so plugging in an AIOC/Digirig later doesn't crash the thread.
+
+---
+
 ## v3.9.1 — 2026-07-29
 
 ### Fixed

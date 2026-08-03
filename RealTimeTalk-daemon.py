@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.10.0"
+__version__ = "3.10.1"
 
 import argparse
 import asyncio
@@ -5481,6 +5481,7 @@ def _dtmf_listener() -> None:
             log.info("DTMF listener ready via multimon-ng "
                      "(no profiles — run dtmf_monitor.py --train to improve) "
                      "wake=%s sleep=%s", DTMF_WAKE_SEQ, DTMF_SLEEP_SEQ)
+            pacat = sox = mmng = None
             try:
                 pacat = subprocess.Popen(
                     ["pacat", "--record", "--raw", "--format=s16le",

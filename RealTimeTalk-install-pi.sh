@@ -37,7 +37,11 @@ echo "[1/8] Checking system packages…"
 # espeak-ng       - phonemizer Piper needs for Chinese TTS
 # fonts-noto-color-emoji - dashboard button icons include an astral-plane emoji (owner
 #                   icon); without a color-emoji font it renders as a blank box
-REQUIRED_APT_PKGS=(libportaudio2 pulseaudio-utils pipewire-alsa espeak-ng fonts-noto-color-emoji)
+# sox, multimon-ng - only exercised if a radio interface (AIOC/Digirig) is plugged in,
+#                   but the DTMF listener thread runs unconditionally and probes for one
+#                   every few seconds regardless of whether this Pi has radio hardware —
+#                   installed unconditionally so plugging one in later doesn't crash it
+REQUIRED_APT_PKGS=(libportaudio2 pulseaudio-utils pipewire-alsa espeak-ng fonts-noto-color-emoji sox multimon-ng)
 MISSING_PKGS=()
 for pkg in "${REQUIRED_APT_PKGS[@]}"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
