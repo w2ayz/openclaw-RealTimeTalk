@@ -178,17 +178,22 @@ When enabled, Five only acts on the enrolled owner's voice — every transcript'
 
 ### Setup
 
-```bash
-# 1. Install sherpa-onnx into the daemon's venv
-~/.local/realtimetalk-venv/bin/pip install sherpa-onnx
+`RealTimeTalk-install-pi.sh` installs `sherpa-onnx` and downloads the 3D-Speaker CAM++ zh-en model (~28 MB) automatically — no manual steps needed. Just restart the service after installing, then enroll:
 
-# 2. Download the 3D-Speaker CAM++ zh-en model (~28 MB)
+```bash
+systemctl --user restart openclaw-realtimetalk
+```
+
+Then open `http://<pi-ip>:19000/voice-enroll` to enroll.
+
+If you're setting this up outside the installer (or need to re-fetch the model by hand):
+
+```bash
+~/.local/realtimetalk-venv/bin/pip install sherpa-onnx
 mkdir -p ~/.local/share/rtt/speaker
 wget -O ~/.local/share/rtt/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
 # (the release tag really is spelled "recongition" upstream)
-
-# 3. Restart, then enroll at http://<pi-ip>:19000/voice-enroll
 ```
 
 ### Enrollment
@@ -220,17 +225,20 @@ In owner-only mode **everything** — wake phrases, sleep, monitor toggles, and 
 
 ## Prerequisites
 
+Everything below except the OpenClaw gateway itself and the OpenAI API key is installed automatically by `RealTimeTalk-install-pi.sh` (see [Installation](#installation)) — listed here for reference, or for setting up outside the installer.
+
 | Requirement | Notes |
 |-------------|-------|
-| Raspberry Pi OS Bookworm | Pi 5 or Pi 4 |
-| Python 3.9+ | Pre-installed on Bookworm |
-| PipeWire | Default on Bookworm; used for AGC virtual source |
-| **OpenClaw gateway running locally** | Required — daemon routes all AI through it |
+| Raspberry Pi OS Bookworm/Trixie | Pi 5 or Pi 4; aarch64 or x86_64 (Piper binary auto-detects architecture) |
+| Python 3.9+ | Pre-installed |
+| PipeWire + `pipewire-alsa` | `pipewire-alsa` is required, not just PipeWire itself — without it, ALSA's "default" device can't resample to the 24kHz/16kHz rates the Realtime API and openwakeword need, and raw hardware access conflicts with PipeWire's exclusive hold on USB audio devices |
+| `pulseaudio-utils` (`pactl`) | Used throughout for PipeWire sink/source control |
+| **OpenClaw gateway running locally** | Required — daemon routes all AI through it. Not installed by this script |
 | OpenClaw 2026.5+ | Gateway protocol v4 required |
-| OpenAI API key or OAuth | For STT (Realtime API). OAuth via OpenClaw `openai-codex` provider supported |
+| OpenAI API key | Installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. OAuth via OpenClaw `openai-codex` provider also supported |
 | Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
-| espeak-ng | Required for Chinese TTS phonemisation (`apt install espeak-ng`) |
-| zhconv | Python package — installed automatically by installer (`pip install zhconv`) |
+| espeak-ng | Required for Chinese TTS phonemisation |
+| `fonts-noto-color-emoji` | Dashboard's owner/everyone button icon (👤) needs a color-emoji font or it renders as a blank box |
 | USB microphone | C-Media PCM2902 or similar; AGC compensates for quiet hardware |
 | Speaker or headset | USB or 3.5mm; headset auto-detected |
 
@@ -257,14 +265,15 @@ git clone git@github.com:w2ayz/openclaw-RealTimeTalk.git ~/openclaw-RealTimeTalk
 bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 ```
 
-The installer:
-1. Creates a Python venv at `~/.local/realtimetalk-venv` and installs deps
-2. Installs `libportaudio2` and `espeak-ng` via apt
-3. Installs `zhconv` for Simplified Chinese normalisation
-4. Writes the PipeWire AGC config to `~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf`
-5. Reloads PipeWire so the AGC source is available immediately
-6. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
-7. Enables linger and starts the service
+Safe to re-run any time (e.g. after `git pull`) — every step checks first and skips what's already installed. The installer:
+1. Installs system packages via apt: `libportaudio2`, `pulseaudio-utils`, `pipewire-alsa`, `espeak-ng`, `fonts-noto-color-emoji`
+2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs all of `requirements.txt`
+3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected)
+4. Downloads the CAM++ speaker-verification model
+5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set
+6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
+7. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
+8. Enables linger and starts the service
 
 ### 3. Check the dashboard
 
@@ -280,11 +289,16 @@ By default the daemon uses:
 - **Mic** — PipeWire default source (the WebRTC AGC virtual source `rtt_agc_source` is set as default on startup)
 - **Speaker** — found automatically by scanning PipeWire sinks (non-HDMI, non-Bluetooth)
 
-To override the ALSA speaker output:
+To override the ALSA speaker or mic device:
 ```bash
 # Edit the service ExecStart line:
 ~/.config/systemd/user/openclaw-realtimetalk.service
-# Add: --alsa-output plughw:3,0
+# Defaults set by the installer: --input-device pipewire --alsa-output default
+```
+Prefer a device **name** (e.g. `pipewire`, or a specific PipeWire sink/source name from
+`--list-devices`) over a raw numeric index — numeric indices shift whenever a USB audio
+device is plugged or unplugged, silently pointing the daemon at the wrong hardware.
+```bash
 systemctl --user daemon-reload && systemctl --user restart openclaw-realtimetalk
 ```
 
@@ -439,12 +453,13 @@ RealTimeTalk/
 | Speaker calibration hangs or takes 30+ seconds | Old per-step parec capture (v1.6) | v1.7 uses fast sd.rec (~6 s total) |
 | Speaker calibration sets max volume (PW 60%) | Old "max tone energy" logic always picked loudest step | v1.7 picks minimum clearly-audible step (SNR knee) |
 | No audio from speaker after calibration | Calibrated level too low, or wrong sink | Check dashboard device panel; use Manual adjustment on speaker-cal page |
-| Dashboard squares/boxes in text | Browser font has no emoji | v1.7 uses plain ASCII throughout |
+| Dashboard button icon shows as a blank box (owner/everyone 👤 specifically) | No color-emoji font installed — that icon is outside the Basic Multilingual Plane, unlike the rest of the button glyphs | `sudo apt install fonts-noto-color-emoji` (installer does this automatically), then **fully restart Chromium** — it only re-scans system fonts at its own startup, not on page reload |
 | `aplay: audio open error: Device or resource busy` | PipeWire holds USB device exclusively | v1.7 plays TTS via paplay through PipeWire; speaker-cal also PipeWire-native |
-| AGC source not appearing after reboot | PipeWire config not loaded | Check `~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf` exists; run `systemctl --user restart pipewire` |
+| Selected speaker shows "Idle" in the dashboard and Play test produces no sound | `_find_usb_speaker_sink()` ignored PipeWire's actual default sink and always played to the first non-HDMI sink in creation order (often the onboard jack) regardless of what's selected | Fixed in v3.10.0 — both sink-lookup helpers now prefer the current default sink |
+| Mic stops working after a USB device is plugged/unplugged | `--input-device <number>` pins a numeric index that shifts whenever the set of USB audio devices changes | Use `--input-device pipewire` (installer's default since v3.10.0) instead of a numeric index — it's a name, not an index, so it survives hot-plug |
 | `speech_started` fires but never `speech_stopped` | Noise floor with gain applied looks like speech | Run Calibrate mic from dashboard |
-| Piper produces silence / wrong language | espeak-ng missing for Chinese | `apt install espeak-ng` |
-| Service not starting after reboot | Linger not enabled | `loginctl enable-linger $USER` |
+| Piper produces silence / wrong language | espeak-ng missing for Chinese | `apt install espeak-ng` (installer does this automatically) |
+| Service not starting after reboot | Linger not enabled | `loginctl enable-linger $USER` (installer does this automatically) |
 
 ---
 

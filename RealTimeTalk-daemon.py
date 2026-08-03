@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.9.1"
+__version__ = "3.10.0"
 
 import argparse
 import asyncio
@@ -480,41 +480,58 @@ def _find_always_on_mic_source() -> str | None:
     return None
 
 
+def _qualifying_sinks() -> list[list[str]]:
+    """Return [index, name] pairs for sinks that are neither HDMI, a monitor,
+    nor the internal AGC loopback sink."""
+    out = subprocess.run(["pactl", "list", "short", "sinks"],
+                         capture_output=True, text=True).stdout
+    result = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            name = parts[1]
+            if ("hdmi" not in name.lower()
+                    and "monitor" not in name.lower()
+                    and not name.startswith("rtt_agc")):
+                result.append(parts)
+    return result
+
+
 def _find_usb_speaker_sink() -> str | None:
-    """Return the PipeWire sink index of the first non-HDMI, non-Bluetooth USB sink."""
+    """Return the PipeWire sink index of the currently active speaker: the
+    default sink if it qualifies (non-HDMI/monitor/AGC), else the first
+    qualifying sink."""
     try:
-        out = subprocess.run(["pactl", "list", "short", "sinks"],
-                             capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                name = parts[1]
-                if ("hdmi" not in name.lower()
-                        and "monitor" not in name.lower()
-                        and not name.startswith("rtt_agc")):
-                    return parts[0]   # sink index
+        qualifying = _qualifying_sinks()
+        default_name = subprocess.run(["pactl", "get-default-sink"],
+                                      capture_output=True, text=True).stdout.strip()
+        for parts in qualifying:
+            if parts[1] == default_name:
+                return parts[0]   # sink index
+        if qualifying:
+            return qualifying[0][0]
     except Exception:
         pass
     return None
 
 
 def _find_usb_speaker_sink_name() -> str | None:
-    """Return the PipeWire sink NAME of the USB speaker (for paplay --device).
+    """Return the PipeWire sink NAME of the currently active speaker (for
+    paplay --device): the default sink if it qualifies, else the first
+    qualifying sink.
 
     PipeWire holds USB devices exclusively, so direct-ALSA `aplay -D plughw`
     fails with 'device busy'. Speaker calibration must play through PipeWire.
     """
     try:
-        out = subprocess.run(["pactl", "list", "short", "sinks"],
-                             capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                name = parts[1]
-                if ("hdmi" not in name.lower()
-                        and "monitor" not in name.lower()
-                        and not name.startswith("rtt_agc")):
-                    return name
+        qualifying = _qualifying_sinks()
+        default_name = subprocess.run(["pactl", "get-default-sink"],
+                                      capture_output=True, text=True).stdout.strip()
+        for parts in qualifying:
+            if parts[1] == default_name:
+                return default_name
+        if qualifying:
+            return qualifying[0][1]
     except Exception:
         pass
     return None
@@ -636,6 +653,7 @@ def _apply_agc_profile(radio: bool) -> None:
     and mic mode (gain_control=true), then hot-reload the echo-cancel module."""
     import time as _ta
     try:
+        os.makedirs(os.path.dirname(_AGC_CONF), exist_ok=True)
         # Reliable fallback mic — physical device name is stable across reboots
         _FALLBACK_MIC  = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
         iface = _active_radio_iface[0]
@@ -1334,13 +1352,21 @@ def _update_agc_capture_source(physical_source: str) -> bool:
 
 
 def _activate_agc_source() -> bool:
-    """Make the WebRTC AGC source the PipeWire default if it exists.
+    """Make the WebRTC AGC source the PipeWire default, creating it first if needed.
+
+    _apply_agc_profile() is otherwise only invoked reactively (radio interface
+    plugged/unplugged) — on a plain mic+speaker Pi that never sees a radio
+    interface, nothing would ever create the AGC source at all, and every
+    startup would silently fall back to static gain/gate forever. Create it
+    here on first use instead.
 
     Returns True when AGC is active (daemon should use AGC-tuned gain/gate),
     False when it should fall back to the static --mic-gain / --mic-gate.
     """
     if not _agc_source_available():
-        return False
+        _apply_agc_profile(radio=False)
+        if not _agc_source_available():
+            return False
     try:
         subprocess.run(
             ["pactl", "set-default-source", AGC_SOURCE_NAME],
@@ -4481,8 +4507,17 @@ setInterval(upd, 2000);
                                 proc = _sp.Popen(["paplay", f"--device={mon_sink}", _pre],
                                                  stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             else:
-                                proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
-                                                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                                # PipeWire holds USB devices exclusively, so play
+                                # through PipeWire (paplay -> sink) rather than
+                                # direct-ALSA aplay, which fails 'device busy' and
+                                # silently falls back to an inaudible device.
+                                speaker_sink = _find_usb_speaker_sink_name()
+                                if speaker_sink:
+                                    proc = _sp.Popen(["paplay", f"--device={speaker_sink}", _pre],
+                                                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                                else:
+                                    proc = _sp.Popen(["aplay", "-D", alsa, "-q", _pre],
+                                                     stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             _headset_cal_proc[0] = proc
                             proc.wait()
                             _headset_cal_proc[0] = None
@@ -5683,7 +5718,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
         return
 
     try:
-        oww = _OWWModel(wakeword_models=[_model_path], inference_framework='onnx')
+        oww = _OWWModel(wakeword_model_paths=[_model_path])
     except Exception as exc:
         log.error("openwakeword model load failed: %s", exc)
         return
@@ -5958,8 +5993,15 @@ if __name__ == "__main__":
                    help=f"HTTP toggle port (default {DEFAULT_HTTP_PORT})")
     p.add_argument("--input-source",   type=str, default=None,
                    help="PipeWire source name to use as mic (overrides AGC auto-select)")
-    p.add_argument("--input-device",   type=int, default=None,
-                   help="sounddevice input device index (see --list-devices)")
+    def _device_index_or_name(v):
+        try:
+            return int(v)
+        except ValueError:
+            return v
+    p.add_argument("--input-device",   type=_device_index_or_name, default=None,
+                   help="sounddevice input device index or name (see --list-devices); "
+                        "prefer a stable name (e.g. 'pipewire') over an index, which "
+                        "shifts when USB audio devices are hot-plugged")
     p.add_argument("--alsa-output",    type=str, default=ALSA_OUTPUT,
                    help=f"ALSA output device for TTS playback (default: {ALSA_OUTPUT})")
     p.add_argument("--session-key",    type=str, default=OPENCLAW_SESSION,
