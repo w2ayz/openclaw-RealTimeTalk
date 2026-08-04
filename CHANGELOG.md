@@ -1,3 +1,15 @@
+## v3.10.2 — 2026-08-04
+
+### Fixed
+
+- **v3.10.1's openwakeword fix broke wake-word loading on this Pi's actual environment.** That commit assumed openwakeword 0.4.0's API everywhere (`wakeword_model_paths` kwarg, no explicit `inference_framework`) — but this Pi has 0.6.0 installed, which deprecated `wakeword_model_paths` back in favor of `wakeword_models` again (the API renamed the same argument in both directions across versions) and defaults `inference_framework` to `"tflite"`. Since the daemon always loads a hardcoded `.onnx` model file regardless of installed version, the missing `inference_framework='onnx'` made loading fail outright: `"The tflite inference framework is selected, but onnx models were provided!"`. Fixed by always passing `inference_framework='onnx'` (correct on any version, since the model file's format never changes) and trying `wakeword_models=` first, falling back to `wakeword_model_paths=` on `TypeError` — works across the openwakeword version installed here (0.6.0) and the one the previous fix targeted (0.4.0), instead of assuming a single specific version everywhere this daemon runs.
+
+### Changed
+
+- **TTS self-interrupt guard window doubled, 1s → 2s** (`_GUARD_TICKS` in `speak()`). The echo-coupling estimate from only ~700ms of real audio was too short a sample — a self-interrupt could trip almost immediately once the guard ended, cutting off a reply within about a second of it starting. Confirmed on real hardware: a reply got self-interrupted this way, immediately followed by a rejected non-owner voice check on whatever the mic picked up next — consistent with Five's own TTS bleeding into the mic before the coupling estimate had converged.
+
+---
+
 ## v3.10.0 — 2026-08-03
 
 ### Added

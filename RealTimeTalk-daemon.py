@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.10.1"
+__version__ = "3.10.2"
 
 import argparse
 import asyncio
@@ -1972,7 +1972,10 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             _sr = PIPER_SAMPLE_RATE
         _output_peak   = int(np.max(np.abs(_final_pcm))) if len(_final_pcm) else 0
         _TICK_SAMPLES  = max(1, _sr * 50 // 1000)   # samples per 50ms tick
-        _GUARD_TICKS   = 20                          # 1s guard: 300ms silence + 700ms audio
+        _GUARD_TICKS   = 40                          # 2s guard (doubled from 1s — the coupling
+                                                      # estimate from only ~700ms of real audio was
+                                                      # too short a sample, letting a self-interrupt
+                                                      # trip almost immediately once the guard ended)
         _SAFETY        = 3.5                         # threshold = echo × 3.5 (reverb can be 3-4× guard measurement)
 
         mic_peaks_during: list[int] = []
@@ -5718,8 +5721,19 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
         log.warning("hey_jarvis model not found at %s — local wake word disabled", _model_path)
         return
 
+    # _model_path is always an .onnx file (hardcoded above), so inference_framework
+    # must always be "onnx" regardless of openwakeword version — its default
+    # ("tflite") makes loading this model fail outright. The kwarg name for the
+    # model list has also churned across versions in both directions (0.4.0 wants
+    # wakeword_model_paths; 0.6.0 deprecated that back in favor of wakeword_models,
+    # though it still accepts the old name with a warning) — try the current name
+    # first, fall back to the older one on TypeError instead of assuming one
+    # specific installed version.
     try:
-        oww = _OWWModel(wakeword_model_paths=[_model_path])
+        try:
+            oww = _OWWModel(wakeword_models=[_model_path], inference_framework='onnx')
+        except TypeError:
+            oww = _OWWModel(wakeword_model_paths=[_model_path], inference_framework='onnx')
     except Exception as exc:
         log.error("openwakeword model load failed: %s", exc)
         return
