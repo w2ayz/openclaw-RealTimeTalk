@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.10.2"
+__version__ = "3.11.0"
 
 import argparse
 import asyncio
@@ -1097,28 +1097,53 @@ CALIBRATE_PHRASES = {
     "adjust mic for noise", "adjust microphone for noise",
 }
 
-WAKE_PHRASES  = {"five wake up", "5 wake up", "real time talk on", "real-time talk on", "realtimetalk on",
-                 "five 醒来", "five 醒", "five 开始", "wake up five", "wake up 5",
-                 "hey jarvis", "hey jarvis wake up",
-                 "hej jarvis", "hay jarvis", "jarvis"}  # also caught by openwakeword in SLEEP state
-SLEEP_PHRASES = {"five go to sleep", "5 go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
-                 "five 睡觉", "five 休息", "five 停", "sleep five"}
-MONITOR_ON_PHRASES  = {"five start monitoring", "start monitoring", "five monitor on",
-                       "monitor on", "five monitoring on"}
-MONITOR_OFF_PHRASES = {"five stop monitoring", "stop monitoring", "five monitor off",
-                       "monitor off", "five monitoring off"}
-CONTINUE_PHRASES    = {"continue", "five continue", "please continue", "go on", "go ahead",
-                       "keep going", "继续", "继续说", "你继续", "请继续"}
-# Owner-only mode toggles. Keep phrases ≥3 words — _matches_phrase's 60%
-# word-overlap fuzzy pass makes short phrases trigger-happy.
-OWNER_ONLY_ON_PHRASES  = {"only listen to me", "five only listen to me",
-                          "owner only mode", "owner mode on",
-                          "只听我的", "只听我说话", "只听我的话"}
-OWNER_ONLY_OFF_PHRASES = {"listen to everyone", "five listen to everyone",
-                          "everyone mode", "owner mode off",
-                          "听大家的", "听所有人的", "听大家说话"}
+# Agent identity — overridden at startup by --agent-name / --wake-phrase (see argparse
+# section at the bottom). All phrase sets below are rebuilt from these once args are parsed;
+# the literals here are just the pre-override defaults (used by --list-devices/--calibrate
+# early-exit paths, which return before the rebuild runs).
+AGENT_NAME    = "Zeebot"
+AGENT_NAME_LC = "zeebot"
 
-# Wake confirmation — affirmative responses accepted after Five asks "Yes?"
+def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
+    """Return (WAKE, SLEEP, MON_ON, MON_OFF, CONTINUE, OWNER_ON, OWNER_OFF) for an agent name.
+
+    `wake_phrase` overrides the primary wake phrase (e.g. a custom phonetic
+    respelling); "<name> wake up" is always kept as an additional recognised
+    phrase alongside it. "Hey Jarvis" stays fixed regardless of agent name —
+    it's tied to openwakeword's pretrained hey_jarvis_v0.1.onnx model, not a
+    phrase this daemon can rename.
+    """
+    primary = (wake_phrase or "").strip().lower() or f"{name_lc} wake up"
+    wake = {primary, f"{name_lc} wake up", "real time talk on", "real-time talk on", "realtimetalk on",
+            f"{name_lc} 醒来", f"{name_lc} 醒", f"{name_lc} 开始", f"wake up {name_lc}",
+            "hey jarvis", "hey jarvis wake up",
+            "hej jarvis", "hay jarvis", "jarvis"}  # also caught by openwakeword in SLEEP state
+    if name_lc == "five":
+        wake |= {"5 wake up", "wake up 5"}  # digit synonym, historical default agent name
+    sleep = {f"{name_lc} go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
+             f"{name_lc} 睡觉", f"{name_lc} 休息", f"{name_lc} 停", f"sleep {name_lc}"}
+    if name_lc == "five":
+        sleep |= {"5 go to sleep"}
+    mon_on  = {f"{name_lc} start monitoring", "start monitoring", f"{name_lc} monitor on",
+               "monitor on", f"{name_lc} monitoring on"}
+    mon_off = {f"{name_lc} stop monitoring", "stop monitoring", f"{name_lc} monitor off",
+               "monitor off", f"{name_lc} monitoring off"}
+    cont    = {"continue", f"{name_lc} continue", "please continue", "go on", "go ahead",
+               "keep going", "继续", "继续说", "你继续", "请继续"}
+    # Owner-only mode toggles. Keep phrases ≥3 words — _matches_phrase's 60%
+    # word-overlap fuzzy pass makes short phrases trigger-happy.
+    owner_on  = {"only listen to me", f"{name_lc} only listen to me",
+                 "owner only mode", "owner mode on",
+                 "只听我的", "只听我说话", "只听我的话"}
+    owner_off = {"listen to everyone", f"{name_lc} listen to everyone",
+                 "everyone mode", "owner mode off",
+                 "听大家的", "听所有人的", "听大家说话"}
+    return wake, sleep, mon_on, mon_off, cont, owner_on, owner_off
+
+(WAKE_PHRASES, SLEEP_PHRASES, MONITOR_ON_PHRASES, MONITOR_OFF_PHRASES,
+ CONTINUE_PHRASES, OWNER_ONLY_ON_PHRASES, OWNER_ONLY_OFF_PHRASES) = _build_phrase_sets(AGENT_NAME_LC)
+
+# Wake confirmation — affirmative responses accepted after the agent asks "Yes?"
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
     "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
@@ -2816,7 +2841,7 @@ class RealtimeSession:
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "Going silent now. Say Five wake up to resume.", self.alsa_output
+                        None, speak, f"Going silent now. Say {AGENT_NAME} wake up to resume.", self.alsa_output
                     )
                 finally:
                     self._busy.clear()
@@ -2963,10 +2988,10 @@ class RealtimeSession:
         import time as _tact2; _last_activity[0] = _tact2.time()
         self._busy.set()
         try:
-            log.info("Routing to Five: %s", transcript)
+            log.info("Routing to %s: %s", AGENT_NAME, transcript)
             _log_entry("you", transcript)
-            _log_entry("thinking", "Five is thinking...")  # live counter shown on dashboard
-            # Prefix tells Five to ignore cron/heartbeat background context
+            _log_entry("thinking", f"{AGENT_NAME} is thinking...")  # live counter shown on dashboard
+            # Prefix tells the agent to ignore cron/heartbeat background context
             voice_msg = f"[voice] {transcript}"
             _think_task = asyncio.ensure_future(
                 self.gw.ask(voice_msg, session_key=self.session_key)
@@ -2982,14 +3007,14 @@ class RealtimeSession:
             finally:
                 _current_think_task[0] = None
             if not reply:
-                log.warning("History fallback also empty — no reply from Five")
-                _log_entry("system", "No reply from Five — please try again.")
+                log.warning("History fallback also empty — no reply from %s", AGENT_NAME)
+                _log_entry("system", f"No reply from {AGENT_NAME} — please try again.")
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak, "Sorry, I didn't get a response. Please try again.",
                     self.alsa_output
                 )
                 return
-            log.info("Five: %s", reply)
+            log.info("%s: %s", AGENT_NAME, reply)
             _log_entry("five", reply)
             await asyncio.get_running_loop().run_in_executor(
                 None, speak, reply, self.alsa_output, -1.0, 300, True, True  # resumable, interruptible
@@ -3112,7 +3137,7 @@ class RealtimeSession:
                     },
                 },
             }))
-            log.info("Session active — speak now (routed through Five / OpenClaw)")
+            log.info("Session active — speak now (routed through %s / OpenClaw)", AGENT_NAME)
 
             import time as _st
             _last_mic_cb[0] = _st.time()   # seed so watchdog doesn't fire immediately
@@ -3319,7 +3344,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 elif _get_spk_extractor() is None:
                     out = {"ok": False, "error": "sherpa-onnx or model unavailable"}
                 elif _is_speaking[0]:
-                    out = {"ok": False, "error": "Five is speaking — try again"}
+                    out = {"ok": False, "error": f"{AGENT_NAME} is speaking — try again"}
                 else:
                     pcm  = _record_pcm_blocking(secs)
                     peak = int(np.max(np.abs(pcm))) if len(pcm) else 0
@@ -3370,7 +3395,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     out = {"ok": False, "error": f"no {'radio' if radio else 'mic'} profile "
                                                   f"enrolled or model unavailable"}
                 elif _is_speaking[0]:
-                    out = {"ok": False, "error": "Five is speaking — try again"}
+                    out = {"ok": False, "error": f"{AGENT_NAME} is speaking — try again"}
                 else:
                     pcm = _record_pcm_blocking(4.0)
                     emb = _compute_embedding(pcm, DEVICE_RATE)
@@ -3461,10 +3486,10 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 
 <h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Mic Voice Profile</h3>
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Hey Jarvis, Five wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Hey Jarvis, {AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="rec(this,'1','en','mic')">&#9210; Record 5s</button> <span id="mic-s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Five 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="rec(this,'2','zh','mic')">&#9210; Record 5s</button> <span id="mic-s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -3479,10 +3504,10 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 If missing, Owner-Only mode still works but accepts all speakers over radio.</p>
 {radio_hint}
 <div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Hey Jarvis, Five wake up. Please check my calendar and read me the news for today.&rdquo;</p>
+<p class="info">Read aloud: &ldquo;Hey Jarvis, {AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
 <button onclick="rec(this,'1','en','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;Five 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
+<p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
 <button onclick="rec(this,'2','zh','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
@@ -5058,7 +5083,7 @@ setInterval(upd, 2000);
                     '&#128225; TRANSMITTING&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if (_is_tx[0] and speaking) else
-                    '<div class="spkbanner">&#9834; Five is speaking&hellip;'
+                    f'<div class="spkbanner">&#9834; {AGENT_NAME} is speaking&hellip;'
                     ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
                     if speaking else
                     '<div class="spkbanner paused">&#9646;&#9646; Paused'
@@ -5087,7 +5112,7 @@ setInterval(upd, 2000);
                     if e["role"] == "you":
                         rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
                     elif e["role"] == "five":
-                        rows += f'<div class="five">{ts_span}<b>Five:</b> {e["text"]}</div>'
+                        rows += f'<div class="five">{ts_span}<b>{AGENT_NAME}:</b> {e["text"]}</div>'
                     elif e["role"] == "monitor":
                         rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
                     elif e["role"] == "thinking":
@@ -5095,7 +5120,7 @@ setInterval(upd, 2000);
                         dur = thinking_dur.get(ep)
                         if dur is None:
                             rows += (f'<div class="thinking">{ts_span}'
-                                     f'Five is thinking&hellip; '
+                                     f'{AGENT_NAME} is thinking&hellip; '
                                      f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
                                      f' &nbsp;<a href="/interrupt" class="irupt">&#10005; Interrupt</a>'
                                      f'</div>')
@@ -5318,7 +5343,7 @@ def _dtmf_listener() -> None:
         if DTMF_WAKE_SEQ in seq:
             seq = ""
             log.info("DTMF wake '%s' received", DTMF_WAKE_SEQ)
-            _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking Five")
+            _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking {AGENT_NAME}")
             if _idle_disconnected[0] and _wake_event[0]:
                 _last_activity[0] = now; _wake_activate[0] = True
                 _persist_active[0] = True; _save_sleep_state(False)
@@ -5329,13 +5354,13 @@ def _dtmf_listener() -> None:
         elif DTMF_SLEEP_SEQ in seq:
             seq = ""
             log.info("DTMF sleep '%s' received", DTMF_SLEEP_SEQ)
-            _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — Five silent")
+            _log_entry("system", f"DTMF {DTMF_SLEEP_SEQ} — {AGENT_NAME} silent")
             _persist_active[0] = False
             _dtmf_force_silent[0] = True
         elif DTMF_DEEPSLEEP_SEQ in seq:
             seq = ""
             log.info("DTMF deep-sleep '%s' received", DTMF_DEEPSLEEP_SEQ)
-            _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — Five sleeping (disconnecting)")
+            _log_entry("system", f"DTMF {DTMF_DEEPSLEEP_SEQ} — {AGENT_NAME} sleeping (disconnecting)")
             _persist_active[0] = False
             _wake_activate[0] = False        # discard any stale activation intent
             _persist_monitoring[0] = False   # clear monitoring when going to deep sleep
@@ -5781,7 +5806,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                         last_trigger = now
                         log.info("Wake word detected (score=%.2f)", score)
                         if _idle_disconnected[0] and _wake_event[0]:
-                            _log_entry("system", "Wake word detected — entering silent mode. Say 'Five wake up' to activate.")
+                            _log_entry("system", f"Wake word detected — entering silent mode. Say '{AGENT_NAME} wake up' to activate.")
                             _last_activity[0] = now
                             # Intentionally NOT setting _wake_activate — OWW wakes to Silent,
                             # not Active. User must say the wake phrase to go Active.
@@ -5930,7 +5955,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
 
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref)
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or 'Five wake up' to activate)")
+    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or '%s wake up' to activate)", AGENT_NAME)
 
     while not stop_event.is_set():
         # If sleeping (restored from disk or just auto-slept), wait for wake before connecting
@@ -5957,7 +5982,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             _wake_activate[0] = False
             log.info("Wake-from-sleep: session started active (HTTP wake)")
         elif _woke_from_sleep:
-            log.info("Wake-from-sleep: session started silent (OWW wake) — say 'Five wake up' to activate")
+            log.info("Wake-from-sleep: session started silent (OWW wake) — say '%s wake up' to activate", AGENT_NAME)
         session_ref[0] = session
         try:
             await session.run()
@@ -6027,11 +6052,21 @@ if __name__ == "__main__":
                    help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
     p.add_argument("--spk-threshold",  type=float, default=None,
                    help=f"Speaker-verification cosine threshold override (default: {SPK_THRESHOLD_DEFAULT})")
+    p.add_argument("--agent-name",     type=str, default="Zeebot",
+                   help="Agent name used in wake/sleep phrases and UI (default: Zeebot)")
+    p.add_argument("--wake-phrase",    type=str, default=None,
+                   help="Primary wake phrase override (default: '<name> wake up')")
     p.add_argument("--list-devices",   action="store_true",
                    help="Print available audio devices and exit")
     p.add_argument("--calibrate",      action="store_true",
                    help="Measure ambient noise and print recommended --mic-gate value, then exit")
     args = p.parse_args()
+
+    AGENT_NAME    = args.agent_name.strip()
+    AGENT_NAME_LC = AGENT_NAME.lower()
+    (WAKE_PHRASES, SLEEP_PHRASES, MONITOR_ON_PHRASES, MONITOR_OFF_PHRASES,
+     CONTINUE_PHRASES, OWNER_ONLY_ON_PHRASES, OWNER_ONLY_OFF_PHRASES) = \
+        _build_phrase_sets(AGENT_NAME_LC, args.wake_phrase)
 
     if args.list_devices:
         print(sd.query_devices())

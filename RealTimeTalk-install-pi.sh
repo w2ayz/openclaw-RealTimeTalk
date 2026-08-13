@@ -190,8 +190,38 @@ echo "      (see step 7) — no device index needed here.  Use the dashboard's"
 echo "      'Use' buttons, or 'pactl set-default-source/-sink <name>', to pick"
 echo "      a specific device; the daemon follows PipeWire's default at runtime."
 
-# ── 7. systemd user service ───────────────────────────────────────────────────
-echo "[7/8] Writing systemd service…"
+# ── 7. Agent identity + systemd user service ──────────────────────────────────
+echo "[7/8] Configuring agent identity…"
+
+# Preserve the existing agent name / wake phrase across re-runs (e.g. after
+# `git pull`) instead of silently reprompting with the new code default —
+# a re-run must never rename a live deployment out from under it.
+EXISTING_AGENT_NAME=""
+EXISTING_WAKE_PHRASE=""
+if [ -f "$SERVICE_FILE" ]; then
+    EXISTING_AGENT_NAME="$(grep -oP -- '--agent-name \K\S+' "$SERVICE_FILE" 2>/dev/null || true)"
+    EXISTING_WAKE_PHRASE="$(grep -oP -- '--wake-phrase "\K[^"]+' "$SERVICE_FILE" 2>/dev/null || true)"
+fi
+
+if [ -n "$EXISTING_AGENT_NAME" ]; then
+    DEFAULT_AGENT_NAME="$EXISTING_AGENT_NAME"
+elif [ -f "$SERVICE_FILE" ]; then
+    # Pre-existing install from before --agent-name existed — it was always "Five".
+    DEFAULT_AGENT_NAME="Five"
+else
+    DEFAULT_AGENT_NAME="Zeebot"
+fi
+
+read -r -p "      Agent name  [Enter for '$DEFAULT_AGENT_NAME']: " AGENT_NAME_ARG
+AGENT_NAME_ARG="${AGENT_NAME_ARG:-$DEFAULT_AGENT_NAME}"
+
+WAKE_PHRASE_PROMPT_DEFAULT="${EXISTING_WAKE_PHRASE:-${AGENT_NAME_ARG,,} wake up}"
+read -r -p "      Wake phrase [Enter for '$WAKE_PHRASE_PROMPT_DEFAULT']: " WAKE_PHRASE_ARG
+WAKE_PHRASE_ARG="${WAKE_PHRASE_ARG:-$WAKE_PHRASE_PROMPT_DEFAULT}"
+
+echo "      ✓ agent name: $AGENT_NAME_ARG   wake phrase: $WAKE_PHRASE_ARG"
+
+echo "      Writing systemd service…"
 mkdir -p "$SERVICE_DIR"
 
 # "pipewire" / "default" are PipeWire's own ALSA-compat pseudo-devices (from the
@@ -207,6 +237,7 @@ build_exec_start() {
     local cmd="$PYTHON $DAEMON"
     [ "$INPUT_DEVICE" != "none" ] && cmd="$cmd --input-device $INPUT_DEVICE"
     [ "$ALSA_OUTPUT"  != "none" ] && cmd="$cmd --alsa-output $ALSA_OUTPUT"
+    cmd="$cmd --agent-name \"$AGENT_NAME_ARG\" --wake-phrase \"$WAKE_PHRASE_ARG\""
     echo "$cmd"
 }
 
@@ -258,3 +289,6 @@ fi
 echo "To pin a specific mic/speaker instead of PipeWire's default:"
 echo "  1. Edit INPUT_DEVICE / ALSA_OUTPUT near the bottom of this script"
 echo "  2. Re-run: bash $(basename "$0")"
+echo ""
+echo "To change agent name or wake phrase later: bash $(basename "$0") — re-running"
+echo "prompts again (Enter keeps the current name/phrase, shown as the default)."

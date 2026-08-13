@@ -157,6 +157,11 @@ Voice ID (enrollment / test page) lives on the **Calibrate** page, as the **firs
 
 ### Voice commands
 
+> The agent name is configurable (`--agent-name`, default **Zeebot**) — see
+> [Deployment.md §5](Deployment.md#5-agent-name--wake-phrase). This table
+> uses **Five** as the example throughout since that's this Pi's configured
+> name; substitute your own.
+
 | Say | Effect |
 |-----|--------|
 | "Five wake up" | Request activation — Five asks "Yes?" for confirmation |
@@ -431,10 +436,15 @@ The `openai-codex` OAuth provider (ChatGPT consumer API) is also supported — t
 ```
 RealTimeTalk/
 ├── README.md                        this file
+├── Deployment.md                    step-by-step install guide (prerequisites, folder layout, agent name/wake phrase)
 ├── CHANGELOG.md                     version history
 ├── SKILL.md                         OpenClaw skill descriptor
+├── RADIO-INTERFACE.md               AIOC / Digirig radio interface reference
+├── UI-BUTTONS.md                    dashboard button reference
 ├── requirements.txt                 Python dependencies
 ├── RealTimeTalk-daemon.py           main daemon
+├── radio_interfaces.py              Radio Mode: interface registry, PTT/audio resolution
+├── dtmf_monitor.py                  standalone DTMF Mon/Train/Retrain CLI
 ├── RealTimeTalk-install-pi.sh       one-command Pi deploy
 └── RealTimeTalk-toggle.sh           start / stop / status / log / devices
 ```

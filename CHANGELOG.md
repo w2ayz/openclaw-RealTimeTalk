@@ -1,3 +1,13 @@
+## v3.11.0 — 2026-08-12
+
+### Added
+
+- **Configurable agent name and wake phrase via `--agent-name`/`--wake-phrase` CLI flags**, ported from the Mac fork ([`openclaw-RealTimeTalk-mac`](https://github.com/w2ayz/openclaw-RealTimeTalk-mac) v3.9.2). Every wake/sleep/monitor/owner-only-mode phrase set, plus all agent-name references in the dashboard, voice-enrollment pages, and log output, is now rebuilt from `--agent-name` at startup instead of the name being hardcoded as `Five` throughout the source. Defaults to `Zeebot` (matching the Mac fork and the wider OpenClaw convention) when the flag is omitted. `--wake-phrase` optionally overrides just the primary wake phrase (e.g. a custom phonetic respelling); `<name> wake up` is always kept as an additional recognised phrase alongside it. "Hey Jarvis" (the deep-sleep wake word) is intentionally **not** renamed — it's tied to openwakeword's pretrained `hey_jarvis_v0.1.onnx` model, not a phrase this daemon can substitute without training a custom model.
+- **`RealTimeTalk-install-pi.sh` now prompts for agent name and wake phrase** and injects `--agent-name`/`--wake-phrase` into the systemd `ExecStart` line. Re-running the installer (e.g. after `git pull`) preserves whatever name/phrase is already in the existing service file as the prompt default — and for an install predating this feature (no `--agent-name` in the unit file yet), the prompt defaults to `Five` specifically, not the new `Zeebot` code default, so a routine re-run never silently renames a live deployment.
+- **New `Deployment.md`**, adapted from the Mac fork's `DEPLOYMENT.md`: step-by-step prerequisites, folder structure, install/upgrade flow, and the agent-name/wake-phrase configuration steps above, written for someone who hasn't seen this repo before.
+
+---
+
 ## v3.10.2 — 2026-08-04
 
 ### Fixed
