@@ -1,3 +1,25 @@
+## v3.12.0 — 2026-08-13
+
+Ported the applicable fixes from the Mac fork's v3.9.3 session
+([`openclaw-RealTimeTalk-mac`](https://github.com/w2ayz/openclaw-RealTimeTalk-mac)),
+which also bumps to v3.12.0 to align version numbers between the two going
+forward.
+
+### Changed
+
+- **Owner-only mode now skips the wake-confirmation round-trip.** Previously every wake phrase — even in owner-only mode, where `_verify_speaker()` had already biometrically confirmed the speaker as the enrolled owner before the wake phrase is even evaluated — still got a "Yes?" and waited for a second confirming utterance. That confirmation step exists to filter unauthenticated false-positives, which doesn't apply once the voice is already verified; owner-only mode now activates immediately ("I'm listening.") on a verified wake phrase instead. Non-owner-only mode is unaffected — it still asks for confirmation, since there's no biometric check to lean on.
+
+### Fixed
+
+- **`strip_markdown()`'s backtick-stripping regex deleted the entire content of backtick-wrapped spans** instead of keeping the inner text, unlike the adjacent bold/italic regexes which correctly preserve it via a capture group. Since replies often wrap numeric values in backticks (e.g. `` `72°F` ``), this was silently erasing temperatures and other figures from spoken replies entirely.
+- **The TTS self-interrupt threshold could decay below its own guard-measured baseline on long replies**, eventually low enough that an ordinary loud syllable falsely triggered a self-interrupt. Two compounding causes, both fixed: (1) the continuously-tracked coupling estimate learned from any tick louder than a flat 200-sample floor, including quiet passages where the mic/output ratio is dominated by room noise rather than real echo — now requires the tick's output to be comparably loud to the reply's peak (≥30%) before learning from it; (2) even with (1), the guard's initial measurement is a max-over-max ratio across a full 2s window, which is statistically always ≥ any single later per-tick sample, so continuous EMA tracking would still trend downward over any sufficiently long reply regardless of gating — the threshold can now still rise if echo genuinely gets louder later in a reply, but never drops below the guard's own measurement (`guard_floor`).
+
+### Not ported (Mac-specific, doesn't apply here)
+
+- **ElevenLabs switched to the primary TTS engine for all replies** (Mac v3.9.3) — Pi's design deliberately keeps Piper as the primary, fully-offline TTS engine for an always-on headless deployment; ElevenLabs/OpenAI stay fallback-only for Chinese. Not a bug fix, a platform-appropriate design difference.
+- **CJK unit-reading fix for `_preprocess_units()`** (code-switching mid-sentence into English for °F/%/etc. in Chinese replies) — this workaround only exists on Mac because `eleven_v3` (its new primary TTS model) skips ElevenLabs' automatic text normalization. Pi still uses `eleven_multilingual_v2` (which normalizes automatically) as a Chinese-only fallback, and Piper's per-segment script-splitting already renders each language segment with the matching voice — Pi's architecture doesn't hit this bug class in the first place.
+- **`INVALID_OUTPUT_DEVICES` blocklist for "LG ULTRAWIDE"** — a CoreAudio phantom-audio-endpoint quirk specific to a monitor on the Mac Mini's desk. No Pi equivalent.
+
 ## v3.11.0 — 2026-08-12
 
 ### Added

@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.11.0"
+__version__ = "3.12.0"
 
 import argparse
 import asyncio
@@ -1688,7 +1688,7 @@ def _update_service_gate(new_gate: int):
 def strip_markdown(text: str) -> str:
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'`{1,3}[^`\n]*`{1,3}', '', text)
+    text = re.sub(r'`{1,3}([^`\n]*)`{1,3}', r'\1', text)
     text = re.sub(r'^\s*#+\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
@@ -2034,6 +2034,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             guard_max_out = 0   # peak output PCM during guard
             guard_max_mic = 0   # peak mic echo during guard
             interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
+            guard_floor = SPEAK_INTERRUPT_PEAK  # threshold floor set by the guard measurement — see below
             coupling: float | None = None
             tick_idx    = 0
             while True:
@@ -2065,6 +2066,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                                 int(_output_peak * coupling * _SAFETY),
                                 SPEAK_INTERRUPT_PEAK,
                             )
+                            guard_floor = interrupt_threshold[0]
                             log.info("TTS coupling=%.3f echo=%d out=%d → threshold=%d",
                                      coupling, guard_max_mic, guard_max_out,
                                      interrupt_threshold[0])
@@ -2077,12 +2079,23 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 # unevenly-loud reply doesn't outrun a threshold frozen from the
                 # start — but never learn from a tick that already looks like a
                 # real interruption, or a genuine barge-in would just get EMA'd away.
-                if tick_out > 200 and p <= interrupt_threshold[0]:
+                # Also require the tick to be genuinely loud (comparable to this
+                # reply's peak), not just above the 200 floor — a quiet tick's
+                # mic/output ratio is dominated by room noise floor rather than
+                # real echo, and letting those ticks drag the EMA down was
+                # confirmed live shrinking the threshold on long replies until an
+                # ordinary loud syllable tripped a false self-interrupt.
+                if tick_out > max(200, int(_output_peak * 0.3)) and p <= interrupt_threshold[0]:
                     local = p / tick_out
                     coupling = local if coupling is None else (
                         coupling * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                    # guard_floor never shrinks below the guard's own measurement: the
+                    # guard takes a MAX over a full 2s window, which is statistically
+                    # always ≥ any single later EMA sample, so unclamped tracking only
+                    # ever drifts down over a long reply. The EMA can still push the
+                    # threshold higher if echo genuinely grows louder later on.
                     interrupt_threshold[0] = max(
-                        int(_output_peak * coupling * _SAFETY), SPEAK_INTERRUPT_PEAK)
+                        int(_output_peak * coupling * _SAFETY), SPEAK_INTERRUPT_PEAK, guard_floor)
 
                 if _http_interrupt[0]:
                     _http_interrupt[0] = False
@@ -2813,6 +2826,29 @@ class RealtimeSession:
                     log.info("Wake phrase detected — already active")
                     await asyncio.get_running_loop().run_in_executor(
                         None, speak, "Yes, I'm here.", self.alsa_output
+                    )
+                finally:
+                    self._busy.clear()
+                return
+            # Silent or monitoring — normally ask for confirmation before activating
+            # (avoids self-triggering off the agent's own TTS or background chatter
+            # that happens to include the wake phrase) — UNLESS owner-only mode
+            # already biometrically verified this transcript came from the enrolled
+            # voice (via _verify_speaker above), in which case the confirmation
+            # round-trip is redundant and skipped.
+            if _owner_only[0] and _verification_available(_radio_profile_active[0]):
+                log.info("Wake phrase detected — owner voice verified, activating immediately")
+                _log_entry("system", "Voice activated (owner verified)")
+                self._busy.set()
+                try:
+                    if self._monitoring:
+                        self._monitoring = False
+                        _persist_monitoring[0] = False
+                    self._active = True
+                    _persist_active[0] = True
+                    import time as _tact3; _last_activity[0] = _tact3.time()
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, speak, "I'm listening.", self.alsa_output
                     )
                 finally:
                     self._busy.clear()
