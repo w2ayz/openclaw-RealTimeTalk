@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.0"
+__version__ = "3.12.1"
 
 import argparse
 import asyncio
@@ -5789,12 +5789,19 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     # wakeword_model_paths; 0.6.0 deprecated that back in favor of wakeword_models,
     # though it still accepts the old name with a warning) — try the current name
     # first, fall back to the older one on TypeError instead of assuming one
-    # specific installed version.
+    # specific installed version. Some 0.4.0 builds forward unrecognized kwargs
+    # into an internal AudioFeatures(...) call whose constructor never had an
+    # inference_framework parameter at all (onnx is its only option, so there's
+    # nothing to select) — TypeError there too, so a final fallback drops the
+    # kwarg entirely instead of assuming every build accepts it.
     try:
         try:
             oww = _OWWModel(wakeword_models=[_model_path], inference_framework='onnx')
         except TypeError:
-            oww = _OWWModel(wakeword_model_paths=[_model_path], inference_framework='onnx')
+            try:
+                oww = _OWWModel(wakeword_model_paths=[_model_path], inference_framework='onnx')
+            except TypeError:
+                oww = _OWWModel(wakeword_model_paths=[_model_path])
     except Exception as exc:
         log.error("openwakeword model load failed: %s", exc)
         return

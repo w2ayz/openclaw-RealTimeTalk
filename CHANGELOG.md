@@ -1,3 +1,9 @@
+## v3.12.1 — 2026-08-13
+
+### Fixed
+
+- **`_oww_wakeword_listener()`'s two-way version-compat fallback for loading `hey_jarvis_v0.1.onnx` still failed on some openwakeword 0.4.0 builds** — both the `wakeword_models=`+`inference_framework='onnx'` attempt and the `wakeword_model_paths=`+`inference_framework='onnx'` fallback pass `inference_framework` unconditionally, but on this build `Model.__init__` forwards unrecognized kwargs into an internal `AudioFeatures(...)` call whose constructor has no `inference_framework` parameter at all (its only supported format is onnx, so there's nothing to select) — both attempts raised the identical `TypeError: AudioFeatures.__init__() got an unexpected keyword argument 'inference_framework'`, silently disabling "Hey Jarvis" deep-sleep wake on affected installs (confirmed on a real Pi 5 install). Added a third fallback that drops `inference_framework` entirely on a second `TypeError`.
+
 ## v3.12.0 — 2026-08-13
 
 Ported the applicable fixes from the Mac fork's v3.9.3 session
