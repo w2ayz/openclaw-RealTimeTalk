@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.1"
+__version__ = "3.12.2"
 
 import argparse
 import asyncio
@@ -420,7 +420,18 @@ DTMF_WAKE_SILENT_SEQ = "789"   # transmit DTMF 7-8-9 to wake from deep sleep int
 DTMF_SAMPLE_RATE   = 8000    # Hz — standard for DTMF; AIOC audio downsampled from 48kHz
 DTMF_PROFILE_FILE  = os.path.expanduser("~/.config/rtt/dtmf_profiles.json")
 DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~120, open~300+)
-DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops
+DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops — kept tight for DTMF
+                             # digit-boundary timing precision; Playback listener uses its own,
+                             # longer tail below instead of sharing this one.
+PLAYBACK_TAIL_S    = 1.0     # seconds to hold COS open after signal drops, Playback listener only.
+                             # Live-measured on a Baofeng HT via AIOC (2026-08-15): idle floor is a
+                             # clean 36-44 (threshold=200 has huge margin, not the problem), but
+                             # mid-sentence gaps between syllables/words reached up to 0.55s — just
+                             # over the shared 0.5s DTMF_COS_TAIL_S, so the Playback listener kept
+                             # closing the capture mid-phrase and only queuing the last short
+                             # fragment (>= PLAYBACK_MIN_SECS survives, the rest are silently
+                             # dropped) — matches the observed 0.6-0.7s clips instead of full
+                             # utterances. 1.0s gives ~2x margin over the measured 0.55s gap.
 PLAYBACK_MIN_SECS  = 0.6     # shorter captures are noise/squelch-flap, not a real transmission — discard
 PLAYBACK_MAX_SECS  = 30.0    # cap a single capture so a stuck-open squelch can't grow memory unbounded
 PLAYBACK_COOLDOWN_S = 2.0    # after transmitting a replay on-air, ignore new segments for this long —
@@ -5628,6 +5639,24 @@ def _playback_worker() -> None:
         if not sink:
             log.warning("Playback: captured %.1fs but no radio sink found — dropped", secs)
             continue
+        # Normalize before transmit. Captured RX audio is at whatever level the
+        # source radio's speaker/data-out line happened to produce — live-measured
+        # on a Baofeng HT via AIOC (2026-08-15): voice peaks topped out around
+        # ~1600 (int16 full scale is 32767), i.e. roughly -26 dBFS. TTS/speak()'s
+        # Piper output is normalized much hotter than that, so at the same sink
+        # volume a verbatim replay of raw captured audio plays back far quieter
+        # than a normal transmission — easily below the receiving radio's squelch/
+        # noise floor, which read as "no voice came through" even though PTT keyed
+        # and paplay succeeded. Scale to a consistent target peak, capping the
+        # gain so a near-silent/noise-only capture doesn't get blown up into loud
+        # hiss. First live pass (target 90%, cap 20x) confirmed audible but still
+        # a bit quiet — some real captures run below the ~1600 calibration peak,
+        # so the 20x cap was the limiting factor, not the target. Raised both.
+        _pcm_arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        _peak = float(np.max(np.abs(_pcm_arr))) if len(_pcm_arr) else 0.0
+        if _peak > 0:
+            _gain = min(31785.0 / _peak, 32.0)   # target ~97% full scale, capped 32x
+            pcm_bytes = np.clip(_pcm_arr * _gain, -32768, 32767).astype(np.int16).tobytes()
         wav_path = _pw_tf.mktemp(suffix=".wav")
         try:
             with _pw_wave.open(wav_path, "wb") as wf:
@@ -5680,10 +5709,10 @@ def _playback_listener(stop_flag: list) -> None:
         if not found:
             _pl_time.sleep(3); continue
         _pb_iface, aioc_src = found
-        _pb_squelch = SquelchTracker(_pb_iface.cos_threshold, DTMF_COS_TAIL_S)
+        _pb_squelch = SquelchTracker(_pb_iface.cos_threshold, PLAYBACK_TAIL_S)
 
         log.info("Playback listener ready via %s (COS>=%d, tail=%.1fs, min=%.1fs) — on-air replay",
-                 _pb_iface.name, _pb_squelch.base_threshold, DTMF_COS_TAIL_S, PLAYBACK_MIN_SECS)
+                 _pb_iface.name, _pb_squelch.base_threshold, PLAYBACK_TAIL_S, PLAYBACK_MIN_SECS)
         proc = None
         try:
             proc = subprocess.Popen(

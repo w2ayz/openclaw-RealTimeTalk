@@ -1,3 +1,10 @@
+## v3.12.2 — 2026-08-15
+
+### Fixed
+
+- **EchoTest (`_playback_listener`/`_playback_worker`, the AIOC "on-air replay" dashboard toggle) fragmented real transmissions into unusable sub-second clips.** It shared `DTMF_COS_TAIL_S` (0.5s) as its squelch-open hangover with the DTMF digit decoder, which needs a tight tail for digit-boundary timing — but live-measured on a Baofeng HT, natural gaps between syllables/words during normal speech reached up to 0.55s, just over that hangover, so the listener kept closing the capture mid-sentence. Only the last fragment (if it happened to clear `PLAYBACK_MIN_SECS`) got queued and replayed; the rest were silently dropped. Gave the Playback listener its own `PLAYBACK_TAIL_S` (1.0s), decoupled from DTMF's.
+- **EchoTest replays were far too quiet to be reliably heard**, even after the fragmentation fix restored full-length captures. Captured RX audio sits at whatever level the transmitting radio's speaker/data-out line produces (live-measured peaks ~1600 of int16 full-scale 32767, roughly -26 dBFS) — much quieter than Piper's normalized TTS output, which the same sink volume is tuned for. `_playback_worker` now normalizes each captured segment to a consistent target peak before transmitting (first pass: 90% target/20x gain cap, still measured a bit quiet in the field; raised to 97% target/32x cap).
+
 ## v3.12.1 — 2026-08-13
 
 ### Fixed
