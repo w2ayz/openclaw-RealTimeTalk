@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.2"
+__version__ = "3.12.3"
 
 import argparse
 import asyncio
@@ -410,6 +410,14 @@ _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded i
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
+_mic_restart_gen:     list = [0]      # bumped by _apply_agc_profile() on every successful mic↔radio
+                                       # switch. ALSA's "pipewire" device binds to whatever concrete
+                                       # PipeWire node is default AT STREAM-OPEN TIME and does not
+                                       # migrate when the default source changes later — so any
+                                       # already-open sd.InputStream (main STT capture, openwakeword
+                                       # listener) keeps reading from the old AGC source/physical mic
+                                       # forever unless explicitly closed and reopened. Watchers below
+                                       # compare against this counter to know when to do that.
 # DTMF detection — sequences transmitted over radio to wake/sleep Five
 DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake Five
 DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to silent
@@ -690,13 +698,30 @@ def _apply_agc_profile(radio: bool) -> None:
         with open(_AGC_CONF, "w") as f:
             f.write(content)
 
-        # Hot-swap echo-cancel module
+        # Hot-swap echo-cancel module. Two different loaders can create an
+        # echo-cancel instance here: our own pactl load-module call below
+        # (module name "module-echo-cancel", unloads cleanly via pactl), and
+        # a persistent one PipeWire itself loads at its own startup from
+        # _AGC_CONF (module name "libpipewire-module-echo-cancel", written
+        # above for resilience across a PipeWire restart) — live-confirmed
+        # (2026-08-16) that `pactl unload-module` returns "Access denied" on
+        # that one, since it's a native context.modules entry, not a
+        # pulse-compat module. Left alive, its stale node coexists under the
+        # identical name "rtt_agc_source" alongside the fresh one, and
+        # WirePlumber's default-source resolution was observed binding real
+        # capture clients (the daemon's own STT stream) to the OLD stale
+        # node — so a mic↔radio switch silently stopped reaching actual
+        # speech recognition even though the logs claimed success. Only
+        # `pw-cli destroy` can remove it.
         mods = subprocess.run(["pactl", "list", "short", "modules"],
                               capture_output=True, text=True).stdout
         for line in mods.splitlines():
-            if "echo-cancel" in line:
-                subprocess.run(["pactl", "unload-module", line.split()[0]],
-                               capture_output=True)
+            if "echo-cancel" not in line:
+                continue
+            mod_id = line.split()[0]
+            subprocess.run(["pactl", "unload-module", mod_id], capture_output=True)
+            if "libpipewire-module-echo-cancel" in line:
+                subprocess.run(["pw-cli", "destroy", mod_id], capture_output=True)
         _ta.sleep(0.5)
         subprocess.run(["pactl", "load-module", "module-echo-cancel",
                         "aec_method=webrtc",
@@ -748,6 +773,7 @@ def _apply_agc_profile(radio: bool) -> None:
         log.info("AGC profile → %s (gain_control=%s, MIC_GAIN=%.0fx)",
                  "radio" if radio else "mic", not radio,
                  AGC_MIC_GAIN_RADIO if radio else AGC_MIC_GAIN)
+        _mic_restart_gen[0] += 1
 
         # Owner-only voice verification is less reliable over radio audio
         # (different frequency response/compression than the enrolled mic
@@ -1357,14 +1383,21 @@ def _update_agc_capture_source(physical_source: str) -> bool:
             f.write(content)
         # Update RAW_MIC_SOURCE so speaker-cal captures from the right mic
         globals()['RAW_MIC_SOURCE'] = physical_source
-        # Hot-swap: unload old echo-cancel module, load new one
+        # Hot-swap: unload old echo-cancel module, load new one. The
+        # config-loaded "libpipewire-module-echo-cancel" instance rejects
+        # pactl's unload ("Access denied" — it's a native context.modules
+        # entry, not pulse-compat) and needs pw-cli instead, or it survives
+        # as a stale, identically-named duplicate — see _apply_agc_profile
+        # for the live-confirmed failure mode this caused.
         mods = subprocess.run(["pactl", "list", "short", "modules"],
                               capture_output=True, text=True).stdout
         for line in mods.splitlines():
-            if "echo-cancel" in line:
-                mid = line.split()[0]
-                subprocess.run(["pactl", "unload-module", mid],
-                               capture_output=True)
+            if "echo-cancel" not in line:
+                continue
+            mid = line.split()[0]
+            subprocess.run(["pactl", "unload-module", mid], capture_output=True)
+            if "libpipewire-module-echo-cancel" in line:
+                subprocess.run(["pw-cli", "destroy", mid], capture_output=True)
         import time as _t2; _t2.sleep(0.5)
         subprocess.run([
             "pactl", "load-module", "module-echo-cancel",
@@ -1381,6 +1414,7 @@ def _update_agc_capture_source(physical_source: str) -> bool:
                        capture_output=True)
         log.info("AGC capture redirected to %s (AGC still active as default)",
                  physical_source)
+        _mic_restart_gen[0] += 1
         return True
     except Exception as e:
         log.warning("Could not redirect AGC capture: %s", e)
@@ -2571,17 +2605,24 @@ class RealtimeSession:
         return None
 
     async def _watch_mic_stream(self):
-        """Detect USB mic hot-unplug and reopen the stream when replugged."""
+        """Detect USB mic hot-unplug, or an AGC mic↔radio source switch, and
+        reopen the stream so it follows the new PipeWire default source."""
         import time as _wm
         await asyncio.sleep(5.0)   # let stream settle before watching
+        seen_gen = _mic_restart_gen[0]
         while not self.stop_event.is_set():
             await asyncio.sleep(2.0)
             if self.stop_event.is_set():
                 break
+            gen_changed = _mic_restart_gen[0] != seen_gen
             elapsed = _wm.time() - _last_mic_cb[0]
-            if elapsed < 4.0:
+            if elapsed < 4.0 and not gen_changed:
                 continue
-            log.warning("Mic silent %.1fs — hot-plug recovery starting", elapsed)
+            seen_gen = _mic_restart_gen[0]
+            if gen_changed:
+                log.info("AGC source switched — reopening mic stream to follow it")
+            else:
+                log.warning("Mic silent %.1fs — hot-plug recovery starting", elapsed)
             old = self._mic_stream_ref[0]
             try:
                 if old:
@@ -5856,10 +5897,16 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     buf = np.array([], dtype=np.int16)
 
     try:
+      while not stop_flag[0]:
+        # Snapshot the generation before opening — an AGC mic↔radio switch
+        # bumps _mic_restart_gen, and this stream (like the main STT capture)
+        # binds to whatever PipeWire node is default at open time and won't
+        # follow a later default-source change on its own. See _mic_restart_gen.
+        seen_gen = _mic_restart_gen[0]
         with sd.InputStream(samplerate=OWW_RATE, channels=1, dtype='int16',
                             blocksize=OWW_CHUNK, callback=_cb,
                             device=input_device):
-            while not stop_flag[0]:
+            while not stop_flag[0] and _mic_restart_gen[0] == seen_gen:
                 try:
                     chunk = audio_q.get(timeout=0.15)
                 except _q.Empty:
@@ -5891,6 +5938,14 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                                 _oww_confirm_pending[0] = True
                                 _oww_confirm_t[0] = now
                                 log.info("OWW: silent mode — priming wake confirmation")
+        if not stop_flag[0]:
+            log.info("AGC source switched — reopening wake-word listener stream")
+            buf = np.array([], dtype=np.int16)
+            while not audio_q.empty():   # drop audio queued from the old source
+                try:
+                    audio_q.get_nowait()
+                except _q.Empty:
+                    break
     except Exception as exc:
         log.error("openwakeword listener crashed: %s", exc)
 
