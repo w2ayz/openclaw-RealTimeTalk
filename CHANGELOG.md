@@ -1,3 +1,9 @@
+## v3.12.4 — 2026-08-18
+
+### Fixed
+
+- **DTMF wake (`123`) sent while in Monitoring state left the dashboard/status stuck showing Monitoring instead of switching to Active.** `_send_mic()`'s `_dtmf_force_active` handler set `self._active = True` but never cleared `self._monitoring`, so both flags stayed set simultaneously — every other path that transitions into Active (e.g. the openwakeword confirm-wake path) already clears `self._monitoring` first; this was the one path that missed it. Also cleared the persisted `_persist_monitoring` flag in the DTMF `123` handler itself, so the stuck state didn't survive a reconnect either.
+
 ## v3.12.3 — 2026-08-16
 
 ### Fixed

@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.3"
+__version__ = "3.12.4"
 
 import argparse
 import asyncio
@@ -2702,6 +2702,9 @@ class RealtimeSession:
             # Apply DTMF force flags immediately (don't wait for next transcript)
             if _dtmf_force_active[0]:
                 _dtmf_force_active[0] = False
+                if self._monitoring:
+                    self._monitoring = False   # Active supersedes Monitoring
+                    _log_entry("system", "Monitoring stopped")
                 if not self._active:
                     self._active = True
                     _last_activity[0] = __import__("time").time()
@@ -5432,6 +5435,7 @@ def _dtmf_listener() -> None:
             seq = ""
             log.info("DTMF wake '%s' received", DTMF_WAKE_SEQ)
             _log_entry("system", f"DTMF {DTMF_WAKE_SEQ} — waking {AGENT_NAME}")
+            _persist_monitoring[0] = False   # Active supersedes Monitoring — don't leave it stuck on
             if _idle_disconnected[0] and _wake_event[0]:
                 _last_activity[0] = now; _wake_activate[0] = True
                 _persist_active[0] = True; _save_sleep_state(False)
