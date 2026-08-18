@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.5"
+__version__ = "3.12.6"
 
 import argparse
 import asyncio
@@ -3271,6 +3271,192 @@ class RealtimeSession:
                     pass
                 self._mic_stream_ref[0] = None
 
+def _dashboard_dynamic(sess) -> dict:
+    """Compute the dashboard's dynamic fragments (state pill, banners, nav,
+    conversation log rows). Shared by the full-page dashboard render and the
+    /dashboard-frag polling endpoint, so periodic refresh can patch the DOM
+    in place instead of doing a full page reload (which flashed the whole
+    page every few seconds)."""
+    # Check for device changes on every poll
+    new_fp = _get_audio_fingerprint()
+    device_banner = ""
+    if new_fp and new_fp != _audio_fingerprint[0]:
+        old_fp = _audio_fingerprint[0]
+        _audio_fingerprint[0] = new_fp
+        # Suppress announcement if only HDMI changed — display-source
+        # switches connect/disconnect HDMI audio but are not real
+        # speaker changes and should not interrupt with audio.
+        def _non_hdmi(fp):
+            return "\n".join(
+                l for l in fp.splitlines()
+                if "hdmi" not in l.lower()
+            )
+        hdmi_only = (_non_hdmi(new_fp) == _non_hdmi(old_fp))
+        msg = "Audio devices changed."
+        _device_change_msg[0] = msg
+        log.info("Device change detected%s", " (HDMI only — silent)" if hdmi_only else "")
+        # Check AIOC connect/disconnect immediately on device change —
+        # don't wait for the elif _ptt_alive() branch which is skipped
+        # when _device_change_msg is set.
+        _ptt_alive()
+        if sess and not hdmi_only:
+            import threading as _t
+            def _announce_change():
+                _safe_volume_new_sinks(1)   # PipeWire at 1% safety reset
+                import time as _time; _time.sleep(0.5)
+                # Restore calibrated levels for ALL known sinks, not just default
+                _cal_sinks = subprocess.run(
+                    ["pactl","list","short","sinks"],
+                    capture_output=True, text=True).stdout.splitlines()
+                for _sl in _cal_sinks:
+                    _sn = _sl.split()[1] if len(_sl.split()) > 1 else None
+                    if _sn:
+                        _apply_device_cal(_sn)
+                # Don't announce over the air — skip TTS when Radio profile active
+                if not _radio_profile_active[0]:
+                    speak(msg, sess.alsa_output, volume=_cal_sw_volume)
+            _t.Thread(target=_announce_change, daemon=True).start()
+
+    if _device_change_msg[0]:
+        device_banner = (
+            f'<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
+            f'color:#f59e0b;padding:3px 8px;">'
+            f'{_device_change_msg[0]}</div>'
+            f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
+            f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
+        )
+        _device_change_msg[0] = ""
+    elif _radio_profile_active[0]:
+        # Persistent warning only when Radio profile is active (not just the radio interface connected)
+        _banner_iface = (detect_hw_variant(_active_radio_iface[0])
+                          if _active_radio_iface[0] else "RADIO")
+        _radio_owner_warn = (
+            ' &mdash; no radio voice profile enrolled, accepting ALL speakers'
+            if _owner_only[0] and _owner_profile_radio[0] is None else '')
+        device_banner = (
+            '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
+            'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
+            f'&#128225; {_banner_iface.upper()} ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
+            f'{_radio_owner_warn}'
+            '</div>'
+        )
+    elif _owner_only[0] and not _verification_available():
+        device_banner = (
+            '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
+            'color:#f59e0b;padding:3px 8px;">'
+            '&#9888; Owner-only requested but no voice profile/model &mdash; '
+            'accepting ALL speakers. <a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
+        )
+    elif _idle_disconnected[0]:
+        device_banner = (
+            '<div id="dbanner" style="color:#475569;font-style:italic;">'
+            'Say &#8220;Hey Jarvis&#8221; or press Wake to resume.</div>'
+        )
+    else:
+        device_banner = '<div id="dbanner"></div>'
+
+    active     = sess._active if sess else False
+    monitoring = sess._monitoring if sess else False
+    multilang  = sess._multilang if sess else "off"
+    owner_only = _owner_only[0]
+    enrolled   = _owner_profile[0] is not None
+    paused     = _paused_speech[0] is not None
+    speaking   = _is_speaking[0]
+    thinking   = _current_think_task[0] is not None
+
+    state = ("SLEEPING"   if _idle_disconnected[0]
+             else "MONITORING" if monitoring
+             else "SPEAKING"   if speaking
+             else "THINKING"   if thinking
+             else "PAUSED"     if (active and paused)
+             else "ACTIVE"     if active else "SILENT")
+    _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
+           "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
+           "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
+           "SLEEPING":("#0e0e14","#475569"),
+           }.get(state,("#141d2b","#64748b"))
+    state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
+
+    speaking_banner = (
+        '<div class="spkbanner" style="background:#3b0000;border-color:#dc2626;color:#fca5a5;">'
+        '&#128225; TRANSMITTING&hellip;'
+        ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
+        if (_is_tx[0] and speaking) else
+        f'<div class="spkbanner">&#9834; {AGENT_NAME} is speaking&hellip;'
+        ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
+        if speaking else
+        '<div class="spkbanner paused">&#9646;&#9646; Paused'
+        ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
+        if (active and paused) else ""
+    )
+
+    # Pre-compute thinking durations
+    thinking_dur: dict = {}
+    for _i, _e in enumerate(CONVERSATION_LOG):
+        if _e["role"] == "thinking":
+            _ep = _e.get("epoch", 0.0)
+            for _j in range(_i + 1, len(CONVERSATION_LOG)):
+                if CONVERSATION_LOG[_j]["role"] == "five":
+                    thinking_dur[_ep] = (
+                        CONVERSATION_LOG[_j].get("epoch", _ep) - _ep
+                    )
+                    break
+            else:
+                thinking_dur[_ep] = None
+
+    rows = ""
+    for e in reversed(CONVERSATION_LOG):
+        ts = e.get("ts", "")
+        ts_span = f'<span class="ts">{ts}</span> ' if ts else ""
+        if e["role"] == "you":
+            rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
+        elif e["role"] == "five":
+            rows += f'<div class="five">{ts_span}<b>{AGENT_NAME}:</b> {e["text"]}</div>'
+        elif e["role"] == "monitor":
+            rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
+        elif e["role"] == "thinking":
+            ep  = e.get("epoch", 0.0)
+            dur = thinking_dur.get(ep)
+            if dur is None:
+                rows += (f'<div class="thinking">{ts_span}'
+                         f'{AGENT_NAME} is thinking&hellip; '
+                         f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
+                         f' &nbsp;<a href="/interrupt" class="irupt">&#10005; Interrupt</a>'
+                         f'</div>')
+        else:
+            rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
+
+    _ds = _get_device_status()
+    _voice_lbl = ("Owner-only" if owner_only else "Everyone") + \
+                 ("" if enrolled else " (not enrolled)")
+    device_panel = (
+        f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
+        f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
+        f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
+        f' &ensp;&#128100; {_voice_lbl}</div>'
+    )
+
+    nav_html = (
+        f'<a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a>'
+        f'<a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a>'
+        f'<a href="/monitor/{"stop" if monitoring else "start"}" class="btn {"on" if monitoring else ""}" data-hint="{"Now: Monitoring ON. Click → stop monitoring" if monitoring else "Now: OFF. Click → start passive monitoring (transcribes without routing to agent)"}">&#9678; {"Monitor On" if monitoring else "Monitor"}</a>'
+        f'<a href="/multilang" class="btn {"on" if multilang != "off" else ""}" data-hint="{"Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)" if multilang == "off" else "Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)" if multilang == "en-zh" else "Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language" if multilang == "whitelist" else "Now: Any language — auto-sleep off. Click → OFF"}">&#8853; {"Multi-lang" if multilang == "off" else "Lang: EN/ZH" if multilang == "en-zh" else "Lang: List" if multilang == "whitelist" else "Lang: Any"}</a>'
+        f'<a href="/ownermode" class="btn {"on" if owner_only else ""}" data-hint="{"Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone" if owner_only else (("Now: Everyone. Click → owner-only (verifies against your radio voice profile while Radio mode is on" + ("" if _owner_profile_radio[0] is not None else ", though no radio profile is enrolled yet — accepts all speakers over radio until you add one") + ")") if enrolled else "Enroll a voice profile first (Calibrate → Voice ID)")}">&#128100; {"Owner Only" if owner_only else "Everyone"}</a>'
+        f'<a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a>'
+        f'<a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a>'
+        f'<a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a>'
+    )
+
+    return {
+        "device_banner": device_banner,
+        "device_panel": device_panel,
+        "state": state,
+        "state_pill_style": state_pill_style,
+        "speaking_banner": speaking_banner,
+        "rows": rows if rows else "<div class='sys'>No conversation yet</div>",
+        "nav_html": nav_html,
+    }
+
 # ── HTTP toggle server ────────────────────────────────────────────────────────
 
 def start_http_server(port: int, on_stop, session_ref: list):
@@ -5080,164 +5266,14 @@ setInterval(upd, 2000);
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path in ("/dashboard", "/"):
-                # Check for device changes on every page load
-                new_fp = _get_audio_fingerprint()
-                device_banner = ""
-                if new_fp and new_fp != _audio_fingerprint[0]:
-                    old_fp = _audio_fingerprint[0]
-                    _audio_fingerprint[0] = new_fp
-                    # Suppress announcement if only HDMI changed — display-source
-                    # switches connect/disconnect HDMI audio but are not real
-                    # speaker changes and should not interrupt with audio.
-                    def _non_hdmi(fp):
-                        return "\n".join(
-                            l for l in fp.splitlines()
-                            if "hdmi" not in l.lower()
-                        )
-                    hdmi_only = (_non_hdmi(new_fp) == _non_hdmi(old_fp))
-                    msg = "Audio devices changed."
-                    _device_change_msg[0] = msg
-                    log.info("Device change detected%s", " (HDMI only — silent)" if hdmi_only else "")
-                    # Check AIOC connect/disconnect immediately on device change —
-                    # don't wait for the elif _ptt_alive() branch which is skipped
-                    # when _device_change_msg is set.
-                    _ptt_alive()
-                    if sess and not hdmi_only:
-                        import threading as _t
-                        def _announce_change():
-                            _safe_volume_new_sinks(1)   # PipeWire at 1% safety reset
-                            import time as _time; _time.sleep(0.5)
-                            # Restore calibrated levels for ALL known sinks, not just default
-                            _cal_sinks = subprocess.run(
-                                ["pactl","list","short","sinks"],
-                                capture_output=True, text=True).stdout.splitlines()
-                            for _sl in _cal_sinks:
-                                _sn = _sl.split()[1] if len(_sl.split()) > 1 else None
-                                if _sn:
-                                    _apply_device_cal(_sn)
-                            # Don't announce over the air — skip TTS when Radio profile active
-                            if not _radio_profile_active[0]:
-                                speak(msg, sess.alsa_output, volume=_cal_sw_volume)
-                        _t.Thread(target=_announce_change, daemon=True).start()
-
-                if _device_change_msg[0]:
-                    device_banner = (
-                        f'<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
-                        f'color:#f59e0b;padding:3px 8px;">'
-                        f'{_device_change_msg[0]}</div>'
-                        f'<script>setTimeout(()=>{{var b=document.getElementById("dbanner");'
-                        f'if(b){{b.textContent="";b.removeAttribute("style");}}}},5000);</script>'
-                    )
-                    _device_change_msg[0] = ""
-                elif _radio_profile_active[0]:
-                    # Persistent warning only when Radio profile is active (not just the radio interface connected)
-                    _banner_iface = (detect_hw_variant(_active_radio_iface[0])
-                                      if _active_radio_iface[0] else "RADIO")
-                    _radio_owner_warn = (
-                        ' &mdash; no radio voice profile enrolled, accepting ALL speakers'
-                        if _owner_only[0] and _owner_profile_radio[0] is None else '')
-                    device_banner = (
-                        '<div id="dbanner" style="background:#3b0000;border:1px solid #dc2626;'
-                        'color:#fca5a5;padding:4px 10px;font-weight:bold;letter-spacing:.03em;">'
-                        f'&#128225; {_banner_iface.upper()} ACTIVE &mdash; audio output transmits LIVE OVER THE AIR'
-                        f'{_radio_owner_warn}'
-                        '</div>'
-                    )
-                elif _owner_only[0] and not _verification_available():
-                    device_banner = (
-                        '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
-                        'color:#f59e0b;padding:3px 8px;">'
-                        '&#9888; Owner-only requested but no voice profile/model &mdash; '
-                        'accepting ALL speakers. <a href="/voice-enroll" style="color:#f59e0b">Enroll</a></div>'
-                    )
-                elif _idle_disconnected[0]:
-                    device_banner = (
-                        '<div id="dbanner" style="color:#475569;font-style:italic;">'
-                        'Say &#8220;Hey Jarvis&#8221; or press Wake to resume.</div>'
-                    )
-                else:
-                    device_banner = '<div id="dbanner"></div>'
-
-                active     = sess._active if sess else False
-                monitoring = sess._monitoring if sess else False
-                multilang  = sess._multilang if sess else "off"
-                owner_only = _owner_only[0]
-                enrolled   = _owner_profile[0] is not None
-                paused     = _paused_speech[0] is not None
-                speaking   = _is_speaking[0]
-                thinking   = _current_think_task[0] is not None
-
-                state = ("SLEEPING"   if _idle_disconnected[0]
-                         else "MONITORING" if monitoring
-                         else "SPEAKING"   if speaking
-                         else "THINKING"   if thinking
-                         else "PAUSED"     if (active and paused)
-                         else "ACTIVE"     if active else "SILENT")
-                _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
-                       "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
-                       "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
-                       "SLEEPING":("#0e0e14","#475569"),
-                       }.get(state,("#141d2b","#64748b"))
-                state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
-
-                speaking_banner = (
-                    '<div class="spkbanner" style="background:#3b0000;border-color:#dc2626;color:#fca5a5;">'
-                    '&#128225; TRANSMITTING&hellip;'
-                    ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
-                    if (_is_tx[0] and speaking) else
-                    f'<div class="spkbanner">&#9834; {AGENT_NAME} is speaking&hellip;'
-                    ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
-                    if speaking else
-                    '<div class="spkbanner paused">&#9646;&#9646; Paused'
-                    ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
-                    if (active and paused) else ""
-                )
-
-                # Pre-compute thinking durations
-                thinking_dur: dict = {}
-                for _i, _e in enumerate(CONVERSATION_LOG):
-                    if _e["role"] == "thinking":
-                        _ep = _e.get("epoch", 0.0)
-                        for _j in range(_i + 1, len(CONVERSATION_LOG)):
-                            if CONVERSATION_LOG[_j]["role"] == "five":
-                                thinking_dur[_ep] = (
-                                    CONVERSATION_LOG[_j].get("epoch", _ep) - _ep
-                                )
-                                break
-                        else:
-                            thinking_dur[_ep] = None
-
-                rows = ""
-                for e in reversed(CONVERSATION_LOG):
-                    ts = e.get("ts", "")
-                    ts_span = f'<span class="ts">{ts}</span> ' if ts else ""
-                    if e["role"] == "you":
-                        rows += f'<div class="you">{ts_span}<b>You:</b> {e["text"]}</div>'
-                    elif e["role"] == "five":
-                        rows += f'<div class="five">{ts_span}<b>{AGENT_NAME}:</b> {e["text"]}</div>'
-                    elif e["role"] == "monitor":
-                        rows += f'<div class="mon">{ts_span}{e["text"]}</div>'
-                    elif e["role"] == "thinking":
-                        ep  = e.get("epoch", 0.0)
-                        dur = thinking_dur.get(ep)
-                        if dur is None:
-                            rows += (f'<div class="thinking">{ts_span}'
-                                     f'{AGENT_NAME} is thinking&hellip; '
-                                     f'<span class="tctr" data-start="{ep:.3f}">0</span>s'
-                                     f' &nbsp;<a href="/interrupt" class="irupt">&#10005; Interrupt</a>'
-                                     f'</div>')
-                    else:
-                        rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
-
-                _ds = _get_device_status()
-                _voice_lbl = ("Owner-only" if owner_only else "Everyone") + \
-                             ("" if enrolled else " (not enrolled)")
-                device_panel = (
-                    f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
-                    f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
-                    f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
-                    f' &ensp;&#128100; {_voice_lbl}</div>'
-                )
+                d = _dashboard_dynamic(sess)
+                state             = d["state"]
+                state_pill_style  = d["state_pill_style"]
+                device_panel      = d["device_panel"]
+                device_banner     = d["device_banner"]
+                speaking_banner   = d["speaking_banner"]
+                rows              = d["rows"]
+                nav_html          = d["nav_html"]
 
                 body = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -5282,10 +5318,10 @@ a.cont:hover{{background:var(--gn);color:#000;}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
-<div class="nav"><a href="/wake" class="btn" data-hint="Activate voice — the agent will listen and respond">&#9889; Wake</a><a href="/sleep" class="btn" data-hint="Silence voice and stop monitoring. Say Hey Jarvis or press Wake to resume">&#9790; Sleep</a><a href="/monitor/{'stop' if monitoring else 'start'}" class="btn {'on' if monitoring else ''}" data-hint="{'Now: Monitoring ON. Click → stop monitoring' if monitoring else 'Now: OFF. Click → start passive monitoring (transcribes without routing to agent)'}">&#9678; {'Monitor On' if monitoring else 'Monitor'}</a><a href="/multilang" class="btn {'on' if multilang != 'off' else ''}" data-hint="{'Now: OFF — EN/ZH only, auto-sleep on. Click → EN/ZH mode (auto-sleep off)' if multilang == 'off' else 'Now: EN/ZH — auto-sleep off. Click → Whitelist (EN/ZH/KO/JA/ES/MS)' if multilang == 'en-zh' else 'Now: Whitelist — EN/ZH/KO/JA/ES/MS, auto-sleep off. Click → Any language' if multilang == 'whitelist' else 'Now: Any language — auto-sleep off. Click → OFF'}">&#8853; {'Multi-lang' if multilang == 'off' else 'Lang: EN/ZH' if multilang == 'en-zh' else 'Lang: List' if multilang == 'whitelist' else 'Lang: Any'}</a><a href="/ownermode" class="btn {'on' if owner_only else ''}" data-hint="{'Now: Owner-only — only the enrolled voice is obeyed. Click → listen to everyone' if owner_only else (('Now: Everyone. Click → owner-only (verifies against your radio voice profile while Radio mode is on' + ('' if _owner_profile_radio[0] is not None else ', though no radio profile is enrolled yet — accepts all speakers over radio until you add one') + ')') if enrolled else 'Enroll a voice profile first (Calibrate → Voice ID)')}">&#128100; {'Owner Only' if owner_only else 'Everyone'}</a><a href="/reset" class="btn danger" data-hint="Clear the conversation log (does not affect the agent&apos;s memory)">&#10006; Clear Log</a><a href="/restart" class="btn" data-hint="Restart the RealTimeTalk daemon (reconnects OpenAI and gateway)">&#8635; Restart</a><a href="/gateway-reset" class="btn danger" data-hint="Drop and reconnect the OpenClaw gateway WebSocket without restarting">&#9888; Gateway Reset</a></div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
+<div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}</div>
-<div id="log">{speaking_banner}{rows if rows else "<div class='sys'>No conversation yet</div>"}</div>
+<div id="log">{speaking_banner}{rows}</div>
 <script>
 setInterval(function(){{
   var now=Date.now()/1000;
@@ -5293,32 +5329,55 @@ setInterval(function(){{
     el.textContent=Math.max(0,Math.floor(now-parseFloat(el.dataset.start)));
   }});
 }},500);
-setInterval(function(){{
-  fetch('/speaker-cal/vol').then(function(r){{return r.json();}}).then(function(d){{
-    var dp=document.getElementById('dp');
-    if(dp) dp.innerHTML='&#9673; '+d.mic+' &ensp;&#9834; '+d.speaker_name+' &middot; Vol '+d.spk_vol+' &middot; SW '+d.sw_pct+'% &ensp;Gate '+d.gate+' &middot; Gain '+d.gain+'x';
-  }}).catch(function(){{}});
-}}, 5000);
 (function(){{
-  var _rt=setTimeout(()=>location.reload(),3000);
-  function _cancelReload(){{clearTimeout(_rt);}}
-  function _scheduleReload(){{_rt=setTimeout(()=>location.reload(),3000);}}
-  document.querySelectorAll('.btn[data-hint]').forEach(function(b){{
-    b.addEventListener('mouseenter',function(){{
-      _cancelReload();
-      var h=document.getElementById('dbanner');
-      if(h&&!h.style.background){{h.textContent=b.dataset.hint;h.style.color='#64748b';}}
-    }});
-    b.addEventListener('mouseleave',function(){{
-      _scheduleReload();
-      var h=document.getElementById('dbanner');
-      if(h&&!h.style.background){{h.textContent='';h.style.color='';}}
-    }});
+  // Periodically patch just the dynamic pieces of the dashboard in place
+  // instead of location.reload()'ing the whole document — a full reload
+  // every few seconds re-fetched fonts/CSS and repainted the entire page,
+  // producing a visible flash. Fetching a small JSON fragment and updating
+  // only the changed text/HTML avoids that.
+  var _hover=false;
+  function _refresh(){{
+    if(_hover) return;
+    fetch('/dashboard-frag').then(function(r){{return r.json();}}).then(function(d){{
+      var pill=document.getElementById('pill');
+      if(pill){{pill.textContent=d.state;pill.setAttribute('style',d.state_pill_style);}}
+      var nav=document.getElementById('navbar');
+      if(nav) nav.innerHTML=d.nav_html;
+      var dp=document.getElementById('dp');
+      if(dp) dp.outerHTML=d.device_panel;
+      var db=document.getElementById('dbanner');
+      if(db) db.outerHTML=d.device_banner;
+      var log=document.getElementById('log');
+      if(log) log.innerHTML=d.speaking_banner+d.rows;
+    }}).catch(function(){{}});
+  }}
+  setInterval(_refresh,3000);
+  document.addEventListener('mouseover',function(e){{
+    var b=e.target.closest && e.target.closest('.btn[data-hint]');
+    if(!b) return;
+    _hover=true;
+    var h=document.getElementById('dbanner');
+    if(h&&!h.style.background){{h.textContent=b.dataset.hint;h.style.color='#64748b';}}
+  }});
+  document.addEventListener('mouseout',function(e){{
+    var b=e.target.closest && e.target.closest('.btn[data-hint]');
+    if(!b || b.contains(e.relatedTarget)) return;
+    _hover=false;
+    var h=document.getElementById('dbanner');
+    if(h&&!h.style.background){{h.textContent='';h.style.color='';}}
   }});
 }})();
 </script>
 </body></html>"""
                 _html(self, 200, body)
+            elif self.path == "/dashboard-frag":
+                d = _dashboard_dynamic(sess)
+                body = json.dumps(d).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path == "/status":
                 sess = session_ref[0]
                 active = sess._active if sess else False

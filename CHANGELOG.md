@@ -1,3 +1,9 @@
+## v3.12.6 — 2026-08-18
+
+### Fixed
+
+- **The dashboard flashed the whole page every ~3 seconds.** It kept itself live via `location.reload()` on a 3s timer, which re-fetched the page, its Google Fonts stylesheet, and repainted everything from scratch — visible as a periodic flicker, most noticeable on the state pill and conversation log. Replaced with a `/dashboard-frag` JSON endpoint (backed by a shared `_dashboard_dynamic()` helper, factored out of the old inline page-render code so both paths stay in sync) that the page now polls on the same 3s cadence and uses to patch just the state pill, nav buttons, device panel, device banner, and log in place — no navigation, no flash. The still-active "pause refresh while hovering a nav button" behavior was moved to event delegation (`mouseover`/`mouseout` on `document`) since the nav buttons themselves now get replaced on every refresh.
+
 ## v3.12.5 — 2026-08-18
 
 ### Fixed
