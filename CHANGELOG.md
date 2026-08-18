@@ -1,3 +1,10 @@
+## v3.12.5 — 2026-08-18
+
+### Fixed
+
+- **`_handle_transcript()`'s belt-and-suspenders `_dtmf_force_active` handling (a duplicate of `_send_mic()`'s, for the unlikely case a transcript races the mic poll) had the same Monitoring-not-cleared bug fixed in v3.12.4, but only in `_send_mic()`.** Caught by comparing against an independent port of the v3.12.4 fix on the Mac fork, which fixed both call sites. Mirrored here.
+- **The middle digit of a fast 3-digit DTMF sequence (e.g. `789` decoding as `7,9` with no `8`) could get silently dropped** — `_dtmf_listener` required a digit to decode identically for 3 consecutive polls (~150ms at its ~50ms chunk cadence) before accepting it, and a digit sandwiched between two tone transitions often didn't hold stable that long. Ported from an identical fix live-confirmed on the Mac fork: reduced to `DTMF_HOLD_TICKS = 2` (~100ms) — still enough to reject noise, but no longer squeezes out legitimate middle digits at normal keying speed. `dtmf_monitor.py` (the standalone training CLI) was intentionally left untouched, matching the Mac fork's scope — it runs with far less thread contention and isn't affected by this.
+
 ## v3.12.4 — 2026-08-18
 
 ### Fixed

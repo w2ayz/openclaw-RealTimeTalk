@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.4"
+__version__ = "3.12.5"
 
 import argparse
 import asyncio
@@ -431,6 +431,14 @@ DTMF_COS_THRESHOLD = 200     # raw int16 peak above this = squelch open (closed~
 DTMF_COS_TAIL_S    = 0.5     # seconds to hold COS open after signal drops — kept tight for DTMF
                              # digit-boundary timing precision; Playback listener uses its own,
                              # longer tail below instead of sharing this one.
+DTMF_HOLD_TICKS    = 2       # consecutive matching decode passes needed before a digit is accepted
+                             # (was 3 — ~150ms at the listener's ~50ms chunk cadence). Live-confirmed
+                             # (2026-08-18, ported from the Mac fork's identical fix) the middle digit
+                             # of a fast 3-digit sequence (e.g. 789 decoding as 7,9 with no 8) was
+                             # getting squeezed out — sandwiched between two tone transitions, it often
+                             # didn't hold stable for a full 150ms before the next digit's tone started.
+                             # 2 ticks (~100ms) still rejects noise but reliably catches all three
+                             # digits of every configured sequence at normal keying speed.
 PLAYBACK_TAIL_S    = 1.0     # seconds to hold COS open after signal drops, Playback listener only.
                              # Live-measured on a Baofeng HT via AIOC (2026-08-15): idle floor is a
                              # clean 36-44 (threshold=200 has huge margin, not the problem), but
@@ -2796,6 +2804,9 @@ class RealtimeSession:
         # Apply DTMF force flags (belt-and-suspenders alongside _send_mic)
         if _dtmf_force_active[0]:
             _dtmf_force_active[0] = False
+            if self._monitoring:
+                self._monitoring = False   # Active supersedes Monitoring
+                _log_entry("system", "Monitoring stopped")
             if not self._active:
                 self._active = True
                 _last_activity[0] = __import__("time").time()
@@ -5588,7 +5599,7 @@ def _dtmf_listener() -> None:
                         hold[0] += 1
                     else:
                         prev_dig[0] = digit; hold[0] = 1
-                    if digit and hold[0] == 3:
+                    if digit and hold[0] == DTMF_HOLD_TICKS:
                         seq_ref[0] = _handle_digit(digit, now, seq_ref)
             except Exception as exc:
                 log.warning("DTMF Goertzel error: %s", exc)
