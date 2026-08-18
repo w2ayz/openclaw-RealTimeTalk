@@ -1,3 +1,24 @@
+## v3.14.0 — 2026-08-18
+
+Version-number alignment with the [Mac fork](https://github.com/w2ayz/openclaw-RealTimeTalk-mac)
+— no functional changes here. Mac's own counter had raced ahead to
+v3.14.0 largely from parity work already mutually ported between the two
+forks this session (its DTMF remote control port at v3.13.0 catching up
+to what Pi already had; the DTMF hold-ticks and Monitoring-state fixes,
+both originated on Mac and already ported back here as v3.12.4/v3.12.5;
+and the dashboard-flash fix, originated *here* as v3.12.6 and ported to
+Mac). This repo jumps its own counter to match so `vX.Y.Z` means the
+same release point on both platforms going forward.
+
+One fix from Mac's v3.14.0 isn't ported here: a voice-enrollment
+recording bug where its device self-heal logic wrote a fresh-subprocess-
+resolved PortAudio device index directly into the same variable used to
+open the live audio stream in-process, which can diverge once that
+process's own device cache goes stale. This is specific to Mac's
+`sounddevice`/PortAudio numeric-index device model — this repo resolves
+devices by PipeWire name (`pactl`/`pw-cli`), not numeric indices, so the
+same failure mode doesn't apply here.
+
 ## v3.12.6 — 2026-08-18
 
 ### Fixed

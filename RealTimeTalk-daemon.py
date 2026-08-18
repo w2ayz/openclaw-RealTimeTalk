@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.12.6"
+__version__ = "3.14.0"
 
 import argparse
 import asyncio
