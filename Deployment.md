@@ -270,6 +270,43 @@ cd ~/openclaw-RealTimeTalk
 ./RealTimeTalk-toggle.sh devices    # list audio devices the daemon can see
 ```
 
+### Wiring OpenClaw up to push text for readout
+
+RTT has a local-only `GET http://localhost:19000/speak?text=...` endpoint
+(see README.md's ["Pushing text from OpenClaw (or any local
+process)"](README.md#pushing-text-from-openclaw-or-any-local-process) for
+full detail) that any process on this Pi can call to have RTT read
+arbitrary text aloud — the piece that lets an OpenClaw agent finish a
+keyboard-typed task and deliver the result through RTT instead of just
+replying in text.
+
+OpenClaw won't discover this on its own — add a note to the agent's
+`TOOLS.md` (its OpenClaw workspace directory, per `agents.defaults.workspace`
+in `~/.openclaw/openclaw.json`) so it knows the capability exists and when
+to use it:
+
+```markdown
+### RealTimeTalk — push text to be read aloud
+
+If <you> asks for something via keyboard/text (not voice) and wants the
+result spoken through RealTimeTalk once it's ready — e.g. "look into X and
+read me what you find" typed instead of said — call this instead of just
+replying in text:
+
+​```bash
+curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+​```
+
+- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Success looks like `{"ok": true, "queued": true, "chars": N}`.
+- Only use this when RTT is the actual delivery channel wanted — not as a
+  substitute for normal chat replies.
+```
+
+Since OpenClaw's `AGENTS.md` convention is to read the workspace fresh each
+session, this takes effect on the next session with no daemon restart
+required.
+
 ---
 
 ## 10. Troubleshooting

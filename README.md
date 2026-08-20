@@ -155,6 +155,58 @@ The dashboard auto-refreshes every 3 s and shows:
 
 Voice ID (enrollment / test page) lives on the **Calibrate** page, as the **first** button in the Radio/Monitor/Playback/DTMF group.
 
+### Pushing text from OpenClaw (or any local process)
+
+`GET http://localhost:19000/speak?text=...` lets any process on the same
+machine make the daemon read text aloud on demand — the piece that lets an
+OpenClaw agent do work triggered by keyboard/text (not voice) and still
+deliver the result through RTT. Useful when the request was typed but the
+answer should come back spoken — away from the keyboard, on the radio,
+hands busy, etc.
+
+```bash
+curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "Your text here")"
+# → {"ok": true, "queued": true, "chars": N}
+```
+
+- **Local-only** — rejects anything not from `127.0.0.1`/`::1`/`localhost`.
+- **GET, URL-encoded query string** — fine for a spoken-length summary;
+  don't push a raw multi-page report through it, summarize first.
+- Text runs through the normal `speak()` pipeline (markdown stripped, TTS
+  engine as configured) and plays on whatever output device is currently
+  selected — including transmitting on-air if Radio Mode is active. The
+  line is also logged into the dashboard's conversation history like any
+  other reply.
+
+**Wiring it up in OpenClaw:** add a note to the agent's `TOOLS.md` (in its
+OpenClaw workspace directory — `agents.defaults.workspace` in
+`~/.openclaw/openclaw.json`, often `~/.openclaw/workspace/` but can be the
+agent's home directory itself) so it knows the capability exists and when
+to reach for it — it won't discover the endpoint on its own. Something
+like:
+
+```markdown
+### RealTimeTalk — push text to be read aloud
+
+If <you> asks for something via keyboard/text (not voice) and wants the
+result spoken through RealTimeTalk once it's ready — e.g. "look into X and
+read me what you find" typed instead of said — call this instead of just
+replying in text:
+
+​```bash
+curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+​```
+
+- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Success looks like `{"ok": true, "queued": true, "chars": N}`.
+- Only use this when RTT is the actual delivery channel wanted — not as a
+  substitute for normal chat replies.
+```
+
+Since OpenClaw's `AGENTS.md` convention is to read the workspace fresh each
+session, this takes effect on the next session with no daemon restart
+required.
+
 ### Voice commands
 
 > The agent name is configurable (`--agent-name`, default **Zeebot**) — see
