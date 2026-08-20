@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.16.0"
+__version__ = "3.17.0"
 
 import argparse
 import asyncio
@@ -402,6 +402,11 @@ _speaker_cal_result: dict = {}                     # last calibration result
 _cal_mode_override = [None]  # None=auto-detect, "headset"=force headset, "speaker"=force speaker
 _paused_speech:       list = [None]   # {"remaining","full","alsa"} dict saved when TTS is
                                        # interrupted (resumable=True); None otherwise
+_speak_used_this_turn: list = [False]  # set by /speak; checked (and reset) when a voice
+                                       # turn's own reply is about to be spoken, so that
+                                       # reply doesn't get voiced a second time on top of
+                                       # whatever the agent already sent via /speak — see
+                                       # _handle_transcript
 _http_interrupt:      list = [False]  # set by /interrupt to cut TTS mid-playback
 _last_mic_cb:         list = [0.0]    # epoch of last _mic_cb call — used for hot-plug detection
 _post_busy_until:     list = [0.0]    # timestamp: mic sends silence until this time after TTS ends
@@ -1991,7 +1996,23 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     # Serialize playback: block here (not just around the audio itself) so a second
     # caller's synthesis+playback never overlaps the first's — that overlap is what let
     # two concurrent speak() calls stomp each other's _is_speaking/_http_interrupt state.
-    _speak_lock.acquire()
+    #
+    # Also hold off entirely while a previous reading is paused awaiting a Continue/
+    # Replay/Cancel decision, rather than auto-playing whatever's queued next: that
+    # unrelated next item finishing normally would otherwise hit the "not interrupted"
+    # branch below and clear _paused_speech — a single global slot — wiping out the
+    # still-unresolved pause and making the buttons vanish before anyone touched them.
+    # Re-checked after each lock acquisition (not just once up front) so a call that was
+    # already queued when the interrupt landed can't slip through the instant the lock
+    # frees up. /continue and /replay clear _paused_speech themselves before spawning
+    # their own speak() call, so a legitimate resume passes straight through; Cancel
+    # clears it without playing anything, which also releases anything waiting here.
+    while True:
+        _speak_lock.acquire()
+        if _paused_speech[0] is None:
+            break
+        _speak_lock.release()
+        time.sleep(0.2)
     try:
         # If text contains Chinese, send the whole unsplit text to a multilingual TTS so
         # mixed Chinese/English uses one consistent voice. Try ElevenLabs first, then
@@ -2090,7 +2111,15 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                                                       # estimate from only ~700ms of real audio was
                                                       # too short a sample, letting a self-interrupt
                                                       # trip almost immediately once the guard ended)
-        _SAFETY        = 3.5                         # threshold = echo × 3.5 (reverb can be 3-4× guard measurement)
+        _SAFETY        = 1.8                         # threshold = echo × 1.8 (was 3.5, then 3.0 — 3.0
+                                                      # measured threshold=19284 live and still didn't
+                                                      # catch a real deliberate "Hello" interrupt attempt,
+                                                      # so stepping straight to the Mac fork's own tuned
+                                                      # value (INTERRUPT_SAFETY=1.8) rather than inching
+                                                      # down further. Different hardware (Mac's built-in
+                                                      # speaker/mic vs this Pi's USB speaker + separate
+                                                      # mic), so watch for self-interrupt on a long reading
+                                                      # as the real test of whether 1.8 is still safe here.
 
         mic_peaks_during: list[int] = []
         _interrupted   = [False]
@@ -2635,8 +2664,13 @@ class RealtimeSession:
             self.loop.call_soon_threadsafe(self._cal_peaks.append, raw_peak)
             return
         import time as _tcb2
-        if self._busy.is_set() or _tcb2.time() < _post_busy_until[0]:
-            return  # discard mic input while Five is speaking or during echo gate
+        if self._busy.is_set() or _is_speaking[0] or _tcb2.time() < _post_busy_until[0]:
+            return  # discard mic input while Five is speaking (conversational reply via
+                     # self._busy, or /speak+Continue+Replay via the global _is_speaking
+                     # flag, which those paths set but don't set self._busy for) or during
+                     # the post-speech echo gate. Doesn't touch _mic_level_current above —
+                     # that's already updated, so voice barge-in during any of these is
+                     # unaffected; this only stops wastefully transcribing Five's own voice.
         if _is_tx[0]:
             return  # PTT asserted by something outside this session (e.g. Playback's
                      # on-air retransmit, which keys PTT from its own background
@@ -3138,6 +3172,7 @@ class RealtimeSession:
 
         # New request — discard any previously paused speech
         _paused_speech[0] = None
+        _speak_used_this_turn[0] = False
 
         import time as _tact2; _last_activity[0] = _tact2.time()
         self._busy.set()
@@ -3169,10 +3204,19 @@ class RealtimeSession:
                 )
                 return
             log.info("%s: %s", AGENT_NAME, reply)
-            _log_entry("five", reply)
-            await asyncio.get_running_loop().run_in_executor(
-                None, speak, reply, self.alsa_output, -1.0, 300, True, True  # resumable, interruptible
-            )
+            if _speak_used_this_turn[0]:
+                # This turn already read something aloud via /speak — don't also voice
+                # the reply on top of it (confirmed live: even a one-line reply like
+                # "Re-queued — reading now!" was a second audible thing back to back
+                # with the /speak content). Show it as a de-emphasized status line
+                # instead, same styling as other system/meta log entries, so it's still
+                # visible on the dashboard without being spoken.
+                _log_entry("system", f"{AGENT_NAME} (text only): {reply}")
+            else:
+                _log_entry("five", reply)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak, reply, self.alsa_output, -1.0, 300, True, True  # resumable, interruptible
+                )
         except asyncio.TimeoutError:
             log.error("OpenClaw agent timed out")
             _log_entry("five", "")   # clears the thinking counter on dashboard
@@ -5492,6 +5536,7 @@ setInterval(function(){{
                     return
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 _log_entry("five", text)
+                _speak_used_this_turn[0] = True
                 threading.Thread(target=speak, args=(text, alsa, -1.0, 300, True, True),
                                   daemon=True).start()
                 log.info("HTTP speak — queued %d chars", len(text))

@@ -1,3 +1,15 @@
+## v3.17.0 — 2026-08-20
+
+### Changed
+
+- **Voice barge-in threshold lowered.** `_SAFETY` (the multiplier applied to measured self-echo to set the interrupt threshold) dropped from `3.5` to `1.8`, matching the Mac fork's own tuned `INTERRUPT_SAFETY`. Headless operation means voice is often the only way to interrupt a reading — 3.5 measured a live threshold of ~19,000+ and still didn't catch a deliberate spoken interrupt attempt; 1.8 does (confirmed live: `Speech interrupt — stopping TTS (peak=11792 thr=7722)`), while still leaving roughly a 2× margin over measured self-echo in testing so far. Different hardware than the Mac fork this value was copied from (USB speaker + separate mic vs. built-in), so keep half an eye out for false self-interrupts on long readings.
+
+### Fixed
+
+- **A queued item could auto-play over an unresolved pause and wipe it.** Two `speak()` calls close together (e.g. `/speak` news content, then Echo's own reply queued right behind it) serialize on a lock; if the first got interrupted, the second would start the instant the lock freed, finish normally, and its own cleanup (`_paused_speech = None` on non-interrupted completion) cleared the still-unresolved pause from the first — making the Continue/Replay/Cancel buttons vanish before anyone could use them. `speak()` now holds any new call behind the lock while `_paused_speech` is set, re-checking after each acquisition (not just once) so a call already queued when the interrupt lands can't slip through; `/continue` and `/replay` clear the pause themselves before their own call so a legitimate resume isn't blocked, and Cancel releases anything waiting.
+- **A voice-triggered reply could get read aloud twice.** After using `/speak` to read something (e.g. news) on a voice turn, Echo's own normal reply for that turn was *also* spoken automatically — first as a full recap of the same content, then (after a prompt fix) as a short "sent to RTT, reading now"-style line, but *any* non-empty reply on a voice turn gets voiced, not just a long one, so it kept duplicating. Now tracked structurally: `_speak_used_this_turn` records whether `/speak` fired during the current turn, and if so the turn's reply is logged to the dashboard as a de-emphasized status line (same styling as other system/meta entries) instead of being spoken — no more relying on prompt discipline to avoid it.
+- **Mic audio wasn't muted (at capture time) during `/speak`/Continue/Replay playback.** Only `self._busy` gated whether mic input got forwarded to OpenAI's transcription API, and those three paths never set it (unlike a normal reply), so Five's own voice kept getting streamed and transcribed — wastefully, though harmlessly, since a separate downstream check (`_is_speaking`) already discarded any resulting transcript before acting on it. Mic callback now also checks `_is_speaking` directly, closing the gap for all speaking paths without touching `_mic_level_current` (updated earlier in the same callback), so voice barge-in during any of them is unaffected.
+
 ## v3.16.0 — 2026-08-19
 
 ### Added
