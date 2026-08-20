@@ -4,8 +4,8 @@ RealTimeTalk-daemon.py — OpenClaw RealTimeTalk daemon (gateway-integrated).
 
 Audio flow:
   Mic → OpenAI Realtime API (VAD + STT only) → transcript
-  transcript → OpenClaw gateway (chat.send / agent.wait) → Five's reply
-  Five's reply → Piper TTS → speaker
+  transcript → OpenClaw gateway (chat.send / agent.wait) → AI Agent's reply
+  AI Agent's reply → Piper TTS → speaker
 
 Stop via:
   http://<pi-ip>:19000/dashboard          — phone browser (over Tailscale)
@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.17.0"
+__version__ = "3.17.1"
 
 import argparse
 import asyncio
@@ -195,7 +195,7 @@ VOICE_MODE_FILE          = os.path.expanduser("~/.openclaw/workspace/rtt_voice_m
 CAL_NEW_DEV_PW    = 1      # PipeWire % for unknown device (minimum safe)
 CAL_NEW_DEV_SW    = 0.10   # SW for unknown device (10% — clearly audible but not loud)
 # Speech-interrupt: if the mic sees this many consecutive 50ms blocks above
-# the interrupt threshold while Five is speaking, kill TTS immediately.
+# the interrupt threshold while the AI Agent is speaking, kill TTS immediately.
 SPEAK_INTERRUPT_PEAK   = 4000  # raw mic peak to trigger interrupt (AGC speech >> background)
 SPEAK_INTERRUPT_BLOCKS = 6     # × 50 ms = 300 ms sustained speech → interrupt
 SPEAK_COUPLING_EMA     = 0.15  # how fast the post-guard echo/coupling estimate tracks change
@@ -429,9 +429,9 @@ _mic_restart_gen:     list = [0]      # bumped by _apply_agc_profile() on every 
                                        # listener) keeps reading from the old AGC source/physical mic
                                        # forever unless explicitly closed and reopened. Watchers below
                                        # compare against this counter to know when to do that.
-# DTMF detection — sequences transmitted over radio to wake/sleep Five
-DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake Five
-DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put Five to silent
+# DTMF detection — sequences transmitted over radio to wake/sleep the AI Agent
+DTMF_WAKE_SEQ      = "123"   # transmit DTMF 1-2-3 to wake the AI Agent
+DTMF_SLEEP_SEQ     = "321"   # transmit DTMF 3-2-1 to put the AI Agent to silent
 DTMF_DEEPSLEEP_SEQ  = "987"   # transmit DTMF 9-8-7 to disconnect immediately (skip 10-min wait)
 DTMF_MONITOR_ON_SEQ  = "456"   # transmit DTMF 4-5-6 to start monitoring (passive transcription only)
 DTMF_MONITOR_OFF_SEQ = "654"   # transmit DTMF 6-5-4 to stop monitoring
@@ -466,7 +466,7 @@ PLAYBACK_COOLDOWN_S = 2.0    # after transmitting a replay on-air, ignore new se
                              # us) as a "new transmission" and looping forever
 _persist_active:      list = [False]  # active (voice-routing) state persisted across reconnects
 _persist_monitoring:  list = [False]  # monitoring state persisted across session reconnects
-_last_five_reply:     list = [""]     # last reply returned from Five — used to detect stale history
+_last_five_reply:     list = [""]     # last reply returned from the AI Agent — used to detect stale history
 _wake_activate:       list = [False]  # set True when waking from sleep so new session starts active
 _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mic clears OpenAI VAD
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
@@ -1757,7 +1757,7 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
     text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
     # Strip emoji and symbol characters — Piper reads them as their Unicode names
-    # (e.g. Five's ⚡ becomes "high voltage"). Keep CJK for Chinese TTS.
+    # (e.g. the AI Agent's ⚡ becomes "high voltage"). Keep CJK for Chinese TTS.
     text = re.sub(
         r'[\U0001F000-\U0001FFFF'   # emoji / pictographs
         r'☀-➿'            # misc symbols, dingbats (includes ⚡ U+26A1)
@@ -1964,7 +1964,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
     # resumable=True: if interrupted, save remaining/full text to _paused_speech for
     # the dashboard's Continue/Replay buttons (and the "continue" voice phrase)
-    # interruptible=True: enable user-voice interrupt detection (only for Five's main reply)
+    # interruptible=True: enable user-voice interrupt detection (only for the AI Agent's main reply)
     """Synthesise text with Piper and play via aplay.
 
     Writes text to a temp file and runs Piper with `-i <file>` rather than piping
@@ -2636,7 +2636,7 @@ class RealtimeSession:
         self.alsa_output  = alsa_output
         self.session_key  = session_key
         self._mic_q       = asyncio.Queue(maxsize=200)
-        self._busy        = asyncio.Event()   # set while Five is speaking
+        self._busy        = asyncio.Event()   # set while the AI Agent is speaking
         self._cal_peaks: list[int] = []       # raw peaks collected during calibration
         self._calibrating = False
         self._active      = _persist_active[0]           # restored from last session
@@ -2665,12 +2665,12 @@ class RealtimeSession:
             return
         import time as _tcb2
         if self._busy.is_set() or _is_speaking[0] or _tcb2.time() < _post_busy_until[0]:
-            return  # discard mic input while Five is speaking (conversational reply via
+            return  # discard mic input while the AI Agent is speaking (conversational reply via
                      # self._busy, or /speak+Continue+Replay via the global _is_speaking
                      # flag, which those paths set but don't set self._busy for) or during
                      # the post-speech echo gate. Doesn't touch _mic_level_current above —
                      # that's already updated, so voice barge-in during any of these is
-                     # unaffected; this only stops wastefully transcribing Five's own voice.
+                     # unaffected; this only stops wastefully transcribing the AI Agent's own voice.
         if _is_tx[0]:
             return  # PTT asserted by something outside this session (e.g. Playback's
                      # on-air retransmit, which keys PTT from its own background
@@ -3099,7 +3099,7 @@ class RealtimeSession:
                     self.alsa_output)
             return
 
-        # Continue phrase — resume paused TTS (from where it was cut off) without asking Five again
+        # Continue phrase — resume paused TTS (from where it was cut off) without asking the AI Agent again
         if _matches_phrase(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
             if saved and not self._busy.is_set():
@@ -3130,7 +3130,7 @@ class RealtimeSession:
                 log.debug("Dropped off-whitelist: %r", transcript)
                 return
 
-        # Monitoring-only mode: passively log captured segments (no Five/TTS).
+        # Monitoring-only mode: passively log captured segments (no AI Agent/TTS).
         # Intentionally does NOT update _last_activity — monitoring is passive
         # and must not prevent auto-sleep from firing.
         if self._monitoring:
@@ -3140,7 +3140,7 @@ class RealtimeSession:
                 _log_entry("monitor", t)
             return
 
-        # Suppress transcripts while PTT is asserted — prevents Five's own
+        # Suppress transcripts while PTT is asserted — prevents the AI Agent's own
         # transmitted voice from being picked up and re-routed as a new command.
         if _is_tx[0]:
             log.debug("PTT TX active — suppressing transcript: %r", transcript)
@@ -3151,7 +3151,7 @@ class RealtimeSession:
             log.debug("Dropped noise hallucination: %r", transcript)
             return
 
-        # All other speech: only route to Five when active
+        # All other speech: only route to the AI Agent when active
         if not self._active:
             log.debug("Silent mode — ignoring: %s", transcript)
             return
@@ -3328,7 +3328,7 @@ class RealtimeSession:
                             "turn_detection": {
                                 "type":                "server_vad",
                                 "threshold":           0.35,  # more sensitive; AGC+noise-suppression keeps false triggers low
-                                "prefix_padding_ms":   500,   # capture speech onset better ("Five,…")
+                                "prefix_padding_ms":   500,   # capture speech onset better ("AI Agent,…")
                                 "silence_duration_ms": 700,   # faster end-of-utterance; AGC keeps inter-word gaps short
                             },
                         },
@@ -3614,7 +3614,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path in ("/monitor", "/monitor/start", "/monitor/stop"):
-                # Passive capture-only monitoring (no Five, no TTS).
+                # Passive capture-only monitoring (no AI Agent, no TTS).
                 # /monitor toggles; /monitor/start and /monitor/stop are explicit.
                 _want_monitor = (self.path == "/monitor/start" or
                                  (self.path == "/monitor" and not _persist_monitoring[0]))
@@ -3829,29 +3829,33 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.wfile.write(resp)
 
             elif self.path == "/voice-enroll":
-                enrolled = _owner_profile[0] is not None
+                radio_on       = _radio_profile_active[0]
+                active_target  = "radio" if radio_on else "mic"
+                active_profile = _owner_profile_radio[0] if radio_on else _owner_profile[0]
+                other_target   = "mic" if radio_on else "radio"
+                other_profile  = _owner_profile[0] if radio_on else _owner_profile_radio[0]
                 model_ok = _get_spk_extractor() is not None
+                active_enrolled = active_profile is not None
                 enrolled_since = ""
-                if enrolled and _owner_profile[0].get("created"):
+                if active_enrolled and active_profile.get("created"):
                     enrolled_since = datetime.datetime.fromtimestamp(
-                        _owner_profile[0]["created"]).strftime("%Y-%m-%d %H:%M")
+                        active_profile["created"]).strftime("%Y-%m-%d %H:%M")
                 status_line = (
-                    f"Profile enrolled {enrolled_since}" if enrolled
+                    f"Profile enrolled {enrolled_since}" if active_enrolled
                     else "No profile enrolled" if model_ok
                     else "Speaker model unavailable — install sherpa-onnx + model first")
-                enrolled_radio = _owner_profile_radio[0] is not None
-                enrolled_radio_since = ""
-                if enrolled_radio and _owner_profile_radio[0].get("created"):
-                    enrolled_radio_since = datetime.datetime.fromtimestamp(
-                        _owner_profile_radio[0]["created"]).strftime("%Y-%m-%d %H:%M")
-                radio_status_line = (
-                    f"Radio profile enrolled {enrolled_radio_since}" if enrolled_radio
-                    else "No radio profile enrolled")
-                radio_on = _radio_profile_active[0]
-                radio_hint = ("" if radio_on else
-                    '<p class="info" style="color:var(--rd)">Radio mode is off — turn it on '
-                    '(dashboard) with a live signal coming in before recording these, or you\'ll '
-                    'just capture mic audio mislabeled as radio.</p>')
+                active_label  = "Radio Voice Profile" if radio_on else "Mic Voice Profile"
+                active_src    = _get_default_source()
+                active_device = (_friendly_pw_name("source", active_src) if active_src
+                                  else ("Radio input" if radio_on else "Mic input"))
+                other_label   = "Radio Voice Profile" if other_target == "radio" else "Mic Voice Profile"
+                other_enrolled = other_profile is not None
+                other_section = "" if not other_enrolled else f"""
+<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Other enrolled devices</h3>
+<div class="card" style="display:flex;align-items:center;justify-content:space-between;">
+<span>{other_label}</span>
+<button onclick="clearProfile('{other_target}')" style="border-color:var(--rd)">&#10006; Clear</button>
+</div>"""
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Voice ID — RealTimeTalk</title>
@@ -3870,48 +3874,30 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <p class="info">{status_line} &middot; threshold {_spk_threshold[0]:.2f} &middot; <a href="/calibration">&larr; calibration</a></p>
 <div class="meter"><div id="meter"></div></div>
 
-<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Mic Voice Profile</h3>
+<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">{active_label}</h3>
+<p class="info">Targets whichever input device is currently active &mdash; {active_device}. Switch devices
+(Calibrate page) before recording to enroll a different one.</p>
 <div class="card"><b>Sample 1 — English</b>
 <p class="info">Read aloud: &ldquo;Hey Jarvis, {AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
-<button onclick="rec(this,'1','en','mic')">&#9210; Record 5s</button> <span id="mic-s1"></span></div>
+<button onclick="rec(this,'1','en','{active_target}')">&#9210; Record 5s</button> <span id="active-s1"></span></div>
 <div class="card"><b>Sample 2 — Chinese</b>
 <p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
-<button onclick="rec(this,'2','zh','mic')">&#9210; Record 5s</button> <span id="mic-s2"></span></div>
+<button onclick="rec(this,'2','zh','{active_target}')">&#9210; Record 5s</button> <span id="active-s2"></span></div>
 <div class="card"><b>Sample 3 — free speech</b>
 <p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
-<button onclick="rec(this,'3','mixed','mic')">&#9210; Record 5s</button> <span id="mic-s3"></span></div>
+<button onclick="rec(this,'3','mixed','{active_target}')">&#9210; Record 5s</button> <span id="active-s3"></span></div>
 <div class="card">
-<button onclick="save('mic')">&#128190; Save mic profile</button>
-<button onclick="clearProfile('mic')" style="border-color:var(--rd)">&#10006; Clear mic profile</button>
-<div id="mic-result" class="info"></div></div>
-
-<h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Radio Voice Profile</h3>
-<p class="info">{radio_status_line} &mdash; used automatically whenever Radio mode is active.
-If missing, Owner-Only mode still works but accepts all speakers over radio.</p>
-{radio_hint}
-<div class="card"><b>Sample 1 — English</b>
-<p class="info">Read aloud: &ldquo;Hey Jarvis, {AGENT_NAME} wake up. Please check my calendar and read me the news for today.&rdquo;</p>
-<button onclick="rec(this,'1','en','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s1"></span></div>
-<div class="card"><b>Sample 2 — Chinese</b>
-<p class="info">Read aloud: &ldquo;{AGENT_NAME} 醒来。今天天气怎么样？请帮我看一下我的日程安排。&rdquo;</p>
-<button onclick="rec(this,'2','zh','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s2"></span></div>
-<div class="card"><b>Sample 3 — free speech</b>
-<p class="info">Speak naturally for 5 seconds — mix English and Chinese if you like.</p>
-<button onclick="rec(this,'3','mixed','radio')" {'disabled' if not radio_on else ''}>&#9210; Record 5s</button> <span id="radio-s3"></span></div>
-<div class="card">
-<button onclick="save('radio')">&#128190; Save radio profile</button>
-<button onclick="clearProfile('radio')" style="border-color:var(--rd)">&#10006; Clear radio profile</button>
-<div id="radio-result" class="info"></div></div>
-
-<div class="card">
-<button onclick="test(this)">&#127897; Test my voice (uses whichever profile is live right now)</button>
-<div id="result" class="info"></div></div>
+<button onclick="save('{active_target}')">&#128190; Save profile for {active_device}</button>
+<button onclick="test(this)">&#127897; Test my voice</button>
+<button onclick="clearProfile('{active_target}')" style="border-color:var(--rd)">&#10006; Clear this device's profile</button>
+<div id="active-result" class="info"></div></div>
+{other_section}
 <script>
 const es = new EventSource('/levels');
 es.onmessage = e => {{ const p = parseInt(e.data.split(',')[0]);
   document.getElementById('meter').style.width = Math.min(100, p/150) + '%'; }};
 async function rec(btn, slot, lang, target) {{
-  btn.disabled = true; const lbl = document.getElementById(target+'-s'+slot);
+  btn.disabled = true; const lbl = document.getElementById('active-s'+slot);
   let n = 5; lbl.textContent = 'Recording… speak now';
   const timer = setInterval(()=>{{ n--; if(n>0) lbl.textContent = 'Recording… '+n; }}, 1000);
   try {{
@@ -3919,20 +3905,20 @@ async function rec(btn, slot, lang, target) {{
     const j = await r.json();
     lbl.innerHTML = j.ok ? `<span class="ok">&#10004; captured (peak ${{j.peak}})</span>`
                          : `<span class="bad">&#10006; ${{j.error}}</span>`;
-  }} finally {{ clearInterval(timer); btn.disabled = (target === 'radio' && {str(not radio_on).lower()}); }}
+  }} finally {{ clearInterval(timer); btn.disabled = false; }}
 }}
 async function save(target) {{
   const r = await fetch(`/voice-enroll/save?target=${{target}}`); const j = await r.json();
-  document.getElementById(target+'-result').innerHTML = j.ok
+  document.getElementById('active-result').innerHTML = j.ok
     ? '<span class="ok">Profile saved. You can enable Owner Only on the dashboard.</span>'
     : `<span class="bad">${{j.error}}</span>`;
 }}
 async function test(btn) {{
   btn.disabled = true;
-  document.getElementById('result').textContent = 'Recording 4s — speak now…';
+  document.getElementById('active-result').textContent = 'Recording 4s — speak now…';
   try {{
     const r = await fetch('/voice-enroll/test'); const j = await r.json();
-    document.getElementById('result').innerHTML = j.ok
+    document.getElementById('active-result').innerHTML = j.ok
       ? `[${{j.profile}}] Similarity <b class="${{j.pass?'ok':'bad'}}">${{j.score}}</b> vs threshold ${{j.threshold}} — ${{j.pass?'PASS':'FAIL'}}`
       : `<span class="bad">${{j.error}}</span>`;
   }} finally {{ btn.disabled = false; }}
@@ -6075,7 +6061,7 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
 
     Runs independently of the OpenAI session so wake detection works even in
     SLEEP state (when the OpenAI WebSocket is closed).  Says "Hey Jarvis" to
-    wake Five from sleep; also refreshes _last_activity while awake so a user
+    wake the AI Agent from sleep; also refreshes _last_activity while awake so a user
     speaking is never mis-counted as idle.
     """
     import queue as _q

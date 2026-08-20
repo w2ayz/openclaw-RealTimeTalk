@@ -2,7 +2,7 @@
 
 Headless voice daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it via the
 OpenAI Realtime Transcription API, routes the transcript through the local OpenClaw gateway so
-Five answers with full memory + tools, then synthesises the reply with Piper TTS and plays it
+the AI Agent answers with full memory + tools, then synthesises the reply with Piper TTS and plays it
 through a USB speaker or headset. No browser, no display required — designed for always-on deployments.
 
 Runs as a `systemd` user service that starts automatically on boot. Controlled via a web
@@ -12,18 +12,18 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 
 ## Features
 
-- Voice conversation routed through Five's main OpenClaw session (memory, tools, identity)
+- Voice conversation routed through the AI Agent's main OpenClaw session (memory, tools, identity)
 - OpenAI Realtime **Transcription** API (`gpt-4o-transcribe`) with server-side VAD
 - **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
 - Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
 - **Language filter** — by default only English and Chinese are shown/processed; other languages (noise hallucinations) silently dropped; toggleable Multi-lang mode
-- **Wake confirmation** — when a wake phrase is detected in Silent or Monitoring mode, Five asks "Yes?" before activating; a non-affirmative response or 8-second timeout is logged as a mis-fire and activation is suppressed
+- **Wake confirmation** — when a wake phrase is detected in Silent or Monitoring mode, the AI Agent asks "Yes?" before activating; a non-affirmative response or 8-second timeout is logged as a mis-fire and activation is suppressed
 - **Speaker calibration** — acoustic sweep from minimum volume; finds the quietest clearly-audible level; works through PipeWire (no direct-ALSA conflict)
 - **Headset detection** — auto-detects combined USB headset; switches to manual volume adjustment UI
 - **Audio device hot-plug** — detects plug/unplug events, resets to safe volume, restores calibrated levels, announces the change over TTS
 - Web dashboard on port **19000** — conversation log, wake/sleep/calibrate/monitor controls
-- **Monitoring Only mode** — listen and display transcribed speech without routing to Five (for diagnosing capture quality)
+- **Monitoring Only mode** — listen and display transcribed speech without routing to the AI Agent (for diagnosing capture quality)
 - Boot-order safe — retries gateway connection until OpenClaw is up
 - Gateway protocol v4 compatible (OpenClaw 2026.5+)
 
@@ -45,7 +45,7 @@ Raspberry Pi (headless)
         │
         ├── OpenClaw gateway ─► ws://127.0.0.1:18789  (protocol v4)
         │   (persistent WS)       chat.send + agent.wait + chat.history
-        │                         Five's session: memory, tools, identity
+        │                         AI Agent's session: memory, tools, identity
         │                         Model: openai/gpt-5.5 (OAuth, codex harness)
         │
         ├── OpenAI Realtime ──► wss://api.openai.com/v1/realtime?intent=transcription
@@ -90,7 +90,7 @@ USB mic (C-Media PCM2902) ─► PipeWire rtt_agc_source
 ┌─────────────── daemon mic callback ─────────────────┐
 │  • noise gate: if peak < 60 (AGC mode) → zeros      │
 │  • gain 2x trim (AGC already normalised)             │
-│  • skip if _busy (Five is speaking)                  │
+│  • skip if _busy (AI Agent is speaking)              │
 │  • asyncio.Queue → send to OpenAI                    │
 └─────────────────────────────────────────────────────┘
    │
@@ -103,7 +103,7 @@ gpt-4o-transcribe  →  transcription.completed
    ▼  _handle_transcript()
        zhconv: Traditional Chinese → Simplified
        language gate: drop non-EN/ZH unless multilang mode on
-       monitoring mode: log to dashboard, return (no Five)
+       monitoring mode: log to dashboard, return (no AI Agent)
        wake/sleep/calibrate phrases: handle locally
    │
    ▼  GatewayClient.ask()  →  ws://127.0.0.1:18789  (protocol v4)
@@ -112,7 +112,7 @@ gpt-4o-transcribe  →  transcription.completed
        chat final empty (codex delivers via message tool)
        chat.history fallback  →  extract message-tool arguments.message
    │
-   ▼  Five's reply text
+   ▼  AI Agent's reply text
        zhconv normalise  →  split_by_script (EN/ZH segments)
        strip_markdown()  →  remove bold/links/etc.
        Piper TTS per segment  →  concatenate WAVs
@@ -121,10 +121,10 @@ gpt-4o-transcribe  →  transcription.completed
 USB speaker / headset
    │
    ▼
-You hear Five
+You hear the AI Agent
 ```
 
-**Key timing:** ~4–12 s end-to-end — 1100 ms VAD silence window + ~0.5 s transcription + Five thinking + TTS render.
+**Key timing:** ~4–12 s end-to-end — 1100 ms VAD silence window + ~0.5 s transcription + AI Agent thinking + TTS render.
 
 ---
 
@@ -136,15 +136,15 @@ The dashboard auto-refreshes every 3 s and shows:
 
 - **Status** — ACTIVE / SILENT / MONITORING
 - **Audio devices** — current mic, speaker, volume, mic gate, gain
-- **Conversation log** — newest entries at top, timestamped, colour-coded (You / Five / Monitor / System)
+- **Conversation log** — newest entries at top, timestamped, colour-coded (You / Agent / Monitor / System)
 
 ### Controls
 
 | Link | Action |
 |------|--------|
-| Wake | Activate voice (same as saying "Five wake up") |
-| Sleep | Silence (same as "Five go to sleep") |
-| Start Monitor | Enter passive capture-display mode — listens and shows transcribed words, no Five routing |
+| Wake | Activate voice (same as saying "AI Agent wake up") |
+| Sleep | Silence (same as "AI Agent go to sleep") |
+| Start Monitor | Enter passive capture-display mode — listens and shows transcribed words, no AI Agent routing |
 | Stop Monitor | Exit monitoring mode |
 | Reset | Clear the on-screen log |
 | Multi-lang: ON/OFF | Toggle language filter (OFF = EN/ZH only, drop noise hallucinations) |
@@ -211,27 +211,27 @@ required.
 
 > The agent name is configurable (`--agent-name`, default **Zeebot**) — see
 > [Deployment.md §5](Deployment.md#5-agent-name--wake-phrase). This table
-> uses **Five** as the example throughout since that's this Pi's configured
-> name; substitute your own.
+> uses **AI Agent** as a generic placeholder for whatever name you configure;
+> substitute your own.
 
 | Say | Effect |
 |-----|--------|
-| "Five wake up" | Request activation — Five asks "Yes?" for confirmation |
-| "Hey Jarvis" | Request activation — Five asks "Yes?" for confirmation |
-| "Real Time Talk on" | Request activation — Five asks "Yes?" for confirmation |
-| "Yes" / "Yeah" / "OK" / "Sure" | Confirm activation — Five says "I'm listening." |
-| "Five wake up" *(second time)* | Also accepted as confirmation |
-| "Five go to sleep" | Silence |
+| "AI Agent wake up" | Request activation — the AI Agent asks "Yes?" for confirmation |
+| "Hey Jarvis" | Request activation — the AI Agent asks "Yes?" for confirmation |
+| "Real Time Talk on" | Request activation — the AI Agent asks "Yes?" for confirmation |
+| "Yes" / "Yeah" / "OK" / "Sure" | Confirm activation — the AI Agent says "I'm listening." |
+| "AI Agent wake up" *(second time)* | Also accepted as confirmation |
+| "AI Agent go to sleep" | Silence |
 | "Real Time Talk off" | Silence |
 | "Calibrate mic" / "Calibrate microphone" | Run mic noise calibration |
 
-**Wake confirmation:** When Five is in Silent or Monitoring mode, a wake phrase triggers a confirmation prompt ("Yes?") rather than immediate activation. Five waits up to 8 seconds for an affirmative reply. If no clear "yes" is received the event is logged as a mis-fire and Five stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.
+**Wake confirmation:** When the AI Agent is in Silent or Monitoring mode, a wake phrase triggers a confirmation prompt ("Yes?") rather than immediate activation. The AI Agent waits up to 8 seconds for an affirmative reply. If no clear "yes" is received the event is logged as a mis-fire and the AI Agent stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.
 
 ---
 
 ## Speaker verification (owner-only mode)
 
-When enabled, Five only acts on the enrolled owner's voice — every transcript's audio segment is embedded with a bilingual (EN/ZH) speaker-recognition model and compared against the enrolled profile by cosine similarity. Non-matching speech is silently ignored and logged to the dashboard with its similarity score.
+When enabled, the AI Agent only acts on the enrolled owner's voice — every transcript's audio segment is embedded with a bilingual (EN/ZH) speaker-recognition model and compared against the enrolled profile by cosine similarity. Non-matching speech is silently ignored and logged to the dashboard with its similarity score.
 
 ### Setup
 
@@ -334,7 +334,7 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
 
 ### 3. Check the dashboard
 
-Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SILENT**. Say "Five wake up" to activate, then speak normally.
+Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SILENT**. Say "AI Agent wake up" to activate, then speak normally.
 
 ---
 
@@ -389,7 +389,7 @@ If voice capture is choppy or you get noise hallucinations, run mic calibration:
 2. Keep quiet for 3 seconds while it measures the noise floor
 3. The daemon updates the gate and saves it to the service file
 
-Or use Monitoring Only mode to see exactly what the transcriber captures before routing to Five.
+Or use Monitoring Only mode to see exactly what the transcriber captures before routing to the AI Agent.
 
 ### Speaker calibration
 
@@ -435,7 +435,7 @@ The daemon watches connected audio devices via a PipeWire fingerprint polled eve
 
 ### Language filter
 
-By default only **English and Chinese** are shown and routed to Five. Other languages (Japanese, Korean, Cyrillic, Arabic, etc. that `gpt-4o-transcribe` hallucinates from noise) are silently dropped.
+By default only **English and Chinese** are shown and routed to the AI Agent. Other languages (Japanese, Korean, Cyrillic, Arabic, etc. that `gpt-4o-transcribe` hallucinates from noise) are silently dropped.
 
 Toggle from the dashboard: **Multi-lang: OFF → ON** to see all languages (useful for diagnosing capture).
 
@@ -465,11 +465,11 @@ Update `ExecStart` in the service file accordingly, then reload.
 
 ### OpenClaw session
 
-Default: `agent:main:main` (Five's primary session). Override with `--session-key`.
+Default: `agent:main:main` (the AI Agent's primary session). Override with `--session-key`.
 
 ### OpenClaw model
 
-The daemon connects to OpenClaw gateway at `ws://127.0.0.1:18789` (protocol v4). Five's model is configured in `~/.openclaw/openclaw.json`:
+The daemon connects to OpenClaw gateway at `ws://127.0.0.1:18789` (protocol v4). The AI Agent's model is configured in `~/.openclaw/openclaw.json`:
 
 ```json
 "agents": {
@@ -508,7 +508,7 @@ RealTimeTalk/
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | Gateway connect fails: `protocol mismatch` | OpenClaw updated to v4 protocol | Daemon now negotiates `minProtocol: 4, maxProtocol: 4` — update from v1.6 |
-| Five not responding / empty reply | Codex harness delivers reply via message tool, not chat content | v1.7 fetches from `chat.history` as fallback — update daemon |
+| AI Agent not responding / empty reply | Codex harness delivers reply via message tool, not chat content | v1.7 fetches from `chat.history` as fallback — update daemon |
 | Speech cut off after 2–3 words | VAD silence window too short + AGC inter-word gaps look like silence | `silence_duration_ms` raised to 1100 ms in v1.7 |
 | Voice activated but transcription is garbage / wrong language | Noise hallucinations | Language filter drops non-EN/ZH by default; check mic gate in dashboard |
 | Chinese shows as Traditional characters | Transcriber outputs Traditional | v1.7 normalises to Simplified via zhconv automatically |

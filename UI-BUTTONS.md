@@ -50,7 +50,7 @@ Icons use BMP Unicode symbols (render on Pi/Chromium without a color emoji font)
 
 | Condition | Banner text | Inline action button |
 |-----------|-------------|----------------------|
-| Agent speaking | ♪ Five is speaking… | ✕ Stop |
+| Agent speaking | ♪ AI Agent is speaking… | ✕ Stop |
 | Agent paused | ❚❚ Paused | ▶ Continue |
 
 ---

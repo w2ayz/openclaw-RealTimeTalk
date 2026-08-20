@@ -1,3 +1,10 @@
+## v3.17.1 — 2026-08-20
+
+### Changed
+
+- **`/voice-enroll` now shows only the currently-active profile**, matching the Mac fork's enrollment UI. Previously both the Mic and Radio profile cards (each with their own Sample 1/2/3 recording controls) rendered stacked on the page at all times, pushing Save/Test/Clear for whichever one you actually wanted out of easy reach. Now the page shows one full card — Mic or Radio, whichever device PipeWire currently has as the default source — labeled with its real device name (e.g. "RTT AGC Mic (WebRTC)"), with Save/Test/Clear combined into a single row right under the samples. The other profile (if enrolled) collapses to a one-line entry under "Other enrolled devices" with just a Clear button; switch which one is active via the Calibrate page's Radio toggle before recording to enroll the other.
+- **Text referring to the agent by the fixed name "Five" replaced with generic "AI Agent" phrasing** across README.md, UI-BUTTONS.md, and code comments in RealTimeTalk-daemon.py — the agent's actual name is configurable per-install (`--agent-name`), so prose examples and comments shouldn't imply one fixed name. Deployment.md's literal historical-default-value mentions (`Five` as the pre-v3.11.0 fallback) were left as-is since those describe real config behavior, not identity text. No functional/config changes — `AGENT_NAME`-driven runtime text (spoken prompts, dashboard banners) already used the configured name dynamically before this change.
+
 ## v3.17.0 — 2026-08-20
 
 ### Changed
