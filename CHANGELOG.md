@@ -1,3 +1,9 @@
+## v3.15.0 — 2026-08-19
+
+### Added
+
+- **`/speak?text=...`** — a local-only (127.0.0.1/::1 only) endpoint that pushes arbitrary text through the normal `speak()` TTS pipeline on demand, independent of the voice conversation flow. Lets another process on this machine — an OpenClaw agent, a script — read results back through RTT's voice instead of as text (e.g. "look into X and read me what you find"). Ported from the Mac fork's v3.15.0 feature (its own `_json`-shadowing bug, from a local `import json as _json` alias used elsewhere in `do_GET`, doesn't apply here since this port never introduces a helper named `_json`).
+
 ## v3.14.0 — 2026-08-18
 
 Version-number alignment with the [Mac fork](https://github.com/w2ayz/openclaw-RealTimeTalk-mac)

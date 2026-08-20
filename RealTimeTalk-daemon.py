@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.14.0"
+__version__ = "3.15.0"
 
 import argparse
 import asyncio
@@ -5373,6 +5373,44 @@ setInterval(function(){{
             elif self.path == "/dashboard-frag":
                 d = _dashboard_dynamic(sess)
                 body = json.dumps(d).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path.startswith("/speak"):
+                # Local-only endpoint: lets another process on this machine
+                # (an OpenClaw agent, a script) push arbitrary text through
+                # the normal speak() TTS pipeline on demand, independent of
+                # the voice conversation flow — e.g. reading back the result
+                # of a text-triggered task. Ported from the Mac fork's
+                # v3.15.0 /speak feature.
+                host = self.client_address[0] if self.client_address else ""
+                if host not in ("127.0.0.1", "::1", "localhost"):
+                    body = json.dumps({"ok": False, "error": "local callers only"}).encode()
+                    self.send_response(403)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                import urllib.parse as _up
+                parsed = _up.urlparse(self.path)
+                params = _up.parse_qs(parsed.query)
+                text = (params.get("text") or [""])[0].strip()
+                if not text:
+                    body = json.dumps({"ok": False, "error": "missing text"}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                alsa = sess.alsa_output if sess else ALSA_OUTPUT
+                _log_entry("five", text)
+                threading.Thread(target=speak, args=(text, alsa), daemon=True).start()
+                log.info("HTTP speak — queued %d chars", len(text))
+                body = json.dumps({"ok": True, "queued": True, "chars": len(text)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))
