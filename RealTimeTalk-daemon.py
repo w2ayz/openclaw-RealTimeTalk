@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.15.0"
+__version__ = "3.16.0"
 
 import argparse
 import asyncio
@@ -400,11 +400,17 @@ _audio_fingerprint = [_get_audio_fingerprint()]   # [0] = last known state
 _device_change_msg = [""]                          # [0] = pending announcement or ""
 _speaker_cal_result: dict = {}                     # last calibration result
 _cal_mode_override = [None]  # None=auto-detect, "headset"=force headset, "speaker"=force speaker
-_paused_speech:       list = [None]   # (clean_text, alsa_output) saved when TTS is interrupted; None otherwise
+_paused_speech:       list = [None]   # {"remaining","full","alsa"} dict saved when TTS is
+                                       # interrupted (resumable=True); None otherwise
 _http_interrupt:      list = [False]  # set by /interrupt to cut TTS mid-playback
 _last_mic_cb:         list = [0.0]    # epoch of last _mic_cb call — used for hot-plug detection
 _post_busy_until:     list = [0.0]    # timestamp: mic sends silence until this time after TTS ends
 _is_speaking:         list = [False]  # True while speak() is playing audio
+_speak_lock           = threading.Lock()  # serializes speak() calls — two concurrent callers
+                                           # (e.g. two /speak requests) would otherwise race on
+                                           # _is_speaking/_http_interrupt and overlap audio; the
+                                           # loser's `finally` clearing _is_speaking made Stop
+                                           # disappear mid-playback of the other one
 _current_think_task:  list = [None]   # asyncio.Task for current gw.ask(); cancelled by /interrupt
 _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded in main()
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
@@ -1835,6 +1841,25 @@ def _split_by_script(text: str) -> list[tuple[str, str]]:
 
     return [(s, l) for s, l in segments if s]
 
+_SENTENCE_END_RE = re.compile(r'[.!?。！？]+[\'"’”)\]}】」』]?(?:\s+|$)')
+
+def _sentence_start_before(text: str, char_pos: int) -> int:
+    """Character offset of the start of the sentence containing char_pos.
+
+    Used to resume interrupted playback from the beginning of the sentence that was
+    cut off, rather than replaying the whole message from scratch or resuming mid-word.
+    """
+    start = 0
+    for m in _SENTENCE_END_RE.finditer(text):
+        pos = m.end()
+        if pos >= len(text):
+            break
+        if pos <= char_pos:
+            start = pos
+        else:
+            break
+    return start
+
 def _openai_tts(text: str, output_path: str) -> bool:
     """Call OpenAI TTS API for Chinese text, resample to PIPER_SAMPLE_RATE, write WAV.
     Returns True on success; caller should fall back to Piper on False."""
@@ -1932,7 +1957,8 @@ def _elevenlabs_tts(text: str, output_path: str) -> bool:
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False, interruptible: bool = False):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
-    # resumable=True: if interrupted, save (text, alsa_output) to _paused_speech for /continue
+    # resumable=True: if interrupted, save remaining/full text to _paused_speech for
+    # the dashboard's Continue/Replay buttons (and the "continue" voice phrase)
     # interruptible=True: enable user-voice interrupt detection (only for Five's main reply)
     """Synthesise text with Piper and play via aplay.
 
@@ -1951,12 +1977,21 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
     # Pad playback so USB/PipeWire sinks do not clip the first or last phoneme.
     import wave as _wave, struct as _struct
     wav_parts: list[str] = []
+    # Sample counts for the leading/trailing padding, so an interrupt mid-playback can
+    # subtract them back out and estimate how far into the actual *content* we got —
+    # see the sentence-resume calculation near the end of this function.
+    _lead_pad_samples = int(PIPER_SAMPLE_RATE * silence_ms / 1000) if silence_ms > 0 else 0
+    _tail_pad_added   = False
     if silence_ms > 0:
         silence_path = tempfile.mktemp(suffix=".wav")
         with _wave.open(silence_path, 'wb') as wf:
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
             wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
         wav_parts.append(silence_path)
+    # Serialize playback: block here (not just around the audio itself) so a second
+    # caller's synthesis+playback never overlaps the first's — that overlap is what let
+    # two concurrent speak() calls stomp each other's _is_speaking/_http_interrupt state.
+    _speak_lock.acquire()
     try:
         # If text contains Chinese, send the whole unsplit text to a multilingual TTS so
         # mixed Chinese/English uses one consistent voice. Try ElevenLabs first, then
@@ -2002,6 +2037,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
                 wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
             wav_parts.append(tail_silence_path)
+            _tail_pad_added = True
 
         if not wav_parts:
             return
@@ -2059,6 +2095,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         mic_peaks_during: list[int] = []
         _interrupted   = [False]
         _aplay_rc      = [0]
+        _tick_at_break = [0]   # tick_idx when interrupted — how far into _final_pcm we got
 
         def _monitor_and_play(cmd, radio_tx=False):
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
@@ -2126,6 +2163,18 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                         else:
                             log.info("TTS no coupling data → threshold=%d (floor)",
                                      interrupt_threshold[0])
+                    # The guard only gates the mic-based auto-barge-in calibration above —
+                    # an explicit Stop-button /interrupt must never wait on it. Without this
+                    # check here, the `continue` below skipped straight past the identical
+                    # check after the guard block, so Stop silently did nothing for the
+                    # first _GUARD_TICKS*50ms (2s) of every reply.
+                    if _http_interrupt[0]:
+                        _http_interrupt[0] = False
+                        _interrupted[0] = True
+                        _tick_at_break[0] = tick_idx
+                        try: proc.kill()
+                        except Exception: pass
+                        break
                     continue
 
                 # Keep tracking coupling past the initial 1s guard so a long or
@@ -2153,6 +2202,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 if _http_interrupt[0]:
                     _http_interrupt[0] = False
                     _interrupted[0] = True
+                    _tick_at_break[0] = tick_idx
                     try: proc.kill()
                     except Exception: pass
                     break
@@ -2162,6 +2212,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                         log.info("Speech interrupt — stopping TTS (peak=%d thr=%d)",
                                  p, interrupt_threshold[0])
                         _interrupted[0] = True
+                        _tick_at_break[0] = tick_idx
                         _clear_audio_buffer[0] = True
                         try: proc.kill()
                         except Exception: pass
@@ -2212,10 +2263,25 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             _ptt_release()
             log.info("PTT released")
 
-        # Save text for /continue if interrupted mid-sentence; clear on normal finish.
+        # Save state for the Continue/Replay/Cancel buttons if interrupted mid-sentence;
+        # clear on normal finish. "full" is the whole message (Replay); "remaining" is
+        # estimated from how far into _final_pcm playback got when it was cut off, rounded
+        # back to the start of whichever sentence was in progress (Continue) — see
+        # _sentence_start_before(). Falls back to the whole message when we have no usable
+        # position (e.g. interrupted during the radio-TX path, which doesn't track ticks).
         if _interrupted[0] and resumable:
-            _paused_speech[0] = (strip_markdown(text), alsa_output)
-            log.info("TTS interrupted — saved %d chars for /continue", len(strip_markdown(text)))
+            full_text = strip_markdown(text)
+            remaining_text = full_text
+            content_total = len(_final_pcm) - _lead_pad_samples - (_lead_pad_samples if _tail_pad_added else 0)
+            if content_total > 0 and full_text:
+                played = _tick_at_break[0] * _TICK_SAMPLES - _lead_pad_samples
+                played = max(0, min(played, content_total))
+                char_est = int(played / content_total * len(full_text))
+                start = _sentence_start_before(full_text, char_est)
+                remaining_text = full_text[start:].strip() or full_text
+            _paused_speech[0] = {"remaining": remaining_text, "full": full_text, "alsa": alsa_output}
+            log.info("TTS interrupted — saved %d/%d chars remaining for /continue (/restart replays all)",
+                      len(remaining_text), len(full_text))
         elif not _interrupted[0]:
             _paused_speech[0] = None
 
@@ -2263,6 +2329,7 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             except FileNotFoundError: pass
         try: os.unlink(final_wav)
         except (FileNotFoundError, UnboundLocalError): pass
+        _speak_lock.release()
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -2662,21 +2729,6 @@ class RealtimeSession:
                 log.warning("Mic reconnect failed (%s) — will retry", e)
                 _last_mic_cb[0] = _wm.time()  # back off
 
-    async def _resume_from_http(self, text: str, alsa_output: str):
-        """Resume paused TTS triggered by the /continue HTTP button."""
-        if self._busy.is_set():
-            return
-        self._busy.set()
-        try:
-            _log_entry("system", "Resuming…")
-            await asyncio.get_running_loop().run_in_executor(
-                None, speak, text, alsa_output
-            )
-        finally:
-            import time as _t_gate
-            _post_busy_until[0] = _t_gate.time() + 0.6
-            self._busy.clear()
-
     async def _run_calibration(self):
         """Measure ambient noise via the live mic stream and update MIC_GATE_PEAK."""
         global MIC_GATE_PEAK
@@ -3013,18 +3065,18 @@ class RealtimeSession:
                     self.alsa_output)
             return
 
-        # Continue phrase — resume paused TTS without asking Five again
+        # Continue phrase — resume paused TTS (from where it was cut off) without asking Five again
         if _matches_phrase(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
             if saved and not self._busy.is_set():
                 _paused_speech[0] = None  # clear immediately so concurrent tasks don't re-enter
-                saved_text, saved_dev = saved
+                saved_text, saved_dev = saved["remaining"], saved["alsa"]
                 log.info("Voice continue — resuming %d chars", len(saved_text))
                 _log_entry("system", "Resuming…")
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, saved_text, saved_dev
+                        None, speak, saved_text, saved_dev, -1.0, 300, True, True
                     )
                 finally:
                     import time as _t_gate2
@@ -3368,7 +3420,7 @@ def _dashboard_dynamic(sess) -> dict:
              else "MONITORING" if monitoring
              else "SPEAKING"   if speaking
              else "THINKING"   if thinking
-             else "PAUSED"     if (active and paused)
+             else "PAUSED"     if paused
              else "ACTIVE"     if active else "SILENT")
     _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
            "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
@@ -3386,8 +3438,10 @@ def _dashboard_dynamic(sess) -> dict:
         ' &nbsp;<a href="/interrupt" class="irupt">&#10005; Stop</a></div>'
         if speaking else
         '<div class="spkbanner paused">&#9646;&#9646; Paused'
-        ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a></div>'
-        if (active and paused) else ""
+        ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a>'
+        ' &nbsp;<a href="/replay" class="rpl">&#8635; Replay</a>'
+        ' &nbsp;<a href="/cancel" class="cnl">&#10005; Cancel</a></div>'
+        if paused else ""
     )
 
     # Pre-compute thinking durations
@@ -3851,17 +3905,43 @@ async function clearProfile(target) {{
                 self.end_headers()
                 self.wfile.write(data)
 
-            elif self.path == "/continue":
+            elif self.path in ("/continue", "/replay"):
+                # /continue resumes from the sentence that was cut off; /replay plays
+                # the whole message again from the top. NOT named /restart — that path
+                # already exists (nav bar) for restarting the RealTimeTalk daemon itself
+                # via systemctl; reusing it here would silently shadow this branch, since
+                # do_GET's elif chain matches whichever handler is defined first.
+                #
+                # Spawns speak() directly (like /speak) instead of routing through
+                # sess._resume_from_http() — sess is None until the device has been
+                # woken at least once (session_ref starts as [None] and only gets a
+                # RealtimeSession after a wake event; RTT boots asleep by default), so
+                # requiring sess here silently no-op'd Continue/Replay whenever a
+                # /speak-triggered readout was interrupted while asleep — the common case.
+                #
+                # Clears _paused_speech immediately so a double-click (or the two buttons
+                # clicked in quick succession) can't both re-enter — speak() re-saves it
+                # if this playback is itself interrupted again.
                 saved = _paused_speech[0]
-                if saved and sess and sess.loop:
-                    _paused_speech[0] = None  # clear immediately so double-clicks don't re-enter
-                    saved_text, saved_dev = saved
-                    def _resume():
-                        asyncio.run_coroutine_threadsafe(
-                            sess._resume_from_http(saved_text, saved_dev), sess.loop
-                        )
-                    _threading.Thread(target=_resume, daemon=True).start()
-                    log.info("HTTP continue — resuming %d chars", len(saved_text))
+                if saved:
+                    _paused_speech[0] = None
+                    key   = "full" if self.path == "/replay" else "remaining"
+                    label = "Replaying…" if self.path == "/replay" else "Resuming…"
+                    saved_text, saved_dev = saved[key], saved["alsa"]
+                    _log_entry("system", label)
+                    threading.Thread(target=speak, args=(saved_text, saved_dev, -1.0, 300, True, True),
+                                      daemon=True).start()
+                    log.info("HTTP %s — %d chars", self.path.lstrip("/"), len(saved_text))
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.end_headers()
+
+            elif self.path == "/cancel":
+                # Discard paused speech and go back to the pre-interrupt state — no replay.
+                had = _paused_speech[0] is not None
+                _paused_speech[0] = None
+                _log_entry("system", "Reading cancelled.")
+                log.info("HTTP cancel — discarded paused speech" if had else "HTTP cancel — nothing paused")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
@@ -5311,6 +5391,10 @@ a.irupt{{color:var(--rd);background:var(--rdb);border:1px solid var(--rd);border
 a.irupt:hover{{background:var(--rd);color:#fff;}}
 a.cont{{color:var(--gn);background:var(--gnb);border:1px solid var(--gn);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
 a.cont:hover{{background:var(--gn);color:#000;}}
+a.rpl{{color:var(--you);background:var(--yb);border:1px solid var(--you);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.rpl:hover{{background:var(--you);color:#000;}}
+a.cnl{{color:var(--mu);background:var(--sf2);border:1px solid var(--mu);border-radius:4px;padding:2px 8px;font-size:.82em;font-style:normal;text-decoration:none;margin-left:8px;}}
+a.cnl:hover{{background:var(--mu);color:#000;}}
 .spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
 .spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
 #dbanner{{min-height:1.2em;font-size:.8em;font-family:'JetBrains Mono',monospace;padding:3px 8px;transition:color .1s;}}
@@ -5408,7 +5492,8 @@ setInterval(function(){{
                     return
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 _log_entry("five", text)
-                threading.Thread(target=speak, args=(text, alsa), daemon=True).start()
+                threading.Thread(target=speak, args=(text, alsa, -1.0, 300, True, True),
+                                  daemon=True).start()
                 log.info("HTTP speak — queued %d chars", len(text))
                 body = json.dumps({"ok": True, "queued": True, "chars": len(text)}).encode()
                 self.send_response(200)

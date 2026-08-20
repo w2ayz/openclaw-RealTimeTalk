@@ -1,3 +1,17 @@
+## v3.16.0 — 2026-08-19
+
+### Added
+
+- **Continue / Replay / Cancel buttons** on the dashboard's paused banner, replacing the old single Continue link (which actually restarted from the top despite its name). Continue now does a real resume: `speak()` estimates how far into playback it got when interrupted (from the same 50ms-tick position the barge-in monitor already tracks), maps that to a character offset in the text, and rounds back to the start of whichever sentence was in progress (`_sentence_start_before()`) — so it picks up close to where it left off instead of replaying everything. Replay plays the whole message again from the top (the old Continue behavior). Cancel discards the paused state with no replay. Deliberately not named `/restart` — that path already exists (nav bar) for restarting the RealTimeTalk daemon itself via `systemctl`, and since `do_GET`'s `elif` chain matches whichever handler is defined first, reusing it would have silently shadowed the new route.
+
+### Fixed
+
+- **`/speak` ignored Stop.** The endpoint called `speak()` without `interruptible=True`, so long OpenClaw-triggered readouts played via a plain blocking `subprocess.call()` that never checked the interrupt flag — Stop set the flag but nothing was watching for it. Now passes `resumable=True, interruptible=True`, matching the main conversational reply.
+- **Two concurrent `/speak` calls raced on shared state.** `_is_speaking` and `_http_interrupt` are single global flags; two overlapping `speak()` calls (e.g. two `/speak` requests close together) could have the shorter one's `finally` clear `_is_speaking` while the longer one was still playing, hiding the Stop button mid-reading and leaving `/interrupt` targeting whichever playback happened to still be polling the flag. `speak()` is now serialized behind a module-level lock so a second item waits for the first to fully finish before it starts.
+- **Stop was silently deferred for the first 2 seconds of any reply.** The acoustic-coupling calibration guard's `continue` skipped straight past the `_http_interrupt` check for its full `_GUARD_TICKS` window, so clicking Stop early did nothing until the guard ended. The explicit interrupt check now also runs during the guard window; only the mic-based auto-barge-in threshold stays gated by it.
+- **Paused banner never appeared while the device was asleep.** It required `active` (voice-listening state) in addition to a saved pause, but `/speak` readouts — and their interruptions — happen regardless of listening state, and RTT boots asleep by default. Banner now shows on `paused` alone.
+- **Continue/Replay silently no-op'd.** Both routed playback through `sess._resume_from_http()`, which needs a live `RealtimeSession`; `session_ref[0]` is `None` until the device has actually been woken once, so any `/speak` readout interrupted while asleep (the common case) made both buttons do nothing with no error. They now call `speak()` directly in a plain thread, the same pattern `/speak` and `/cancel` already used, with no session dependency. `_resume_from_http()` removed as dead code.
+
 ## v3.15.0 — 2026-08-19
 
 ### Added
