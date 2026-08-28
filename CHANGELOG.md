@@ -1,3 +1,12 @@
+## v3.18.0 — 2026-08-28
+
+Kept in lockstep with the Mac fork's v3.18.0 — same change, released on both at once (Pi was on 3.17.1, Mac on 3.17.0; both land on 3.18.0).
+
+### Changed
+
+- **`/voice-enroll`: "Clear this device's profile" is now split out of the Save/Test row into its own red-bordered "Danger zone" card**, with a line spelling out the cost of clearing (re-recording all three samples). It previously sat immediately next to Save.
+- **Clearing a profile now confirms inline instead of via a native `confirm()` dialog.** Clicking Clear (active profile, or the "Other enrolled devices" row) replaces the button in place with a "Delete the enrolled … voice profile? This can't be undone." prompt and explicit **Yes, clear** / **Cancel** buttons; only "Yes, clear" hits `/voice-enroll/clear?target=…`. Native `confirm()` dropped partly because it can hang headless/automated browser sessions.
+
 ## v3.17.1 — 2026-08-20
 
 ### Changed

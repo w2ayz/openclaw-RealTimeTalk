@@ -23,7 +23,7 @@ Requires:
   piper installed at ~/.local/bin/piper with a voice model
 """
 
-__version__ = "3.17.1"
+__version__ = "3.18.0"
 
 import argparse
 import asyncio
@@ -3854,7 +3854,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
 <h3 style="color:#94a3b8;font-size:14px;margin:18px 0 6px;">Other enrolled devices</h3>
 <div class="card" style="display:flex;align-items:center;justify-content:space-between;">
 <span>{other_label}</span>
-<button onclick="clearProfile('{other_target}')" style="border-color:var(--rd)">&#10006; Clear</button>
+<span class="clearwrap"><button onclick="confirmClear(this,'{other_target}')" style="border-color:var(--rd)">&#10006; Clear</button></span>
 </div>"""
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -3867,6 +3867,9 @@ h3{{margin:8px 0}} .info{{color:var(--mu);font-size:13px;margin:4px 0}}
 .card{{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:12px;margin:10px 0}}
 button{{padding:8px 14px;border:1px solid var(--bd);border-radius:var(--r);background:#121925;color:var(--tx);font-size:14px;cursor:pointer}}
 button:disabled{{opacity:.4}} .ok{{color:var(--gn)}} .bad{{color:var(--rd)}}
+.card.danger{{border-color:#5a2230;background:#160d12}}
+.clearwrap{{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.clearwrap .confirmtxt{{color:var(--rd);font-size:13px}}
 a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;overflow:hidden;margin:8px 0}}
 .meter>div{{height:100%;width:0;background:var(--gn)}}
 </style></head><body>
@@ -3889,8 +3892,11 @@ a{{color:var(--you)}} .meter{{height:8px;background:#121925;border-radius:4px;ov
 <div class="card">
 <button onclick="save('{active_target}')">&#128190; Save profile for {active_device}</button>
 <button onclick="test(this)">&#127897; Test my voice</button>
-<button onclick="clearProfile('{active_target}')" style="border-color:var(--rd)">&#10006; Clear this device's profile</button>
 <div id="active-result" class="info"></div></div>
+<div class="card danger">
+<b class="bad">&#9888; Danger zone</b>
+<p class="info">Deletes the saved {active_label} for {active_device}. You&rsquo;ll have to re-record all three samples to enroll it again.</p>
+<span class="clearwrap"><button onclick="confirmClear(this,'{active_target}')" style="border-color:var(--rd)">&#10006; Clear this device&rsquo;s profile</button></span></div>
 {other_section}
 <script>
 const es = new EventSource('/levels');
@@ -3923,9 +3929,18 @@ async function test(btn) {{
       : `<span class="bad">${{j.error}}</span>`;
   }} finally {{ btn.disabled = false; }}
 }}
-async function clearProfile(target) {{
-  if (!confirm(`Delete the enrolled ${{target}} voice profile?`)) return;
-  await fetch(`/voice-enroll/clear?target=${{target}}`); location.reload();
+function confirmClear(btn, target) {{
+  const wrap = btn.closest('.clearwrap');
+  const restore = wrap.innerHTML;
+  wrap.innerHTML = `<span class="confirmtxt">Delete the enrolled ${{target}} voice profile? This can&rsquo;t be undone.</span>`
+    + `<button class="doclear" style="border-color:var(--rd)">&#10006; Yes, clear</button>`
+    + `<button class="cancelclear">Cancel</button>`;
+  wrap.querySelector('.cancelclear').onclick = () => {{ wrap.innerHTML = restore; }};
+  wrap.querySelector('.doclear').onclick = async (e) => {{
+    e.target.disabled = true;
+    await fetch(`/voice-enroll/clear?target=${{target}}`);
+    location.reload();
+  }};
 }}
 </script></body></html>"""
                 data = body.encode()
