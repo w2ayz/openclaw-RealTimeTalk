@@ -498,7 +498,7 @@ RealTimeTalk/
 ├── radio_interfaces.py              Radio Mode: interface registry, PTT/audio resolution
 ├── dtmf_monitor.py                  standalone DTMF Mon/Train/Retrain CLI
 ├── RealTimeTalk-install-pi.sh       one-command Pi deploy
-└── RealTimeTalk-toggle.sh           start / stop / status / log / devices
+└── RealTimeTalk-toggle.sh           start / stop / restart / disable / enable / status / log / devices
 ```
 
 ---

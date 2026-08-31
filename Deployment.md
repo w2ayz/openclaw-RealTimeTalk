@@ -55,7 +55,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 ├── dtmf_monitor.py                 # standalone DTMF Mon/Train/Retrain CLI (launched from the Calibrate page)
 ├── requirements.txt                # Python deps (installed into venv/, see below)
 ├── RealTimeTalk-install-pi.sh      # installer — run once, safe to re-run any time
-├── RealTimeTalk-toggle.sh          # start/stop/restart/status/log/devices — day-to-day control
+├── RealTimeTalk-toggle.sh          # start/stop/restart/disable/enable/status/log/devices — day-to-day control
 ├── README.md, SKILL.md, CHANGELOG.md, RADIO-INTERFACE.md, UI-BUTTONS.md
 ├── Deployment.md                   # this file
 └── LICENSE
@@ -263,12 +263,35 @@ on repeaters, etc.).
 ```bash
 cd ~/openclaw-RealTimeTalk
 ./RealTimeTalk-toggle.sh start      # systemctl --user start
-./RealTimeTalk-toggle.sh stop       # systemctl --user stop
+./RealTimeTalk-toggle.sh stop       # systemctl --user stop  (back at next login/boot)
 ./RealTimeTalk-toggle.sh restart    # systemctl --user restart
-./RealTimeTalk-toggle.sh status     # systemctl --user status
+./RealTimeTalk-toggle.sh disable    # stop + disable autostart; verifies it's inactive
+./RealTimeTalk-toggle.sh enable     # undo disable, wait until the dashboard answers
+./RealTimeTalk-toggle.sh status     # systemctl --user status (+ enabled/disabled state)
 ./RealTimeTalk-toggle.sh log        # journalctl --user -u ... -f
 ./RealTimeTalk-toggle.sh devices    # list audio devices the daemon can see
 ```
+
+### Disabling RealTimeTalk (make it inert)
+
+`stop` only lasts until the next login/boot — the service is `enable`d, so
+it comes back. To stop it **and** keep it from starting again (no mic
+capture, no OpenAI Realtime connection, no spoken output, dashboard down)
+without uninstalling anything — the mic kill-switch:
+
+```bash
+./RealTimeTalk-toggle.sh disable    # runs: systemctl --user disable --now openclaw-realtimetalk
+./RealTimeTalk-toggle.sh enable     # runs: systemctl --user enable  --now openclaw-realtimetalk
+```
+
+`disable` verifies `systemd` reports the unit inactive before returning;
+`enable` polls `/status` until the daemon is back up. systemd stops the
+whole service cgroup, so there's no stray process to clean up (unlike the
+Mac fork's wrapper). The `loginctl enable-linger` setting is unaffected —
+re-enabling brings autostart-on-boot back with it.
+
+This leaves the OpenClaw gateway and everything else untouched — RTT is the
+only thing on the Pi that uses the mic.
 
 ### Wiring OpenClaw up to push text for readout
 

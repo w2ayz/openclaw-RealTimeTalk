@@ -1,3 +1,11 @@
+## v3.19.0 — 2026-08-30
+
+Skips 3.18.1 to stay aligned with the Mac fork — that version was a Mac-only wrapper-app rename (`ZeebotTalk.app` → `RealTimeTalk.app`) with no Pi equivalent.
+
+### Added
+
+- **`RealTimeTalk-toggle.sh disable` / `enable`** — a persistent mic kill-switch. `disable` runs `systemctl --user disable --now openclaw-realtimetalk` (stopped **and** no autostart on next login/boot, unlike `stop` which comes back) and verifies systemd reports the unit inactive before returning. `enable` runs `systemctl --user enable --now` and polls `/status` until the daemon answers. `status` now also prints the unit's enabled/disabled state. No process-reaping needed — systemd tears down the whole service cgroup (the Mac fork needs this because its wrapper app could orphan the daemon). Deployment.md §9 gains a "Disabling RealTimeTalk (make it inert)" section.
+
 ## v3.18.0 — 2026-08-28
 
 Kept in lockstep with the Mac fork's v3.18.0 — same change, released on both at once (Pi was on 3.17.1, Mac on 3.17.0; both land on 3.18.0).
