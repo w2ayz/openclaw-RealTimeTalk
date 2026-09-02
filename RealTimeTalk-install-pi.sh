@@ -41,7 +41,9 @@ echo "[1/8] Checking system packages…"
 #                   but the DTMF listener thread runs unconditionally and probes for one
 #                   every few seconds regardless of whether this Pi has radio hardware —
 #                   installed unconditionally so plugging one in later doesn't crash it
-REQUIRED_APT_PKGS=(libportaudio2 pulseaudio-utils pipewire-alsa espeak-ng fonts-noto-color-emoji sox multimon-ng)
+# mpg123          - decodes the MP3 the Edge TTS skill emits into WAV for the
+#                   ElevenLabs → Edge → OpenAI → Piper fallback chain (tiny package)
+REQUIRED_APT_PKGS=(libportaudio2 pulseaudio-utils pipewire-alsa espeak-ng fonts-noto-color-emoji sox multimon-ng mpg123)
 MISSING_PKGS=()
 for pkg in "${REQUIRED_APT_PKGS[@]}"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
@@ -122,6 +124,50 @@ download_piper_voice() {
 }
 download_piper_voice "en_US-lessac-medium" "en/en_US/lessac/medium"
 download_piper_voice "zh_CN-huayan-medium" "zh/zh_CN/huayan/medium"
+
+# ── 3b. Edge TTS skill (network TTS fallback for Chinese/mixed — optional) ────
+# Sits between ElevenLabs and OpenAI TTS in the chain: free, no API key, native
+# zh-CN / en-US neural voices. Needs the published edge-tts skill (official
+# location ~/.openclaw/workspace/skills/edge-tts/) plus Node.js. Absent skill or
+# Node → warn and continue; ElevenLabs → OpenAI TTS → Piper still cover every reply.
+echo "      Checking Edge TTS skill (optional network fallback)…"
+EDGE_TTS_OFFICIAL="$HOME/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js"
+EDGE_TTS_SCRIPT=""
+for cand in \
+    "$SKILL_DIR/../edge-tts/scripts/tts-converter.js" \
+    "${OPENCLAW_WORKSPACE:-}/skills/edge-tts/scripts/tts-converter.js" \
+    "$EDGE_TTS_OFFICIAL"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then
+        EDGE_TTS_SCRIPT="$(cd "$(dirname "$cand")" && pwd)/$(basename "$cand")"
+        break
+    fi
+done
+
+if [ -z "$EDGE_TTS_SCRIPT" ]; then
+    echo "      ⚠ edge-tts skill not found — install it to enable the Edge TTS tier:"
+    echo "          clawhub install edge-tts"
+    echo "        Skipping. ElevenLabs → OpenAI TTS → Piper still cover all replies."
+    EDGE_TTS_SCRIPT="$EDGE_TTS_OFFICIAL"   # daemon re-checks this path at runtime
+else
+    if ! command -v node >/dev/null 2>&1; then
+        echo "      Node.js not found — installing (needed to run the edge-tts skill)…"
+        sudo apt-get install -y -q nodejs npm || \
+            echo "      ⚠ nodejs/npm install failed — Edge TTS stays disabled until Node is available."
+    fi
+    if command -v node >/dev/null 2>&1; then
+        EDGE_TTS_DIR="$(cd "$(dirname "$EDGE_TTS_SCRIPT")" && pwd)"
+        if [ ! -d "$EDGE_TTS_DIR/node_modules" ]; then
+            echo "      Installing Edge TTS node deps (npm install in $EDGE_TTS_DIR)…"
+            ( cd "$EDGE_TTS_DIR" && npm install --omit=dev --silent ) || \
+                echo "      ⚠ npm install failed — Edge TTS falls back to OpenAI/Piper at runtime."
+        fi
+        if node "$EDGE_TTS_SCRIPT" --help >/dev/null 2>&1; then
+            echo "      ✓ Edge TTS skill ready ($EDGE_TTS_SCRIPT)"
+        else
+            echo "      ⚠ Edge TTS script present but not runnable — check node + node_modules."
+        fi
+    fi
+fi
 
 # ── 4. Speaker verification model (owner-only mode) ──────────────────────────
 echo "[4/8] Checking speaker verification model…"
@@ -256,6 +302,7 @@ Restart=no
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+Environment=RTT_EDGE_TTS_SCRIPT=$EDGE_TTS_SCRIPT
 
 [Install]
 WantedBy=default.target

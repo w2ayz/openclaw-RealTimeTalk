@@ -1,3 +1,17 @@
+## v3.20.0 — 2026-09-02
+
+Kept in lockstep with the Mac fork's v3.20.0.
+
+### Added
+
+- **Edge TTS as a network TTS tier for Chinese/mixed replies.** The chain for text containing Chinese is now **ElevenLabs → Edge TTS → OpenAI TTS → Piper** (was ElevenLabs → OpenAI → Piper). Edge TTS is the [edge-tts skill](https://github.com/w2ayz/openclaw-edge-tts): free, no API key, native `zh-CN-XiaoxiaoNeural` / `en-US-AriaNeural` neural voices — for a bilingual user that beats OpenAI's English-accented Mandarin, and it's a free tier ahead of paid OpenAI TTS. New `_edge_tts()` splits by script and voices each run natively; `_edge_tts_seg()` handles one run. Edge emits MP3, decoded to WAV via `mpg123` (new apt dependency, ~100 KB) then resampled to `PIPER_SAMPLE_RATE` like the OpenAI TTS path. **Pure-English replies are unchanged** — they still go straight to the offline Piper `en_US-lessac-medium` voice; Edge only enters on the Chinese/cloud path.
+  - Script path resolved by `_resolve_edge_tts_script()`: `$RTT_EDGE_TTS_SCRIPT` (set by the installer in the systemd unit) → sibling `skills/edge-tts/scripts/tts-converter.js` → `$OPENCLAW_WORKSPACE/...` → official `~/.openclaw/workspace/skills/edge-tts/...`. Missing skill or Node → the tier is silently skipped.
+  - `RealTimeTalk-install-pi.sh` adds `mpg123` to the apt list, resolves the edge-tts skill, installs `nodejs`/`npm` + the skill's `npm` deps if the skill is present (warns and continues if not), and writes `RTT_EDGE_TTS_SCRIPT` into the systemd unit.
+
+### Changed
+
+- **Auto-sleep (10 min idle) is now text-only.** `_idle_watcher` no longer speaks "Going to sleep." — it just writes the `Auto-sleep after N min idle…` line to the dashboard log and flips the state to **SLEEPING**. The spoken line fired during quiet time (often an empty room) and was more startling than useful.
+
 ## v3.19.0 — 2026-08-30
 
 Skips 3.18.1 to stay aligned with the Mac fork — that version was a Mac-only wrapper-app rename (`ZeebotTalk.app` → `RealTimeTalk.app`) with no Pi equivalent.

@@ -5,7 +5,8 @@ RealTimeTalk-daemon.py — OpenClaw RealTimeTalk daemon (gateway-integrated).
 Audio flow:
   Mic → OpenAI Realtime API (VAD + STT only) → transcript
   transcript → OpenClaw gateway (chat.send / agent.wait) → AI Agent's reply
-  AI Agent's reply → Piper TTS → speaker
+  AI Agent's reply → ElevenLabs → Edge TTS → OpenAI TTS → Piper → speaker
+                     (Chinese/mixed uses the network tiers; English → Piper)
 
 Stop via:
   http://<pi-ip>:19000/dashboard          — phone browser (over Tailscale)
@@ -19,11 +20,14 @@ Usage:
 
 Requires:
   pip install "websockets>=12" sounddevice numpy
-  sudo apt install libportaudio2 alsa-utils
+  sudo apt install libportaudio2 alsa-utils mpg123
   piper installed at ~/.local/bin/piper with a voice model
+  (optional) edge-tts skill at ~/.openclaw/workspace/skills/edge-tts/ + Node.js
+    — network TTS fallback for Chinese/mixed replies; path resolved by
+    _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.19.0"
+__version__ = "3.20.0"
 
 import argparse
 import asyncio
@@ -92,6 +96,40 @@ ELEVENLABS_VOICE_ID    = "21m00Tcm4TlvDq8ikWAM"   # Rachel — multilingual v2
 ELEVENLABS_MODEL       = "eleven_multilingual_v2"
 ELEVENLABS_SECRETS_FILE = os.path.expanduser("~/.openclaw/secrets/elevenlabs")
 _elevenlabs_key: str   = ""        # populated lazily from secrets file
+
+# Edge TTS skill — network TTS fallback between ElevenLabs and OpenAI for
+# Chinese/mixed replies. Free, no API key, native zh-CN / en-US neural voices.
+# Official skill location: ~/.openclaw/workspace/skills/edge-tts/ . Edge emits
+# MP3; mpg123 (apt) decodes it to WAV, then it's resampled to PIPER_SAMPLE_RATE
+# exactly like the OpenAI TTS path. Script path is resolved in this order,
+# first hit wins:
+#   1. $RTT_EDGE_TTS_SCRIPT               — set by the installer in the systemd unit
+#   2. <this-skill>/../edge-tts/scripts/tts-converter.js   — sibling skill dir
+#   3. $OPENCLAW_WORKSPACE/skills/edge-tts/scripts/tts-converter.js
+#   4. ~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js  — official
+def _resolve_edge_tts_script() -> str:
+    official = os.path.expanduser(
+        "~/.openclaw/workspace/skills/edge-tts/scripts/tts-converter.js")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ws = os.environ.get("OPENCLAW_WORKSPACE", "").strip()
+    candidates = [
+        os.environ.get("RTT_EDGE_TTS_SCRIPT", "").strip(),
+        os.path.join(here, os.pardir, "edge-tts", "scripts", "tts-converter.js"),
+        os.path.join(ws, "skills", "edge-tts", "scripts", "tts-converter.js") if ws else "",
+        official,
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        c = os.path.abspath(os.path.expanduser(c))
+        if os.path.isfile(c):
+            return c
+    return official
+
+EDGE_TTS_SCRIPT   = _resolve_edge_tts_script()
+EDGE_VOICE_EN     = "en-US-AriaNeural"
+EDGE_VOICE_ZH     = "zh-CN-XiaoxiaoNeural"
+EDGE_TTS_TIMEOUT  = 10             # seconds per Edge segment
 
 _oww_confirm_pending: list = [False]  # OWW fired in silent mode; next transcript triggers "Yes?"
 _oww_confirm_t:       list = [0.0]    # epoch time OWW set the flag (guard against stale transcripts)
@@ -1959,6 +1997,102 @@ def _elevenlabs_tts(text: str, output_path: str) -> bool:
         return False
 
 
+def _edge_tts_seg(text: str, voice: str, output_path: str) -> bool:
+    """Render one text run via the Edge TTS skill → WAV at PIPER_SAMPLE_RATE.
+
+    Edge emits MP3; mpg123 decodes it to WAV, then it's resampled to
+    PIPER_SAMPLE_RATE exactly like _openai_tts. Returns False (→ caller falls
+    through to OpenAI/Piper) if the skill or mpg123 is missing, or on any error.
+    """
+    import wave as _wv, tempfile as _tf
+    if not os.path.isfile(EDGE_TTS_SCRIPT):
+        return False
+    mp3_path = _tf.mktemp(suffix=".mp3")
+    raw_wav  = _tf.mktemp(suffix=".wav")
+    try:
+        r = subprocess.run(
+            ["node", EDGE_TTS_SCRIPT, text, "--voice", voice, "--output", mp3_path],
+            capture_output=True, timeout=EDGE_TTS_TIMEOUT, text=True,
+        )
+        if r.returncode != 0 or not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
+            log.warning("Edge TTS failed for %r (rc=%s): %s", text[:30], r.returncode, (r.stderr or "")[:160])
+            return False
+        d = subprocess.run(
+            ["mpg123", "-q", "-w", raw_wav, mp3_path],
+            capture_output=True, timeout=15, text=True,
+        )
+        if d.returncode != 0 or not os.path.exists(raw_wav):
+            log.warning("Edge TTS: mpg123 decode failed (rc=%s): %s — is the 'mpg123' package installed?",
+                        d.returncode, (d.stderr or "")[:160])
+            return False
+        with _wv.open(raw_wav, 'rb') as wf:
+            src_rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+        data = np.frombuffer(frames, dtype=np.int16)
+        if src_rate != PIPER_SAMPLE_RATE and len(data):
+            n_out = int(len(data) * PIPER_SAMPLE_RATE / src_rate)
+            data = np.interp(
+                np.linspace(0, len(data) - 1, n_out),
+                np.arange(len(data)),
+                data.astype(np.float32),
+            ).astype(np.int16)
+        with _wv.open(output_path, 'wb') as out_wf:
+            out_wf.setnchannels(1); out_wf.setsampwidth(2); out_wf.setframerate(PIPER_SAMPLE_RATE)
+            out_wf.writeframes(data.tobytes())
+        return True
+    except subprocess.TimeoutExpired:
+        log.warning("Edge TTS timed out for %r", text[:30])
+        return False
+    except Exception as e:
+        log.warning("Edge TTS error: %s", e)
+        return False
+    finally:
+        for p in (mp3_path, raw_wav):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _edge_tts(text: str, output_path: str) -> bool:
+    """Render `text` via Edge TTS, split by script so each run uses its native
+    voice (zh-CN-XiaoxiaoNeural / en-US-AriaNeural), concatenated into one WAV
+    at PIPER_SAMPLE_RATE. Returns False (→ caller falls through to OpenAI TTS)
+    if the skill is missing or any segment fails."""
+    import wave as _wv, tempfile as _tf
+    if not os.path.isfile(EDGE_TTS_SCRIPT):
+        return False
+    seg_wavs: list[str] = []
+    try:
+        for seg_text, lang in _split_by_script(text):
+            if not seg_text.strip():
+                continue
+            voice = EDGE_VOICE_ZH if lang == 'zh' else EDGE_VOICE_EN
+            sp = _tf.mktemp(suffix=".wav")
+            if not _edge_tts_seg(seg_text, voice, sp):
+                return False
+            seg_wavs.append(sp)
+        if not seg_wavs:
+            return False
+        frames = b""
+        for sp in seg_wavs:
+            with _wv.open(sp, 'rb') as wf:
+                frames += wf.readframes(wf.getnframes())
+        with _wv.open(output_path, 'wb') as out_wf:
+            out_wf.setnchannels(1); out_wf.setsampwidth(2); out_wf.setframerate(PIPER_SAMPLE_RATE)
+            out_wf.writeframes(frames)
+        return True
+    except Exception as e:
+        log.warning("Edge TTS (multi-segment) error: %s", e)
+        return False
+    finally:
+        for sp in seg_wavs:
+            try:
+                os.unlink(sp)
+            except OSError:
+                pass
+
+
 def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
           resumable: bool = False, interruptible: bool = False):
     # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
@@ -2014,12 +2148,16 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
         _speak_lock.release()
         time.sleep(0.2)
     try:
-        # If text contains Chinese, send the whole unsplit text to a multilingual TTS so
-        # mixed Chinese/English uses one consistent voice. Try ElevenLabs first, then
-        # OpenAI TTS (both handle mixed language natively in a single call).
+        # If text contains Chinese, render it via the network TTS tiers before
+        # falling back to per-segment Piper. Chain: ElevenLabs → Edge TTS →
+        # OpenAI TTS. ElevenLabs/OpenAI take the whole unsplit text in one call;
+        # Edge TTS splits by script internally and uses its native zh/en voices.
         if _is_chinese_text(clean):
             full_path = tempfile.mktemp(suffix=".wav")
             if _elevenlabs_tts(clean, full_path):
+                wav_parts.append(full_path)
+                segments = []   # skip per-segment loop below
+            elif _edge_tts(clean, full_path):
                 wav_parts.append(full_path)
                 segments = []   # skip per-segment loop below
             elif _openai_tts(clean, full_path):
@@ -2034,7 +2172,11 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
                 if _elevenlabs_tts(seg_text, part_path):
                     wav_parts.append(part_path)
                     continue
-                log.warning("ElevenLabs TTS failed for ZH segment — falling back to OpenAI TTS")
+                log.warning("ElevenLabs TTS failed for ZH segment — trying Edge TTS")
+                if _edge_tts_seg(seg_text, EDGE_VOICE_ZH, part_path):
+                    wav_parts.append(part_path)
+                    continue
+                log.warning("Edge TTS failed for ZH segment — falling back to OpenAI TTS")
                 if _openai_tts(seg_text, part_path):
                     wav_parts.append(part_path)
                     continue
@@ -3302,9 +3444,10 @@ class RealtimeSession:
                 _persist_active[0] = False
                 _idle_disconnected[0] = True
                 _save_sleep_state(True)
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "Going to sleep.", self.alsa_output
-                )
+                # Text-only: the dashboard log line above + the SLEEPING state
+                # are the whole notification — no spoken announcement. Auto-sleep
+                # fires during quiet time (often an empty room) and a voice line
+                # there is more startling than useful.
                 await ws.close()
                 return
 

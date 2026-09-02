@@ -23,7 +23,8 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 | [OpenClaw](https://openclaw.ai) gateway running locally | RealTimeTalk routes all AI through it (`ws://127.0.0.1:18789`, protocol v4). Won't start without it. |
 | OpenClaw 2026.5+ | Gateway protocol v4 required. |
 | OpenAI API key | Installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. |
-| ElevenLabs API key (optional) | Only used as a first-try Chinese-TTS voice; falls back to Piper if unset or the request fails. Not read from `openclaw.json` — see [§3.5](#35-optional-elevenlabs-key-for-chinese-tts). |
+| ElevenLabs API key (optional) | First tier of the Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper). Read from `~/.openclaw/secrets/elevenlabs`, not `openclaw.json` — see [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
+| edge-tts skill + Node.js (optional) | Second tier of that chain — free, no key, native zh/en neural voices. Install at `~/.openclaw/workspace/skills/edge-tts/`; installer resolves it. See [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 
 ### System
 
@@ -69,6 +70,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 | `~/.config/systemd/user/openclaw-realtimetalk.service` | The systemd unit — installer writes and reloads this every run |
 | `~/.local/bin/piper-native/` | Piper TTS binary |
 | `~/.local/share/piper/voices/` | English + Chinese Piper voice models |
+| `~/.openclaw/workspace/skills/edge-tts/scripts/node_modules/` | edge-tts skill deps — `npm install`ed by the installer if the skill is present |
 | `~/.local/share/rtt/speaker/` | CAM++ speaker-verification model (owner-only mode) |
 | `~/.config/pipewire/pipewire.conf.d/99-rtt-agc*.conf` | WebRTC AGC virtual-mic PipeWire config, written at runtime by the daemon itself, not the installer |
 
@@ -107,20 +109,32 @@ os.chmod(path, 0o600)
 PY
 ```
 
-### 3.5. Optional: ElevenLabs key for Chinese TTS
+### 3.5. Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper)
 
-Piper's `zh_CN-huayan-medium` voice is the default and requires no key. If
-you'd rather use ElevenLabs for Chinese/mixed-language segments (falls back
-to Piper automatically on any failure), drop a plain-text key at:
+For text containing Chinese, the daemon tries, in order:
 
-```bash
-mkdir -p ~/.openclaw/secrets
-echo -n "your-elevenlabs-key" > ~/.openclaw/secrets/elevenlabs
-chmod 600 ~/.openclaw/secrets/elevenlabs
-```
+1. **ElevenLabs** — if `~/.openclaw/secrets/elevenlabs` holds a key (plain text,
+   not `openclaw.json`):
+   ```bash
+   mkdir -p ~/.openclaw/secrets
+   echo -n "your-elevenlabs-key" > ~/.openclaw/secrets/elevenlabs
+   chmod 600 ~/.openclaw/secrets/elevenlabs
+   ```
+2. **Edge TTS** — the [edge-tts skill](https://github.com/w2ayz/openclaw-edge-tts):
+   free, no API key, native `zh-CN-XiaoxiaoNeural` / `en-US-AriaNeural` voices.
+   Install it at the official path and the RealTimeTalk installer wires it up:
+   ```bash
+   clawhub install edge-tts          # → ~/.openclaw/workspace/skills/edge-tts/
+   ```
+   Needs Node.js (installer adds `nodejs`/`npm` if missing) and `mpg123` (in the
+   apt list — decodes Edge's MP3 to WAV). The resolved script path is written
+   into the systemd unit as `RTT_EDGE_TTS_SCRIPT`.
+3. **OpenAI TTS** — `tts-1-hd` / `nova`, using `talk.providers.openai.apiKey`.
+4. **Piper** — `zh_CN-huayan-medium`, fully offline, always available.
 
-Note this is a different mechanism than `openclaw.json` — the daemon reads
-this key from a standalone file, not `talk.providers.elevenlabs.apiKey`.
+Every tier falls through to the next on missing key/skill or any failure, so
+none of them are required. **Pure-English replies skip the chain entirely** and
+go straight to the offline Piper `en_US-lessac-medium` voice.
 
 ---
 
@@ -134,9 +148,9 @@ bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 Safe to re-run any time (e.g. after `git pull`) — every step checks first and
 skips what's already installed. The installer:
 
-1. Installs system packages via `apt`: `libportaudio2`, `pulseaudio-utils`, `pipewire-alsa`, `espeak-ng`, `fonts-noto-color-emoji`, `sox`, `multimon-ng`
+1. Installs system packages via `apt`: `libportaudio2`, `pulseaudio-utils`, `pipewire-alsa`, `espeak-ng`, `fonts-noto-color-emoji`, `sox`, `multimon-ng`, `mpg123`
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs everything in `requirements.txt`
-3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected: aarch64/x86_64/armv7l)
+3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected: aarch64/x86_64/armv7l); resolves the optional edge-tts skill, installs Node.js + its deps if present, and records `RTT_EDGE_TTS_SCRIPT` in the systemd unit (§3.5)
 4. Downloads the CAM++ speaker-verification model (~28MB)
 5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set
 6. Lists detected audio devices for reference — no manual device index needed; PipeWire's own default source/sink is followed at runtime, changeable from the dashboard

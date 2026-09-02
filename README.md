@@ -2,8 +2,9 @@
 
 Headless voice daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it via the
 OpenAI Realtime Transcription API, routes the transcript through the local OpenClaw gateway so
-the AI Agent answers with full memory + tools, then synthesises the reply with Piper TTS and plays it
-through a USB speaker or headset. No browser, no display required — designed for always-on deployments.
+the AI Agent answers with full memory + tools, then synthesises the reply (Piper TTS for English;
+ElevenLabs → Edge TTS → OpenAI TTS → Piper for Chinese/mixed) and plays it through a USB speaker or
+headset. No browser, no display required — designed for always-on deployments.
 
 Runs as a `systemd` user service that starts automatically on boot. Controlled via a web
 dashboard (port 19000) accessible from any phone browser on the local network or over Tailscale.
@@ -115,7 +116,9 @@ gpt-4o-transcribe  →  transcription.completed
    ▼  AI Agent's reply text
        zhconv normalise  →  split_by_script (EN/ZH segments)
        strip_markdown()  →  remove bold/links/etc.
-       Piper TTS per segment  →  concatenate WAVs
+       Chinese/mixed:  ElevenLabs → Edge TTS → OpenAI TTS → Piper
+       English:        Piper TTS per segment
+       →  concatenate WAVs
    │
    ▼  paplay --device=<usb-sink>  (PipeWire; no ALSA-busy conflict)
 USB speaker / headset
@@ -295,6 +298,8 @@ Everything below except the OpenClaw gateway itself and the OpenAI API key is in
 | OpenAI API key | Installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. OAuth via OpenClaw `openai-codex` provider also supported |
 | Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
 | espeak-ng | Required for Chinese TTS phonemisation |
+| `mpg123` | Decodes the Edge TTS skill's MP3 output to WAV (installer adds it) |
+| edge-tts skill + Node.js (optional) | Network TTS tier between ElevenLabs and OpenAI for Chinese/mixed replies — install at `~/.openclaw/workspace/skills/edge-tts/`; installer resolves it and runs `npm install` |
 | `fonts-noto-color-emoji` | Dashboard's owner/everyone button icon (👤) needs a color-emoji font or it renders as a blank box |
 | USB microphone | C-Media PCM2902 or similar; AGC compensates for quiet hardware |
 | Speaker or headset | USB or 3.5mm; headset auto-detected |
@@ -323,9 +328,9 @@ bash ~/openclaw-RealTimeTalk/RealTimeTalk-install-pi.sh
 ```
 
 Safe to re-run any time (e.g. after `git pull`) — every step checks first and skips what's already installed. The installer:
-1. Installs system packages via apt: `libportaudio2`, `pulseaudio-utils`, `pipewire-alsa`, `espeak-ng`, `fonts-noto-color-emoji`
+1. Installs system packages via apt: `libportaudio2`, `pulseaudio-utils`, `pipewire-alsa`, `espeak-ng`, `fonts-noto-color-emoji`, `mpg123`
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs all of `requirements.txt`
-3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected)
+3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected); resolves the optional edge-tts skill (sibling dir → `$OPENCLAW_WORKSPACE` → official path), installs Node.js + its `npm` deps if the skill is present, and records the path in the systemd unit as `RTT_EDGE_TTS_SCRIPT` — warns and continues if the skill is absent
 4. Downloads the CAM++ speaker-verification model
 5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set
 6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
@@ -441,7 +446,9 @@ Toggle from the dashboard: **Multi-lang: OFF → ON** to see all languages (usef
 
 ### Chinese (Simplified)
 
-All captured Chinese is automatically normalised from Traditional to Simplified using `zhconv`. TTS automatically selects the Chinese Piper voice for CJK segments and English voice for the rest — you can speak mixed sentences naturally.
+All captured Chinese is automatically normalised from Traditional to Simplified using `zhconv`. You can speak mixed sentences naturally — TTS splits by script and voices each run separately.
+
+TTS chain for text containing Chinese: **ElevenLabs → Edge TTS → OpenAI TTS → Piper**. Edge TTS (the [edge-tts skill](https://github.com/w2ayz/openclaw-edge-tts) — free, no API key, native `zh-CN-XiaoxiaoNeural` / `en-US-AriaNeural` neural voices) sits between the paid tiers; its MP3 output is decoded to WAV with `mpg123`. Pure-English replies go straight to the offline Piper `en_US-lessac-medium` voice as before. If the edge-tts skill or Node.js isn't installed, the chain simply skips that tier.
 
 ### VAD / STT settings
 
