@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.20.0"
+__version__ = "3.20.1"
 
 import argparse
 import asyncio
@@ -510,6 +510,9 @@ _clear_audio_buffer:  list = [False]  # set True after TTS interrupt so _send_mi
 _persist_multilang:   list = ["off"]  # multilang state: "off"|"en-zh"|"whitelist"|"any"
 _ptt_serial:          list = [None]   # open serial.Serial for the connected radio's PTT; None when unavailable
 _active_radio_iface:  list = [None]   # RadioInterface currently connected (AIOC/Digirig/...), or None
+_ptt_unavail_logged:  list = [False]  # True once _ptt_open() has logged a "PTT unavailable" reason;
+                                      # suppresses the identical warning on every subsequent 3s
+                                      # hotplug-watcher retry. Cleared when a port opens successfully.
 _dtmf_cos_state:      dict = {"open": False, "threshold": 0}  # live squelch state from _dtmf_listener's
                                         # dedicated COS sub-loop — "threshold" is the SquelchTracker's
                                         # current adaptive effective threshold, read by the DTMF training
@@ -654,9 +657,21 @@ def _ptt_open() -> None:
     """Open the connected radio interface's serial port for PTT. Non-fatal —
     logs a warning if no registered interface (AIOC, Digirig, ...) is found."""
     import serial as _ser
+
+    def _unavail(msg: str, *args) -> None:
+        # Log the reason once per absent/failed streak, then stay quiet. The
+        # hotplug watcher retries _ptt_open() every 3s while a radio is
+        # plugged in but its serial port won't open (permissions, driver),
+        # which otherwise floods the log with an identical line.
+        if not _ptt_unavail_logged[0]:
+            log.warning(msg, *args)
+            _ptt_unavail_logged[0] = True
+        else:
+            log.debug(msg, *args)
+
     found = find_radio_port()
     if not found:
-        log.warning("Radio PTT unavailable (no known radio interface found) — PTT disabled")
+        _unavail("Radio PTT unavailable (no known radio interface found) — PTT disabled")
         _ptt_serial[0] = None
         _active_radio_iface[0] = None
         return
@@ -667,10 +682,11 @@ def _ptt_open() -> None:
         s.rts = False
         _ptt_serial[0] = s
         _active_radio_iface[0] = iface
+        _ptt_unavail_logged[0] = False   # opened cleanly — re-arm the one-shot warning
         log.info("%s PTT ready on %s (%s line) — audio output will transmit over the air",
                  detect_hw_variant(iface), port, iface.ptt_line.upper())
     except Exception as exc:
-        log.warning("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
+        _unavail("%s PTT unavailable (%s) — PTT disabled", iface.name, exc)
         _ptt_serial[0] = None
         _active_radio_iface[0] = None
 

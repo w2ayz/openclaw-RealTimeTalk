@@ -1,3 +1,10 @@
+## v3.20.1 — 2026-09-05
+
+Kept in lockstep with the Mac fork's v3.20.1.
+
+### Fixed
+- **`_ptt_open()` could flood the log with an identical warning every 3 seconds.** The `_radio_hotplug_watcher` calls `_ptt_alive()` on a 3s loop; when a radio interface is plugged in but its serial port won't open (permissions, a missing `dialout` group membership, a flaky adapter), `_ptt_alive()` retries `_ptt_open()` every tick and each call logged `<iface> PTT unavailable (…) — PTT disabled`. `_ptt_open()` now logs the reason at `warning` **once per failed streak** (new `_ptt_unavail_logged` flag, cleared on a successful open) and at `debug` — below the daemon's log level — thereafter. Narrower on Pi than on Mac: Pi's `_ptt_alive()` already guards the retry on `find_radio_port()` returning a port, so the "no radio attached at all" case only logged once at startup and was never the flood source here.
+
 ## v3.20.0 — 2026-09-02
 
 Kept in lockstep with the Mac fork's v3.20.0.
