@@ -1,3 +1,7 @@
+## v3.21.3 — 2026-09-07
+
+Version-number alignment with the Mac fork's v3.21.3 — **no functional change here.** That release anchors the Mac fork's read-along highlight to the wall clock instead of a tick count so it stops drifting behind the audio on long replies; this fork's `_play_audio` already computes read-along position as `(monotonic() - _t0) * sr` (see the "Wall clock at process spawn" note in `_monitor_and_play`), so there was nothing to port.
+
 ## v3.21.2 — 2026-09-07
 
 Kept in lockstep with the Mac fork's v3.21.2. The Mac fork's fourth fix
