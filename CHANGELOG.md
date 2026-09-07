@@ -1,3 +1,11 @@
+## v3.21.5 — 2026-09-07
+
+Kept in lockstep with the Mac fork's v3.21.5 — docs only.
+
+### Docs
+
+- **OpenClaw wiring instructions pointed at the retired `TOOLS.md`.** `README.md` and `Deployment.md` told the operator to add the `/speak` capability note to the agent's `TOOLS.md`. OpenClaw 2026.8 retired that file; local tool notes now live in the `## Tools` section of `AGENTS.md`, and `openclaw doctor --fix` migrates an existing `TOOLS.md` in place (runs the same on Raspberry Pi OS as anywhere else). Both docs now say `AGENTS.md` → `## Tools`, with a legacy-workspace note. Installer was never affected — it doesn't write the snippet.
+
 ## v3.21.4 — 2026-09-07
 
 Version-number alignment with the Mac fork's v3.21.4 — **no functional change here.** That release adds a top-level `import time` the Mac fork was missing, which crashed every streamed gateway reply with `NameError`. This fork has always imported `time` at module scope, so it was never affected.

@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.21.4"
+__version__ = "3.21.5"
 
 import argparse
 import asyncio

@@ -317,10 +317,10 @@ arbitrary text aloud — the piece that lets an OpenClaw agent finish a
 keyboard-typed task and deliver the result through RTT instead of just
 replying in text.
 
-OpenClaw won't discover this on its own — add a note to the agent's
-`TOOLS.md` (its OpenClaw workspace directory, per `agents.defaults.workspace`
-in `~/.openclaw/openclaw.json`) so it knows the capability exists and when
-to use it:
+OpenClaw won't discover this on its own — add a note to the **`## Tools`
+section of the agent's `AGENTS.md`** (in its OpenClaw workspace directory,
+per `agents.defaults.workspace` in `~/.openclaw/openclaw.json`) so it knows
+the capability exists and when to use it:
 
 ```markdown
 ### RealTimeTalk — push text to be read aloud
@@ -346,6 +346,12 @@ curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/sp
 Since OpenClaw's `AGENTS.md` convention is to read the workspace fresh each
 session, this takes effect on the next session with no daemon restart
 required.
+
+> **Older OpenClaw / a workspace with a `TOOLS.md`:** OpenClaw 2026.8+ retired
+> the standalone `TOOLS.md` (and `HEARTBEAT.md`) — local tool notes now live in
+> `AGENTS.md`'s `## Tools` section. If your workspace still has a `TOOLS.md`,
+> run `openclaw doctor --fix` once; it archives the file and folds its content
+> into `AGENTS.md`. Doctor runs the same on Raspberry Pi OS as anywhere else.
 
 ---
 
