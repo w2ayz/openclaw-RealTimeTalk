@@ -5,6 +5,29 @@ Kept in lockstep with the Mac fork's v3.20.1.
 ### Fixed
 - **`_ptt_open()` could flood the log with an identical warning every 3 seconds.** The `_radio_hotplug_watcher` calls `_ptt_alive()` on a 3s loop; when a radio interface is plugged in but its serial port won't open (permissions, a missing `dialout` group membership, a flaky adapter), `_ptt_alive()` retries `_ptt_open()` every tick and each call logged `<iface> PTT unavailable (…) — PTT disabled`. `_ptt_open()` now logs the reason at `warning` **once per failed streak** (new `_ptt_unavail_logged` flag, cleared on a successful open) and at `debug` — below the daemon's log level — thereafter. Narrower on Pi than on Mac: Pi's `_ptt_alive()` already guards the retry on `find_radio_port()` returning a port, so the "no radio attached at all" case only logged once at startup and was never the flood source here.
 
+## v3.21.0 — 2026-09-06
+
+### Added
+
+- **Output-latency compensation for the read-along (Pi only).** The dashboard word-highlight ran ~400–550 ms ahead of the audio because the tick is wall-clock based from playback start and ignores output-device latency. The playback tick now subtracts the per-device latency (`_output_latency_ms`), measured by a new **Latency test** button on the Calibration page (`/speaker-cal/latency-test`: a 0.3 s chirp played via paplay, recorded from the raw mic, FFT cross-correlated). Measured true latency ~87–140 ms depending on capture path; the value persists to `~/.openclaw/workspace/rtt_output_latency.json` and `RTT_OUTPUT_LATENCY_MS` overrides it.
+- **Streaming TTS — the reply starts being spoken while OpenClaw is still writing it.** The daemon no longer waits for the complete reply (chat-final) before synthesizing: a new `StreamingSpeaker` consumes the gateway's incremental `assistant` stream events and starts voicing the reply as soon as a configurable start threshold is met, overlapping generation with speech. On a live test the first text arrived at 3.19s but TTS only began at 4.59s (after chat-final); with streaming, speech can start at the first threshold-crossing rather than at the end. The new pipeline reuses the existing synthesis and playback machinery, refactored into two shared halves — `_synthesize()` and `_play_audio()` — so `speak()` keeps its exact previous behavior for `/speak`, `/continue`, `/replay`, wake confirmations, and one-off readouts.
+  - New `GatewayClient.ask_stream()` async generator: races the gateway's stream queue against the reply future and yields `("delta", data)` events, then `("final", text)` resolved with the exact same fallbacks as `ask()` (chat-final → assistant stream → status-token → chat.history → stale-reply rejection). Codex `message`-tool turns (no streaming) fall through to today's whole-reply path automatically.
+  - `TTS_MAX_SENTENCE` (env `RTT_TTS_MAX_SENTENCE`, default 500 chars) caps how long a single long sentence can stall the pipeline — the buffer flushes at the last clause boundary.
+  - `replace` stream events (model rewrites its answer) reset the speaker mid-turn and re-arm it for the new text.
+
+### Changed
+
+- **New `RTT_TTS_START` environment variable** controls when TTS first starts on a reply (parsed once at startup; see the systemd unit for how the Edge-TTS script path is injected):
+  - `sentence` (default) — wait for one complete sentence before starting speech.
+  - `time:N` — start after N seconds of streamed text.
+  - `chars:N` — start once N characters have accumulated.
+  - `words:N` — start once N words have accumulated.
+  After the first release, the pipeline flushes on sentence boundaries as they complete, so a long reply keeps flowing.
+- **Live "now reading" cue on the dashboard.** A `#nowreading` panel (outside the 3s-polled `#log`) streams the current speaking position from a new `/speech` SSE endpoint: the sentence being read with the in-progress word highlighted, plus a progress bar (`pos/tot`) that trails the live reply text by however long synthesis+playback takes. Shown for streamed replies and manual readouts (`/speak`, `/continue`, `/replay`) alike.
+- **Voice barge-in still works across streamed sentences.** The playback worker measures the mic↔speaker coupling on the first sentence's guard and passes it to subsequent parts (`skip_guard`), so barge-in is never deaf for 2s at the start of each sentence, and an `on_tick` callback reports read-along position ~20 Hz.
+- **`speak()` refactored** into `_synthesize()` (markdown strip → per-script split → TTS chain → concatenation → volume) + `_play_audio()` (PTT routing/keying, coupling monitor, Continue/Replay bookkeeping, auto-reduce) with no behavior change; the streaming pipeline reuses both. `_synthesize` gained `pad_lead`/`pad_tail` so streamed sentences don't get a 600 ms gap between them — only the first sentence is lead-padded and the last tail-padded.
+>>>>>>> 1ddb4c9 (feat: streaming TTS — speak the reply while it's still generating (v3.21.0))
+
 ## v3.20.0 — 2026-09-02
 
 Kept in lockstep with the Mac fork's v3.20.0.

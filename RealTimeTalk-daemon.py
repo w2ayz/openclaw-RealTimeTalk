@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.20.1"
+__version__ = "3.21.0"
 
 import argparse
 import asyncio
@@ -164,6 +164,28 @@ from radio_interfaces import (
 #   "ko"="ko"  "ja"="ja"  "zh"=any CJK  "ar"=Arabic script  "ru"=Cyrillic  "hi"=Devanagari
 MULTILANG_WHITELIST_LANGS: list[str] = ["en", "zh-cn", "zh-tw", "zh", "ko", "ja", "es", "ms"]
 AGENT_TIMEOUT_S   = 90
+# Streaming TTS start threshold — when the streamed reply is long enough to begin
+# synthesizing speech *ahead* of the complete answer reaching the gateway's
+# chat-final event. Env override via $RTT_TTS_START ("RTT_TTS_START" in systemd):
+#   "sentence" (default) — wait for ONE complete sentence before starting TTS
+#   "time:N"   — wait N seconds of streamed text (clock from first delta)
+#   "chars:N"  — wait until N chars accumulate
+#   "words:N"  — wait until N words accumulate
+# The first release uses the mode; afterwards the pipeline flushes at each
+# sentence boundary as they complete. TTS_MAX_SENTENCE caps how long a single
+# (over-long) sentence can starve the pipeline before it flushes at the last
+# clause boundary instead.
+def _parse_tts_start(mode: str) -> tuple[str, float]:
+    if mode.startswith(("time:", "chars:", "words:")):
+        key, _, val = mode.partition(":")
+        try:
+            return key, max(0.05, float(val))     # fractional seconds welcome
+        except ValueError:
+            pass
+    return "sentence", 0.0
+RTT_TTS_START = os.environ.get("RTT_TTS_START", "sentence").strip().lower()
+TTS_START_KIND, TTS_START_VALUE = _parse_tts_start(RTT_TTS_START)
+TTS_MAX_SENTENCE = int(os.environ.get("RTT_TTS_MAX_SENTENCE", "500") or "500")
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
                                  # (lets OpenAI's VAD see real silence between words)
@@ -215,6 +237,13 @@ CAL_AUDIBLE_SNR   = 80.0
 # their previously calibrated settings automatically on connect.
 CAL_STORE_FILE    = os.path.expanduser("~/.openclaw/workspace/speaker_cal_store.json")
 SLEEP_STATE_FILE  = os.path.expanduser("~/.openclaw/workspace/rtt_sleep_state.json")
+# Output-device latency (ms) — the delay between when paplay starts writing
+# audio and when it is actually heard. The read-along tick is wall-clock based
+# (50 ms ticks from paplay start), so without this compensation the word
+# highlight runs AHEAD of the audio by the device latency. Measured per-device
+# via the Calibration page's Latency test (/speaker-cal/latency-test);
+# RTT_OUTPUT_LATENCY_MS env overrides the stored value.
+OUTPUT_LATENCY_FILE = os.path.expanduser("~/.openclaw/workspace/rtt_output_latency.json")
 # Speaker verification (owner-only mode) — 3D-Speaker CAM++ zh-en model via
 # sherpa-onnx. Embeddings gate transcripts so only the enrolled owner's voice
 # is acted on. Missing lib/model/profile degrades to accept-all + banner.
@@ -458,6 +487,17 @@ _current_think_task:  list = [None]   # asyncio.Task for current gw.ask(); cance
 _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded in main()
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
+# Live read-along state for the /speech SSE endpoint — which part of the reply
+# the voice is currently reading out (or None when nothing is being read).
+# Written by StreamingSpeaker/speak() playback workers, read by /speech.
+_live_speech:          list = [None]  # {"seq","text","pos","tot","clause","running"} or None
+_live_speech_lock = threading.Lock()
+_live_seq:             list = [0]     # monotonically increasing read-along generation counter
+def _live_seq_alloc() -> int:
+    with _live_speech_lock:
+        _live_seq[0] += 1
+        return _live_seq[0]
+
 _oww_stop_flag:       list = [False]  # set True to stop the openwakeword listener thread
 _mic_restart_gen:     list = [0]      # bumped by _apply_agc_profile() on every successful mic↔radio
                                        # switch. ALSA's "pipewire" device binds to whatever concrete
@@ -1564,6 +1604,48 @@ def _save_cal_store() -> None:
     except Exception as e:
         log.warning("Could not save calibration store: %s", e)
 
+# ── Output-latency store ─────────────────────────────────────────────────────
+
+_output_latency_ms: list = [0]   # [ms] — read-along compensation, per-device
+
+def _load_output_latency() -> None:
+    """Load the measured output-device latency. Env override wins over stored."""
+    global _output_latency_ms
+    env = os.environ.get("RTT_OUTPUT_LATENCY_MS", "").strip()
+    if env:
+        try:
+            _output_latency_ms[0] = max(0, int(float(env)))
+            log.info("Output latency from env RTT_OUTPUT_LATENCY_MS: %d ms",
+                     _output_latency_ms[0])
+            return
+        except ValueError:
+            log.warning("Bad RTT_OUTPUT_LATENCY_MS=%r — ignoring", env)
+    try:
+        with open(OUTPUT_LATENCY_FILE) as f:
+            _output_latency_ms[0] = max(0, int(json.load(f).get("latency_ms", 0)))
+        log.info("Loaded output latency: %d ms", _output_latency_ms[0])
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        _output_latency_ms[0] = 0
+
+def _save_output_latency(ms: int) -> None:
+    _output_latency_ms[0] = max(0, int(ms))
+    try:
+        os.makedirs(os.path.dirname(OUTPUT_LATENCY_FILE), exist_ok=True)
+        with open(OUTPUT_LATENCY_FILE, "w") as f:
+            json.dump({"latency_ms": _output_latency_ms[0]}, f, indent=2)
+    except Exception as e:
+        log.warning("Could not save output latency: %s", e)
+
+def _read_sink_volume_pct(sink: str) -> int | None:
+    """Current PipeWire sink volume as a percentage, or None if unreadable."""
+    try:
+        out = subprocess.run(["pactl", "get-sink-volume", sink],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"(\d+)%", out)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
 def _save_sleep_state(sleeping: bool) -> None:
     """Persist sleep state to disk so it survives service restarts."""
     try:
@@ -1919,6 +2001,82 @@ def _sentence_start_before(text: str, char_pos: int) -> int:
             break
     return start
 
+# Streaming-sentence splitting — the gateway's assistant-stream events carry
+# partial sentences, so the streaming speaker needs to know when a sentence is
+# *complete* (safe to synthesise now) versus a trailing fragment (keep waiting).
+_ABBREV_WORDS = frozenset({
+    "mr", "mrs", "ms", "dr", "st", "vs", "etc", "e.g", "i.e", "jr", "sr",
+    "prof", "approx", "inc", "ltd", "co", "dept", "fig", "no", "vol", "pp",
+    "al", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct",
+    "nov", "dec", "u.s", "u.k", "a.m", "p.m",
+})
+# Latin punctuation needs the following whitespace/end; CJK punctuation is a
+# boundary even tightly followed by the next clause ("他说。然后"). The lookahead
+# also lets "。”然后" close a quote before the next CJK sentence.
+_SENT_BOUND_RE = re.compile(
+    r'[.!?]+[\'"’”)\]}】」』]?(?:\s+|$)'
+    r'|[。！？][\'"’”)\]}】」』]?(?=\S|$)'
+)
+
+def _is_fake_boundary(text: str, m) -> bool:
+    """Return True if a boundary match is not really a sentence end — an
+    abbreviation ("e.g.", "Mr.", "U.S.", "I.") or a decimal/version number
+    ("3.14", "v3.20.0")."""
+    before = text[:m.start()]
+    wm = re.search(r'([A-Za-z]+)$', before)
+    if wm and (wm.group(1).lower() in _ABBREV_WORDS or len(wm.group(1)) == 1):
+        return True
+    if text[m.end():m.end()+1].isdigit():
+        return True
+    return False
+
+def _last_sentence_boundary(text: str) -> int:
+    """Index just past the last *complete* sentence end in text (0 if none yet).
+
+    A trailing partial sentence (the boundary at the very end of the still-
+    accumulating text) does not count — that's the fragment still being typed.
+    """
+    best = 0
+    for m in _SENT_BOUND_RE.finditer(text):
+        if m.end() >= len(text):
+            break                      # trailing partial — not complete yet
+        if _is_fake_boundary(text, m):
+            continue                   # "e.g.", "Mr.", "U.S.", "3.14"
+        best = m.end()
+    return best
+
+def _last_clause_boundary(text: str) -> int:
+    """Last sentence end, else last comma/semicolon/dash/newline, else 0."""
+    s = _last_sentence_boundary(text)
+    if s:
+        return s
+    m = list(re.finditer(r'[,;，；——…\n]+[\s"\'”’]?', text))
+    return m[-1].end() if m else 0
+
+def _split_sentences(segment: str) -> list[tuple[str, int]]:
+    """Split a flushed segment into [(sentence, offset_in_segment)].
+
+    The trailing partial (a segment that ends mid-sentence — happens on final()
+    of a reply with no trailing punctuation) is kept as the last chunk."""
+    parts: list[tuple[str, int]] = []
+    last = 0
+    for m in _SENT_BOUND_RE.finditer(segment):
+        e = m.end()
+        if e >= len(segment):
+            break
+        if _is_fake_boundary(segment, m):
+            continue
+        chunk = segment[last:e].strip()
+        if chunk:
+            real = segment.find(chunk, last)      # offset in the ORIGINAL (unstripped) text
+            parts.append((chunk, real))
+        last = e
+    tail = segment[last:].strip()
+    if tail:
+        real = segment.find(tail, last)
+        parts.append((tail, real))
+    return parts
+
 def _openai_tts(text: str, output_path: str) -> bool:
     """Call OpenAI TTS API for Chinese text, resample to PIPER_SAMPLE_RATE, write WAV.
     Returns True on success; caller should fall back to Piper on False."""
@@ -2109,326 +2267,372 @@ def _edge_tts(text: str, output_path: str) -> bool:
                 pass
 
 
-def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
-          resumable: bool = False, interruptible: bool = False):
-    # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
-    # resumable=True: if interrupted, save remaining/full text to _paused_speech for
-    # the dashboard's Continue/Replay buttons (and the "continue" voice phrase)
-    # interruptible=True: enable user-voice interrupt detection (only for the AI Agent's main reply)
-    """Synthesise text with Piper and play via aplay.
+def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
+                silence_ms: int = 300, pad_lead: bool = True, pad_tail: bool = True):
+    """Synthesise a single text chunk to a WAV file.  Everything in the legacy
+    speak() up to the playback boundary: markdown strip, per-script split, the
+    multilingual TTS chain, concatenation, silence padding and software volume.
 
-    Writes text to a temp file and runs Piper with `-i <file>` rather than piping
-    via stdin — Piper silently truncates stdin input after a few words, but reads
-    file input completely. Output is captured to a WAV temp file (so aplay reads
-    from disk, avoiding any streaming buffer underruns on the USB speaker).
+    pad_lead/pad_tail: the streaming speaker synthesises one sentence per call
+    and passes pad_lead=False/pad_tail=False so sentences don't get a 300ms
+    silence gap between them — it instead enables only the very first part's
+    lead pad and the very last part's tail pad itself.
+
+    Returns (wav_path, pcm, sr, lead_pad_samples, tail_pad_added) — pcm/sr are
+    read back from the attenuated file for the interrupt monitor's coupling
+    math. Returns (None, empty, 0, 0, False) when the text is empty after
+    markdown stripping.
+
+    Writes text to a temp file and runs Piper with `-i <file>` rather than
+    piping via stdin — Piper silently truncates stdin input after a few words,
+    but reads file input completely. Output is captured to a WAV temp file (so
+    aplay reads from disk, avoiding any streaming buffer underruns on the USB
+    speaker).
     """
     import tempfile
     if volume < 0:
         volume = _cal_sw_volume   # use calibrated level
     clean = strip_markdown(text)
     if not clean:
-        return
+        return None, np.array([], dtype=np.int16), 0, 0, False
     segments = _split_by_script(clean)
     # Pad playback so USB/PipeWire sinks do not clip the first or last phoneme.
     import wave as _wave, struct as _struct
     wav_parts: list[str] = []
     # Sample counts for the leading/trailing padding, so an interrupt mid-playback can
     # subtract them back out and estimate how far into the actual *content* we got —
-    # see the sentence-resume calculation near the end of this function.
-    _lead_pad_samples = int(PIPER_SAMPLE_RATE * silence_ms / 1000) if silence_ms > 0 else 0
+    # see the sentence-resume calculation in _play_audio().
+    _lead_pad_samples = int(PIPER_SAMPLE_RATE * silence_ms / 1000) if (silence_ms > 0 and pad_lead) else 0
     _tail_pad_added   = False
-    if silence_ms > 0:
+    if pad_lead and silence_ms > 0:
         silence_path = tempfile.mktemp(suffix=".wav")
         with _wave.open(silence_path, 'wb') as wf:
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
             wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
         wav_parts.append(silence_path)
-    # Serialize playback: block here (not just around the audio itself) so a second
-    # caller's synthesis+playback never overlaps the first's — that overlap is what let
-    # two concurrent speak() calls stomp each other's _is_speaking/_http_interrupt state.
-    #
-    # Also hold off entirely while a previous reading is paused awaiting a Continue/
-    # Replay/Cancel decision, rather than auto-playing whatever's queued next: that
-    # unrelated next item finishing normally would otherwise hit the "not interrupted"
-    # branch below and clear _paused_speech — a single global slot — wiping out the
-    # still-unresolved pause and making the buttons vanish before anyone touched them.
-    # Re-checked after each lock acquisition (not just once up front) so a call that was
-    # already queued when the interrupt landed can't slip through the instant the lock
-    # frees up. /continue and /replay clear _paused_speech themselves before spawning
-    # their own speak() call, so a legitimate resume passes straight through; Cancel
-    # clears it without playing anything, which also releases anything waiting here.
-    while True:
-        _speak_lock.acquire()
-        if _paused_speech[0] is None:
-            break
-        _speak_lock.release()
-        time.sleep(0.2)
-    try:
-        # If text contains Chinese, render it via the network TTS tiers before
-        # falling back to per-segment Piper. Chain: ElevenLabs → Edge TTS →
-        # OpenAI TTS. ElevenLabs/OpenAI take the whole unsplit text in one call;
-        # Edge TTS splits by script internally and uses its native zh/en voices.
-        if _is_chinese_text(clean):
-            full_path = tempfile.mktemp(suffix=".wav")
-            if _elevenlabs_tts(clean, full_path):
-                wav_parts.append(full_path)
-                segments = []   # skip per-segment loop below
-            elif _edge_tts(clean, full_path):
-                wav_parts.append(full_path)
-                segments = []   # skip per-segment loop below
-            elif _openai_tts(clean, full_path):
-                wav_parts.append(full_path)
-                segments = []   # skip per-segment loop below
-            else:
-                log.warning("Multilingual TTS failed — falling back to per-segment Piper")
-
-        for seg_text, lang in segments:
-            part_path = tempfile.mktemp(suffix=".wav")
-            if lang == 'zh':
-                if _elevenlabs_tts(seg_text, part_path):
-                    wav_parts.append(part_path)
-                    continue
-                log.warning("ElevenLabs TTS failed for ZH segment — trying Edge TTS")
-                if _edge_tts_seg(seg_text, EDGE_VOICE_ZH, part_path):
-                    wav_parts.append(part_path)
-                    continue
-                log.warning("Edge TTS failed for ZH segment — falling back to OpenAI TTS")
-                if _openai_tts(seg_text, part_path):
-                    wav_parts.append(part_path)
-                    continue
-                log.warning("OpenAI TTS failed for ZH segment — falling back to Piper")
-            result = subprocess.run(
-                [PIPER_CMD, "--model", PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN,
-                 "-f", part_path, "-q"],
-                input=seg_text.encode("utf-8"),
-                capture_output=True, env=PIPER_ENV,
-            )
-            if result.returncode != 0 or not os.path.exists(part_path):
-                log.error("Piper failed for %r (rc=%d): %s",
-                          seg_text[:30], result.returncode,
-                          result.stderr.decode(errors="replace")[:120])
-                continue
-            wav_parts.append(part_path)
-
-        if silence_ms > 0 and len(wav_parts) > 1:
-            tail_silence_path = tempfile.mktemp(suffix=".wav")
-            with _wave.open(tail_silence_path, 'wb') as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
-                wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
-            wav_parts.append(tail_silence_path)
-            _tail_pad_added = True
-
-        if not wav_parts:
-            return
-
-        if len(wav_parts) == 1:
-            final_wav = wav_parts[0]
-            wav_parts = []
+    # If text contains Chinese, render it via the network TTS tiers before
+    # falling back to per-segment Piper. Chain: ElevenLabs → Edge TTS →
+    # OpenAI TTS. ElevenLabs/OpenAI take the whole unsplit text in one call;
+    # Edge TTS splits by script internally and uses its native zh/en voices.
+    if _is_chinese_text(clean):
+        full_path = tempfile.mktemp(suffix=".wav")
+        if _elevenlabs_tts(clean, full_path):
+            wav_parts.append(full_path)
+            segments = []   # skip per-segment loop below
+        elif _edge_tts(clean, full_path):
+            wav_parts.append(full_path)
+            segments = []   # skip per-segment loop below
+        elif _openai_tts(clean, full_path):
+            wav_parts.append(full_path)
+            segments = []   # skip per-segment loop below
         else:
-            # Concatenate all WAV parts into one
-            import wave as _wave
-            final_wav = tempfile.mktemp(suffix=".wav")
-            with _wave.open(final_wav, 'wb') as out_wf:
-                for i, part in enumerate(wav_parts):
-                    with _wave.open(part, 'rb') as in_wf:
-                        if i == 0:
-                            out_wf.setparams(in_wf.getparams())
-                        out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
+            log.warning("Multilingual TTS failed — falling back to per-segment Piper")
 
-        # Software volume attenuation — multiply PCM samples (bypasses PipeWire floor)
-        if volume < 1.0:
-            import wave as _wv2
-            with _wv2.open(final_wav, 'rb') as _wf:
-                _params = _wf.getparams()
-                _data = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
-            _data = np.clip(_data.astype(np.float32) * volume, -32768, 32767).astype(np.int16)
-            with _wv2.open(final_wav, 'wb') as _wf:
-                _wf.setparams(_params)
-                _wf.writeframes(_data.tobytes())
+    for seg_text, lang in segments:
+        part_path = tempfile.mktemp(suffix=".wav")
+        if lang == 'zh':
+            if _elevenlabs_tts(seg_text, part_path):
+                wav_parts.append(part_path)
+                continue
+            log.warning("ElevenLabs TTS failed for ZH segment — trying Edge TTS")
+            if _edge_tts_seg(seg_text, EDGE_VOICE_ZH, part_path):
+                wav_parts.append(part_path)
+                continue
+            log.warning("Edge TTS failed for ZH segment — falling back to OpenAI TTS")
+            if _openai_tts(seg_text, part_path):
+                wav_parts.append(part_path)
+                continue
+            log.warning("OpenAI TTS failed for ZH segment — falling back to Piper")
+        result = subprocess.run(
+            [PIPER_CMD, "--model", PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN,
+             "-f", part_path, "-q"],
+            input=seg_text.encode("utf-8"),
+            capture_output=True, env=PIPER_ENV,
+        )
+        if result.returncode != 0 or not os.path.exists(part_path):
+            log.error("Piper failed for %r (rc=%d): %s",
+                      seg_text[:30], result.returncode,
+                      result.stderr.decode(errors="replace")[:120])
+            continue
+        wav_parts.append(part_path)
 
-        # Sample mic level before playback (ambient baseline)
-        import time as _spk_time
-        with _mic_level_lock:
-            baseline_peak = _mic_level_current[0]
+    if pad_tail and silence_ms > 0 and len(wav_parts) >= 1:
+        tail_silence_path = tempfile.mktemp(suffix=".wav")
+        with _wave.open(tail_silence_path, 'wb') as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
+            wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
+        wav_parts.append(tail_silence_path)
+        _tail_pad_added = True
 
-        # Load output PCM for coupling measurement (Mac-style acoustic coupling).
-        # The coupling ratio (mic_peak / output_peak) scales the interrupt threshold
-        # to the actual room acoustics — tight headset → high threshold, separate
-        # mic/speaker → lower threshold, always above SPEAK_INTERRUPT_PEAK floor.
-        import wave as _wpcm
-        try:
-            with _wpcm.open(final_wav, 'rb') as _wf:
-                _sr = _wf.getframerate()
-                _final_pcm = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
-        except Exception:
-            _final_pcm = np.array([], dtype=np.int16)
-            _sr = PIPER_SAMPLE_RATE
-        _output_peak   = int(np.max(np.abs(_final_pcm))) if len(_final_pcm) else 0
-        _TICK_SAMPLES  = max(1, _sr * 50 // 1000)   # samples per 50ms tick
-        _GUARD_TICKS   = 40                          # 2s guard (doubled from 1s — the coupling
-                                                      # estimate from only ~700ms of real audio was
-                                                      # too short a sample, letting a self-interrupt
-                                                      # trip almost immediately once the guard ended)
-        _SAFETY        = 1.8                         # threshold = echo × 1.8 (was 3.5, then 3.0 — 3.0
-                                                      # measured threshold=19284 live and still didn't
-                                                      # catch a real deliberate "Hello" interrupt attempt,
-                                                      # so stepping straight to the Mac fork's own tuned
-                                                      # value (INTERRUPT_SAFETY=1.8) rather than inching
-                                                      # down further. Different hardware (Mac's built-in
-                                                      # speaker/mic vs this Pi's USB speaker + separate
-                                                      # mic), so watch for self-interrupt on a long reading
-                                                      # as the real test of whether 1.8 is still safe here.
+    if not wav_parts:
+        return None, np.array([], dtype=np.int16), 0, 0, False
 
-        mic_peaks_during: list[int] = []
-        _interrupted   = [False]
-        _aplay_rc      = [0]
-        _tick_at_break = [0]   # tick_idx when interrupted — how far into _final_pcm we got
+    if len(wav_parts) == 1:
+        final_wav = wav_parts[0]
+        wav_parts = []
+    else:
+        # Concatenate all WAV parts into one
+        import wave as _wave
+        final_wav = tempfile.mktemp(suffix=".wav")
+        with _wave.open(final_wav, 'wb') as out_wf:
+            for i, part in enumerate(wav_parts):
+                with _wave.open(part, 'rb') as in_wf:
+                    if i == 0:
+                        out_wf.setparams(in_wf.getparams())
+                    out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
 
-        def _monitor_and_play(cmd, radio_tx=False):
-            proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    # Software volume attenuation — multiply PCM samples (bypasses PipeWire floor)
+    if volume < 1.0:
+        import wave as _wv2
+        with _wv2.open(final_wav, 'rb') as _wf:
+            _params = _wf.getparams()
+            _data = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
+        _data = np.clip(_data.astype(np.float32) * volume, -32768, 32767).astype(np.int16)
+        with _wv2.open(final_wav, 'wb') as _wf:
+            _wf.setparams(_params)
+            _wf.writeframes(_data.tobytes())
 
-            if radio_tx:
-                # Known TX→RX crosstalk on this hardware (see the _is_tx guard in
-                # _mic_cb) makes the mic signal untrustworthy for barge-in detection
-                # while transmitting — the same reason transcription is muted during
-                # PTT. Don't self-interrupt on it; /interrupt still works.
-                while True:
-                    try:
-                        _aplay_rc[0] = proc.wait(timeout=0.05)
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
-                    if _http_interrupt[0]:
-                        _http_interrupt[0] = False
-                        _interrupted[0] = True
-                        try: proc.kill()
-                        except Exception: pass
-                        break
-                return
+    # Load output PCM for coupling measurement (Mac-style acoustic coupling).
+    # The coupling ratio (mic_peak / output_peak) scales the interrupt threshold
+    # to the actual room acoustics — tight headset → high threshold, separate
+    # mic/speaker → lower threshold, always above SPEAK_INTERRUPT_PEAK floor.
+    import wave as _wpcm
+    try:
+        with _wpcm.open(final_wav, 'rb') as _wf:
+            _sr = _wf.getframerate()
+            _final_pcm = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16)
+    except Exception:
+        _final_pcm = np.array([], dtype=np.int16)
+        _sr = PIPER_SAMPLE_RATE
+    # Intermediate WAV parts are no longer needed after concatenation
+    for p in wav_parts:
+        try: os.unlink(p)
+        except OSError: pass
+    return final_wav, _final_pcm, _sr, _lead_pad_samples, _tail_pad_added
 
-            consec      = 0
-            guard       = _GUARD_TICKS
-            guard_max_out = 0   # peak output PCM during guard
-            guard_max_mic = 0   # peak mic echo during guard
-            interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
-            guard_floor = SPEAK_INTERRUPT_PEAK  # threshold floor set by the guard measurement — see below
-            coupling: float | None = None
-            tick_idx    = 0
+
+def _play_audio(final_wav: str, final_pcm, sr: int, alsa_output: str,
+                resumable: bool, full_text: str,
+                lead_pad_samples: int, tail_pad_added: bool,
+                coupling: float | None = None, skip_guard: bool = False,
+                ptt_keyed: bool = False, interruptible: bool = True,
+                skip_auto_reduce: bool = False, on_tick=None):
+    """Play a synthesized WAV through aplay/paplay with the interrupt monitor.
+
+    Returns (interrupted, tick_at_break, coupling_measured). This is the
+    playback half of the legacy speak(): PTT routing/keying, the barge-in
+    coupling monitor, Continue/Replay bookkeeping and auto-reduce. Reused by
+    both speak() and the streaming speaker's playback worker.
+
+    coupling / skip_guard: when a coupling measured from a previous sentence is
+    passed, skip the 2s guard and compute the barge-in threshold immediately
+    from this part's output peak × coupling × safety — keeps voice barge-in
+    working across a multi-sentence streamed reply (the streaming playback
+    worker passes the previous part's measured coupling).
+    ptt_keyed: the caller keys/releases PTT once for the whole turn; don't key
+    per part.
+    on_tick(samples_played): called ~20 Hz from the monitor loop so the caller
+    can report live read-along position.
+    """
+    # Sample mic level before playback (ambient baseline)
+    import time as _spk_time
+    with _mic_level_lock:
+        baseline_peak = _mic_level_current[0]
+
+    _output_peak   = int(np.max(np.abs(final_pcm))) if len(final_pcm) else 0
+    _TICK_SAMPLES  = max(1, sr * 50 // 1000)   # samples per 50ms tick
+    _GUARD_TICKS   = 40                          # 2s guard (doubled from 1s — the coupling
+                                                 # estimate from only ~700ms of real audio was
+                                                 # too short a sample, letting a self-interrupt
+                                                 # trip almost immediately once the guard ended)
+    _SAFETY        = 1.8                         # threshold = echo × 1.8 (was 3.5, then 3.0 — 3.0
+                                                 # measured threshold=19284 live and still didn't
+                                                 # catch a real deliberate "Hello" interrupt attempt,
+                                                 # so stepping straight to the Mac fork's own tuned
+                                                 # value (INTERRUPT_SAFETY=1.8) rather than inching
+                                                 # down further. Different hardware (Mac's built-in
+                                                 # speaker/mic vs this Pi's USB speaker + separate
+                                                 # mic), so watch for self-interrupt on a long
+                                                 # reading as the real test of whether 1.8 is still
+                                                 # safe here.
+
+    mic_peaks_during: list[int] = []
+    _interrupted   = [False]
+    _aplay_rc      = [0]
+    _tick_at_break = [0]   # samples played (wall-clock) when interrupted — how far into final_pcm we got
+    # Measured echo/coupling ratio, computed by the monitor thread below (and
+    # returned to the caller so the streaming worker can pass it to the next
+    # sentence). Must live HERE, in _play_audio's own scope — a local inside
+    # _monitor_and_play would be invisible at the return, raising NameError and
+    # stopping the reply after the first sentence.
+    coupling_now: float | None = None
+
+    def _monitor_and_play(cmd, radio_tx=False):
+        nonlocal coupling_now
+        proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+
+        if radio_tx:
+            # Known TX→RX crosstalk on this hardware (see the _is_tx guard in
+            # _mic_cb) makes the mic signal untrustworthy for barge-in detection
+            # while transmitting — the same reason transcription is muted during
+            # PTT. Don't self-interrupt on it; /interrupt still works.
+            _t0 = _spk_time.monotonic()
             while True:
                 try:
                     _aplay_rc[0] = proc.wait(timeout=0.05)
                     break
                 except subprocess.TimeoutExpired:
                     pass
-                with _mic_level_lock:
-                    p = _mic_level_current[0]
-                mic_peaks_during.append(p)
-
-                s0 = tick_idx * _TICK_SAMPLES
-                s1 = s0 + _TICK_SAMPLES
-                tick_out = (int(np.max(np.abs(_final_pcm[s0:s1])))
-                            if len(_final_pcm) and s1 <= len(_final_pcm) else 0)
-                tick_idx += 1
-
-                if guard > 0:
-                    if tick_out > guard_max_out:
-                        guard_max_out = tick_out
-                    if p > guard_max_mic:
-                        guard_max_mic = p
-                    guard -= 1
-                    if guard == 0:
-                        if guard_max_out > 200:
-                            coupling = guard_max_mic / guard_max_out
-                            interrupt_threshold[0] = max(
-                                int(_output_peak * coupling * _SAFETY),
-                                SPEAK_INTERRUPT_PEAK,
-                            )
-                            guard_floor = interrupt_threshold[0]
-                            log.info("TTS coupling=%.3f echo=%d out=%d → threshold=%d",
-                                     coupling, guard_max_mic, guard_max_out,
-                                     interrupt_threshold[0])
-                        else:
-                            log.info("TTS no coupling data → threshold=%d (floor)",
-                                     interrupt_threshold[0])
-                    # The guard only gates the mic-based auto-barge-in calibration above —
-                    # an explicit Stop-button /interrupt must never wait on it. Without this
-                    # check here, the `continue` below skipped straight past the identical
-                    # check after the guard block, so Stop silently did nothing for the
-                    # first _GUARD_TICKS*50ms (2s) of every reply.
-                    if _http_interrupt[0]:
-                        _http_interrupt[0] = False
-                        _interrupted[0] = True
-                        _tick_at_break[0] = tick_idx
-                        try: proc.kill()
-                        except Exception: pass
-                        break
-                    continue
-
-                # Keep tracking coupling past the initial 1s guard so a long or
-                # unevenly-loud reply doesn't outrun a threshold frozen from the
-                # start — but never learn from a tick that already looks like a
-                # real interruption, or a genuine barge-in would just get EMA'd away.
-                # Also require the tick to be genuinely loud (comparable to this
-                # reply's peak), not just above the 200 floor — a quiet tick's
-                # mic/output ratio is dominated by room noise floor rather than
-                # real echo, and letting those ticks drag the EMA down was
-                # confirmed live shrinking the threshold on long replies until an
-                # ordinary loud syllable tripped a false self-interrupt.
-                if tick_out > max(200, int(_output_peak * 0.3)) and p <= interrupt_threshold[0]:
-                    local = p / tick_out
-                    coupling = local if coupling is None else (
-                        coupling * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
-                    # guard_floor never shrinks below the guard's own measurement: the
-                    # guard takes a MAX over a full 2s window, which is statistically
-                    # always ≥ any single later EMA sample, so unclamped tracking only
-                    # ever drifts down over a long reply. The EMA can still push the
-                    # threshold higher if echo genuinely grows louder later on.
-                    interrupt_threshold[0] = max(
-                        int(_output_peak * coupling * _SAFETY), SPEAK_INTERRUPT_PEAK, guard_floor)
-
+                if on_tick is not None:
+                    on_tick(int((_spk_time.monotonic() - _t0) * sr))
                 if _http_interrupt[0]:
                     _http_interrupt[0] = False
                     _interrupted[0] = True
-                    _tick_at_break[0] = tick_idx
                     try: proc.kill()
                     except Exception: pass
                     break
-                if p > interrupt_threshold[0]:
-                    consec += 1
-                    if consec >= SPEAK_INTERRUPT_BLOCKS:
-                        log.info("Speech interrupt — stopping TTS (peak=%d thr=%d)",
-                                 p, interrupt_threshold[0])
-                        _interrupted[0] = True
-                        _tick_at_break[0] = tick_idx
-                        _clear_audio_buffer[0] = True
-                        try: proc.kill()
-                        except Exception: pass
-                        break
-                else:
-                    consec = 0
+            return
 
-        # If a radio interface's PTT is available, route audio to its sink and key the radio.
-        import time as _ptt_t
-        _radio_sink = _find_radio_sink() if (_ptt_alive() and _radio_profile_active[0]) else None
-        _use_ptt   = bool(_radio_sink)
+        consec      = 0
+        # Skip the coupling guard when the caller passes a measured coupling from
+        # a previous sentence (the streaming pipeline) so playback isn't deaf to
+        # barge-in for the first 2s of every new sentence.
+        init_coupling = coupling if (skip_guard and coupling) else None
+        guard         = 0 if init_coupling is not None else _GUARD_TICKS
+        guard_max_out = 0   # peak output PCM during guard
+        guard_max_mic = 0   # peak mic echo during guard
+        interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
+        guard_floor = SPEAK_INTERRUPT_PEAK  # threshold floor set by the guard measurement — see below
+        coupling_now = init_coupling      # nonlocal — writes into _play_audio's scope
+        if init_coupling is not None:
+            interrupt_threshold[0] = max(
+                int(_output_peak * init_coupling * _SAFETY), SPEAK_INTERRUPT_PEAK)
+            guard_floor = interrupt_threshold[0]
+        # Wall clock at process spawn. s0 is derived from this (not tick_idx ×
+        # _TICK_SAMPLES) because each loop iteration is proc.wait(0.05) + the
+        # processing below — a few ms over 50ms per tick that, over a long
+        # reply, made the read-along advance ~4% slower than the audio and fall
+        # visibly behind by the end. Real elapsed time keeps the highlight on
+        # the word actually being heard.
+        _t0        = _spk_time.monotonic()
+        while True:
+            try:
+                _aplay_rc[0] = proc.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            with _mic_level_lock:
+                p = _mic_level_current[0]
+            mic_peaks_during.append(p)
 
-        # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
-        # Bluetooth handling than aplay -D default (ALSA compat layer).
-        # When a radio interface is active, always route through its PipeWire sink via paplay.
-        if _use_ptt:
-            _play_cmd = ["paplay", f"--device={_radio_sink}", final_wav]
-        elif alsa_output in ("default", "pulse"):
-            _play_cmd = ["paplay", final_wav]
-        else:
-            _play_cmd = ["aplay", "-D", alsa_output, "-q", final_wav]
-        _play_fallback = ["paplay", final_wav]
+            s0 = int((_spk_time.monotonic() - _t0) * sr)
+            s1 = s0 + _TICK_SAMPLES
+            tick_out = (int(np.max(np.abs(final_pcm[s0:s1])))
+                        if len(final_pcm) and s1 <= len(final_pcm) else 0)
+            if on_tick is not None:
+                on_tick(s0)
 
-        if _use_ptt:
-            _ptt_key()
-            _ptt_t.sleep(_ptt_prekey_s())
-            log.info("PTT keyed — transmitting")
+            if guard > 0:
+                if tick_out > guard_max_out:
+                    guard_max_out = tick_out
+                if p > guard_max_mic:
+                    guard_max_mic = p
+                guard -= 1
+                if guard == 0:
+                    if guard_max_out > 200:
+                        coupling_now = guard_max_mic / guard_max_out
+                        interrupt_threshold[0] = max(
+                            int(_output_peak * coupling_now * _SAFETY),
+                            SPEAK_INTERRUPT_PEAK,
+                        )
+                        guard_floor = interrupt_threshold[0]
+                        log.info("TTS coupling=%.3f echo=%d out=%d → threshold=%d",
+                                 coupling_now, guard_max_mic, guard_max_out,
+                                 interrupt_threshold[0])
+                    else:
+                        log.info("TTS no coupling data → threshold=%d (floor)",
+                                 interrupt_threshold[0])
+                # The guard only gates the mic-based auto-barge-in calibration above —
+                # an explicit Stop-button /interrupt must never wait on it. Without this
+                # check here, the `continue` below skipped straight past the identical
+                # check after the guard block, so Stop silently did nothing for the
+                # first _GUARD_TICKS*50ms (2s) of every reply.
+                if _http_interrupt[0]:
+                    _http_interrupt[0] = False
+                    _interrupted[0] = True
+                    _tick_at_break[0] = s0
+                    try: proc.kill()
+                    except Exception: pass
+                    break
+                continue
 
-        _is_speaking[0] = True
+            # Keep tracking coupling past the initial 1s guard so a long or
+            # unevenly-loud reply doesn't outrun a threshold frozen from the
+            # start — but never learn from a tick that already looks like a
+            # real interruption, or a genuine barge-in would just get EMA'd away.
+            # Also require the tick to be genuinely loud (comparable to this
+            # reply's peak), not just above the 200 floor — a quiet tick's
+            # mic/output ratio is dominated by room noise floor rather than
+            # real echo, and letting those ticks drag the EMA down was
+            # confirmed live shrinking the threshold on long replies until an
+            # ordinary loud syllable tripped a false self-interrupt.
+            if tick_out > max(200, int(_output_peak * 0.3)) and p <= interrupt_threshold[0]:
+                local = p / tick_out
+                coupling_now = local if coupling_now is None else (
+                    coupling_now * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                # guard_floor never shrinks below the guard's own measurement: the
+                # guard takes a MAX over a full 2s window, which is statistically
+                # always ≥ any single later EMA sample, so unclamped tracking only
+                # ever drifts down over a long reply. The EMA can still push the
+                # threshold higher if echo genuinely grows louder later on.
+                interrupt_threshold[0] = max(
+                    int(_output_peak * coupling_now * _SAFETY), SPEAK_INTERRUPT_PEAK, guard_floor)
+
+            if _http_interrupt[0]:
+                _http_interrupt[0] = False
+                _interrupted[0] = True
+                _tick_at_break[0] = s0
+                try: proc.kill()
+                except Exception: pass
+                break
+            if p > interrupt_threshold[0]:
+                consec += 1
+                if consec >= SPEAK_INTERRUPT_BLOCKS:
+                    log.info("Speech interrupt — stopping TTS (peak=%d thr=%d)",
+                             p, interrupt_threshold[0])
+                    _interrupted[0] = True
+                    _tick_at_break[0] = s0
+                    _clear_audio_buffer[0] = True
+                    try: proc.kill()
+                    except Exception: pass
+                    break
+            else:
+                consec = 0
+
+    # If a radio interface's PTT is available, route audio to its sink and key the radio.
+    import time as _ptt_t
+    _radio_sink = _find_radio_sink() if (_ptt_alive() and _radio_profile_active[0]) else None
+    _use_ptt   = bool(_radio_sink)
+
+    # Use paplay (PipeWire-native) for default/pulse sink — better resampling and
+    # Bluetooth handling than aplay -D default (ALSA compat layer).
+    # When a radio interface is active, always route through its PipeWire sink via paplay.
+    if _use_ptt:
+        _play_cmd = ["paplay", f"--device={_radio_sink}", final_wav]
+    elif alsa_output in ("default", "pulse"):
+        _play_cmd = ["paplay", final_wav]
+    else:
+        _play_cmd = ["aplay", "-D", alsa_output, "-q", final_wav]
+    _play_fallback = ["paplay", final_wav]
+
+    _keyed_here = False
+    if _use_ptt and not ptt_keyed:
+        _ptt_key()
+        _keyed_here = True
+        _ptt_t.sleep(_ptt_prekey_s())
+        log.info("PTT keyed — transmitting")
+
+    try:
         if interruptible:
             _m = _threading.Thread(daemon=True, target=_monitor_and_play,
                                    args=(_play_cmd,), kwargs={"radio_tx": _use_ptt})
@@ -2443,80 +2647,542 @@ def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silen
             rc = subprocess.call(_play_cmd, stderr=subprocess.DEVNULL)
             if rc != 0 and _play_cmd != _play_fallback:
                 subprocess.call(_play_fallback, stderr=subprocess.DEVNULL)
-        _is_speaking[0] = False
-
-        if _use_ptt:
+    finally:
+        if _keyed_here:
             _ptt_t.sleep(_ptt_tail_s())
             _ptt_release()
             log.info("PTT released")
 
-        # Save state for the Continue/Replay/Cancel buttons if interrupted mid-sentence;
-        # clear on normal finish. "full" is the whole message (Replay); "remaining" is
-        # estimated from how far into _final_pcm playback got when it was cut off, rounded
-        # back to the start of whichever sentence was in progress (Continue) — see
-        # _sentence_start_before(). Falls back to the whole message when we have no usable
-        # position (e.g. interrupted during the radio-TX path, which doesn't track ticks).
-        if _interrupted[0] and resumable:
-            full_text = strip_markdown(text)
-            remaining_text = full_text
-            content_total = len(_final_pcm) - _lead_pad_samples - (_lead_pad_samples if _tail_pad_added else 0)
-            if content_total > 0 and full_text:
-                played = _tick_at_break[0] * _TICK_SAMPLES - _lead_pad_samples
-                played = max(0, min(played, content_total))
-                char_est = int(played / content_total * len(full_text))
-                start = _sentence_start_before(full_text, char_est)
-                remaining_text = full_text[start:].strip() or full_text
-            _paused_speech[0] = {"remaining": remaining_text, "full": full_text, "alsa": alsa_output}
-            log.info("TTS interrupted — saved %d/%d chars remaining for /continue (/restart replays all)",
-                      len(remaining_text), len(full_text))
-        elif not _interrupted[0]:
-            _paused_speech[0] = None
+    # Save state for the Continue/Replay/Cancel buttons if interrupted mid-sentence;
+    # clear on normal finish. "full" is the whole message (Replay); "remaining" is
+    # estimated from how far into final_pcm playback got when it was cut off, rounded
+    # back to the start of whichever sentence was in progress (Continue) — see
+    # _sentence_start_before(). Falls back to the whole message when we have no usable
+    # position (e.g. interrupted during the radio-TX path, which doesn't track ticks).
+    if _interrupted[0] and resumable:
+        remaining_text = full_text or ""
+        content_total = len(final_pcm) - lead_pad_samples - (lead_pad_samples if tail_pad_added else 0)
+        if content_total > 0 and full_text:
+            played = _tick_at_break[0] - lead_pad_samples
+            played = max(0, min(played, content_total))
+            char_est = int(played / content_total * len(full_text))
+            start = _sentence_start_before(full_text, char_est)
+            remaining_text = full_text[start:].strip() or full_text
+        _paused_speech[0] = {"remaining": remaining_text, "full": full_text or "", "alsa": alsa_output}
+        log.info("TTS interrupted — saved %d/%d chars remaining for /continue (/restart replays all)",
+                 len(remaining_text), len(full_text or ""))
+    elif not _interrupted[0]:
+        _paused_speech[0] = None
 
-        # Auto-reduce: only fire on genuinely loud bleed (20× baseline AND >2000
-        # absolute). With WebRTC AGC the baseline is near-zero so the old 5×/500
-        # thresholds fired on every normal playback and collapsed the volume.
-        if _interrupted[0] or speak.__globals__.get("_skip_auto_reduce", False):
-            pass
-        elif mic_peaks_during:
-            avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
-            if baseline_peak > 0 and avg_during > baseline_peak * 40 and avg_during > 4000:
-                try:
-                    import re as _re
-                    sinks = subprocess.run(["pactl", "list", "short", "sinks"],
-                                           capture_output=True, text=True).stdout
-                    for line in sinks.splitlines():
-                        parts = line.split()
-                        if (len(parts) >= 2 and "hdmi" not in parts[1].lower()
-                                and "monitor" not in parts[1].lower()
-                                and not parts[1].startswith("rtt_agc")):
-                            cur = subprocess.run(["pactl", "get-sink-volume", parts[0]],
-                                                 capture_output=True, text=True).stdout
-                            m = _re.search(r'(\d+)%', cur)
-                            if m:
-                                cur_pct = int(m.group(1))
-                                new_pct = max(10, cur_pct - 10)
-                                subprocess.run(["pactl", "set-sink-volume", parts[0],
-                                                f"{new_pct}%"], capture_output=True)
-                                log.info("Auto-reduced speaker %d%%→%d%% "
-                                         "(bleed %.0f > 20×baseline %.0f)",
-                                         cur_pct, new_pct, avg_during, baseline_peak)
-                except Exception as e:
-                    log.debug("Auto-volume error: %s", e)
+    # Auto-reduce: only fire on genuinely loud bleed (20× baseline AND >2000
+    # absolute). With WebRTC AGC the baseline is near-zero so the old 5×/500
+    # thresholds fired on every normal playback and collapsed the volume.
+    # skip_auto_reduce lets the streaming worker fire this once per turn instead
+    # of once per sentence.
+    if _interrupted[0] or skip_auto_reduce:
+        pass
+    elif mic_peaks_during:
+        avg_during = sum(mic_peaks_during) / len(mic_peaks_during)
+        if baseline_peak > 0 and avg_during > baseline_peak * 40 and avg_during > 4000:
+            try:
+                import re as _re
+                sinks = subprocess.run(["pactl", "list", "short", "sinks"],
+                                       capture_output=True, text=True).stdout
+                for line in sinks.splitlines():
+                    parts = line.split()
+                    if (len(parts) >= 2 and "hdmi" not in parts[1].lower()
+                            and "monitor" not in parts[1].lower()
+                            and not parts[1].startswith("rtt_agc")):
+                        cur = subprocess.run(["pactl", "get-sink-volume", parts[0]],
+                                             capture_output=True, text=True).stdout
+                        m = _re.search(r'(\d+)%', cur)
+                        if m:
+                            cur_pct = int(m.group(1))
+                            new_pct = max(10, cur_pct - 10)
+                            subprocess.run(["pactl", "set-sink-volume", parts[0],
+                                            f"{new_pct}%"], capture_output=True)
+                            log.info("Auto-reduced speaker %d%%→%d%% "
+                                     "(bleed %.0f > 20×baseline %.0f)",
+                                     cur_pct, new_pct, avg_during, baseline_peak)
+            except Exception as e:
+                log.debug("Auto-volume error: %s", e)
 
+    try: os.unlink(final_wav)
+    except OSError: pass
+    return _interrupted[0], _tick_at_break[0], coupling_now
+
+
+def speak(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0, silence_ms: int = 300,
+          resumable: bool = False, interruptible: bool = False):
+    # volume=-1 means use the calibrated level (_cal_sw_volume); pass explicit 0-1 to override
+    # resumable=True: if interrupted, save remaining/full text to _paused_speech for
+    # the dashboard's Continue/Replay buttons (and the "continue" voice phrase)
+    # interruptible=True: enable user-voice interrupt detection (only for the AI Agent's main reply)
+    """Synthesise text with Piper and play via aplay. (monolithic path)
+
+    Waits for the serialization lock, then runs the two shared halves in
+    sequence: `_synthesize` + `_play_audio`. Streaming replies use
+    StreamingSpeaker instead (same halves, per-sentence), so this entry point
+    keeps its exact historical behavior for /speak, /continue, /replay, wake
+    confirmations and one-off readouts — and reports a live read-along through
+    _play_audio's on_tick when interruptible.
+    """
+    import time as _t_spk
+    # Serialize playback: block here (not just around the audio itself) so a second
+    # caller's synthesis+playback never overlaps the first's — that overlap is what let
+    # two concurrent speak() calls stomp each other's _is_speaking/_http_interrupt state.
+    #
+    # Also hold off entirely while a previous reading is paused awaiting a Continue/
+    # Replay/Cancel decision, rather than auto-playing whatever's queued next: that
+    # unrelated next item finishing normally would otherwise hit the "not interrupted"
+    # branch in _play_audio and clear _paused_speech — a single global slot — wiping
+    # out the still-unresolved pause and making the buttons vanish before anyone
+    # touched them. Re-checked after each lock acquisition (not just once up front) so
+    # a call that was already queued when the interrupt landed can't slip through the
+    # instant the lock frees up. /continue and /replay clear _paused_speech
+    # themselves before spawning their own speak() call, so a legitimate resume passes
+    # straight through; Cancel clears it without playing anything, which also releases
+    # anything waiting here.
+    while True:
+        _speak_lock.acquire()
+        if _paused_speech[0] is None:
+            break
+        _speak_lock.release()
+        _t_spk.sleep(0.2)
+    _interrupted_out = False
+    try:
+        wav_path, pcm, sr, lead_samp, tail_pad = _synthesize(
+            text, alsa_output, volume, silence_ms)
+        if wav_path is None:
+            return
+        clean = strip_markdown(text)
+        # Live read-along for this readout (e.g. /speak, /continue, /replay) — same
+        # _live_speech state the streaming pipeline uses, driven by _play_audio ticks.
+        _seq_ra = None
+        if interruptible and clean:
+            _seq_ra = _live_seq_alloc()
+            with _live_speech_lock:
+                _live_speech[0] = {"seq": _seq_ra, "text": clean, "pos": 0,
+                                   "tot": len(clean), "clause": None, "running": True}
+            content_total = max(1, len(pcm) - lead_samp - (lead_samp if tail_pad else 0))
+            # Same output-latency compensation as the streaming tick: the tick is
+            # wall-clock from playback start, so subtract the device latency to
+            # keep the highlight on the audio the listener actually hears.
+            _ra_lat_samp = int(_output_latency_ms[0] * sr / 1000)
+            def _readalong_tick(samples_played):
+                played = samples_played - _ra_lat_samp
+                frac = min(1.0, max(0.0, (played - lead_samp) / content_total))
+                pos = int(frac * len(clean))
+                with _live_speech_lock:
+                    st = _live_speech[0]
+                    if st and st.get("seq") == _seq_ra:
+                        st["pos"] = pos
+                        st["clause"] = {"text": clean, "start": 0, "off": pos}
+                        st["running"] = True
+        _is_speaking[0] = True
+        try:
+            _interrupted_out, _tick_b, _coupl = _play_audio(
+                wav_path, pcm, sr, alsa_output, resumable, clean,
+                lead_samp, tail_pad,
+                interruptible=interruptible,
+                on_tick=_readalong_tick if (interruptible and _seq_ra is not None) else None)
+        finally:
+            _is_speaking[0] = False
+            if _seq_ra is not None:
+                with _live_speech_lock:
+                    if _live_speech[0] and _live_speech[0].get("seq") == _seq_ra:
+                        _live_speech[0] = None
     except Exception as e:
         log.error("speak() error: %s", e)
     finally:
-        _is_speaking[0] = False
         # Short gate when interrupted (speaker stops instantly, no echo tail).
         # Full 600 ms gate when TTS completes normally (speaker rings down).
-        import time as _t_sp
-        _post_busy_until[0] = _t_sp.time() + (0.15 if _interrupted[0] else 0.6)
-        for p in wav_parts:
-            try: os.unlink(p)
-            except FileNotFoundError: pass
-        try: os.unlink(final_wav)
-        except (FileNotFoundError, UnboundLocalError): pass
+        _post_busy_until[0] = _t_spk.time() + (0.15 if _interrupted_out else 0.6)
         _speak_lock.release()
+
+
+class StreamingSpeaker:
+    """Streams an OpenClaw reply to TTS while OpenClaw is still generating it.
+
+    The streaming consumer calls `feed(cumulative_text)` as gateway ``assistant``
+    stream events arrive and `final(full_text)` when chat-final lands.  A start
+    threshold (RTT_TTS_START) decides when the buffered text is first released to
+    the TTS pipeline; after that, sentence boundaries flush continuously, with
+    TTS_MAX_SENTENCE as the anti-starvation cap.
+
+    Two worker threads per generation:
+      - synthesis worker — `_synthesize()` one released sentence at a time, runs
+        ahead of playback to hide per-sentence TTS latency (esp. network tiers).
+      - playback worker — `_play_audio()` each part back-to-back, keeping voice
+        barge-in working across parts (coupling measured from the previous part),
+        keying PTT once for the whole turn, and driving the `_live_speech`
+        read-along at ~4 Hz.
+
+    A `replace` stream event (model restarted its answer) calls `reset()`: the
+    current generation is stopped and discarded, and the next `feed()`/`final()`
+    starts a fresh one.
+    """
+
+    def __init__(self, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
+                 silence_ms: int = 300):
+        self.alsa_output = alsa_output
+        self.volume = volume
+        self.silence_ms = silence_ms
+        self.seq = _live_seq_alloc()               # read-along generation (bumped on reset)
+        self._gen = 0                               # worker generation (bumped on reset)
+        self._gen_stop = _threading.Event()
+        self.sentence_q = queue.Queue()             # (text, char_start_in_reply)
+        self.wav_q = queue.Queue()                  # (wav,pcm,sr,text,start,lead,tail) | ("end",)
+        self._threads: list = []
+        self._generation_started = False
+        self._lock = _threading.Lock()
+        self._buffered = ""
+        self._released = 0                          # char frontier already handed to sentence_q
+        self._started = False                       # start threshold met?
+        self._t0: float | None = None               # first feed() wall clock (time:N mode)
+        self._final_given = False
+        self._known_full = ""                       # latest cumulative text (Continue/Replay)
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def feed(self, text: str):
+        """New cumulative streamed text.  Releases text past the start threshold
+        / sentence boundaries into the synthesis pipeline."""
+        with self._lock:
+            self._known_full = text
+            self._buffered = text
+            if self._t0 is None:
+                self._t0 = time.monotonic()
+            rel = self._release_point(text)
+            if rel <= self._released:
+                return
+            region = text[self._released:rel]
+            self._released = rel
+        self._dispatch(region)
+
+    def final(self, full_text: str):
+        """The complete reply has arrived — release everything still buffered."""
+        region = None
+        with self._lock:
+            self._known_full = full_text
+            self._buffered = full_text
+            self._final_given = True
+            if len(full_text) > self._released:
+                region = full_text[self._released:]
+                self._released = len(full_text)
+                self._started = True
+        if region is not None and region.strip():
+            self._dispatch(region)
+        self._ensure_workers()
+
+    def reset(self):
+        """Model restarted its answer (``replace`` event) — stop and discard the
+        current generation; a fresh pipeline starts on the next feed()."""
+        self._gen_stop.set()
+        _http_interrupt[0] = True       # cut any part that is mid-playback right now
+        self._drain()
+        with self._lock:
+            self._buffered = ""
+            self._released = 0
+            self._started = False
+            self._final_given = False
+            self._known_full = ""
+            self._t0 = None
+        self.seq = _live_seq_alloc()
+        self._gen += 1
+        self._gen_stop = _threading.Event()
+        self.sentence_q = queue.Queue()
+        self.wav_q = queue.Queue()
+        self._threads = []
+        self._generation_started = False
+        # The stale read-along belonged to the old answer; the consumer will post
+        # a fresh frame when the rewritten text starts arriving.
+        with _live_speech_lock:
+            st = _live_speech[0]
+            if st and st.get("text"):
+                st["running"] = False
+                st["pos"] = 0
+        log.info("StreamingSpeaker reset — waiting for the rewritten answer")
+
+    def interrupt(self):
+        """User Stop / task cancellation — stop now and save Continue/Replay
+        state for the interrupted sentence (matching today's speak() behavior)."""
+        self._gen_stop.set()
+        _http_interrupt[0] = True       # stop any part that is mid-playback right now
+
+    def wait(self):
+        for t in self._threads[:]:
+            t.join(timeout=15)
+
+    # ── start-threshold + boundary dispatch ──────────────────────────────────
+
+    def _release_point(self, text: str) -> int:
+        """How far into `text` complete text may be released right now."""
+        boundary = self._released
+        buffered = len(text)
+        if not self._started:
+            kind, val = TTS_START_KIND, TTS_START_VALUE
+            if kind == "sentence":
+                b = _last_sentence_boundary(text)
+                if b > boundary:
+                    boundary = b
+            else:
+                met = False
+                if kind == "time":
+                    met = (time.monotonic() - self._t0) >= val
+                elif kind == "chars":
+                    met = len(text) >= int(val)
+                elif kind == "words":
+                    met = len(text.split()) >= int(val)
+                if met:
+                    b = _last_sentence_boundary(text)
+                    if b > boundary:
+                        boundary = b
+                    else:
+                        c = _last_clause_boundary(text)
+                        if c > boundary:
+                            boundary = c
+                        else:
+                            boundary = buffered   # partial clause is fine for time/chars/words
+        else:
+            b = _last_sentence_boundary(text)
+            if b > boundary:
+                boundary = b
+        # Anti-starvation: never let a single sentence stall the pipeline past
+        # TTS_MAX_SENTENCE chars waiting for its end — flush at the last clause
+        # boundary (or everything, if even that is unreachable).
+        if buffered - boundary > TTS_MAX_SENTENCE:
+            c = _last_clause_boundary(text)
+            if c > boundary:
+                boundary = c
+            elif buffered > boundary:
+                boundary = buffered
+        return boundary
+
+    def _dispatch(self, region: str):
+        region_start = self._released - len(region)
+        parts = _split_sentences(region)
+        dispatched = []
+        if not parts:
+            chunk = region.strip()
+            if chunk:
+                dispatched.append((chunk, region_start + region.find(chunk)))
+        else:
+            for chunk, off in parts:
+                dispatched.append((chunk, region_start + off))
+        for chunk, real in dispatched:
+            self.sentence_q.put((chunk, real))
+        if dispatched:
+            with self._lock:
+                if not self._started:
+                    self._started = True
+                    log.info("Streaming TTS started (mode=%s) at %d/%d chars",
+                             RTT_TTS_START, self._released, len(self._known_full))
+        self._ensure_workers()
+
+    def _ensure_workers(self):
+        if self._generation_started:
+            return
+        self._generation_started = True
+        sq, wq = self.sentence_q, self.wav_q
+        stop, gen = self._gen_stop, self._gen
+        t1 = _threading.Thread(target=self._synth_worker, args=(sq, wq, gen, stop), daemon=True)
+        t2 = _threading.Thread(target=self._playback_worker, args=(wq, gen, stop), daemon=True)
+        self._threads = [t1, t2]
+        t1.start()
+        t2.start()
+
+    def _drain(self):
+        for _ in range(self.wav_q.qsize()):
+            try:
+                item = self.wav_q.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, tuple) and item and item[0] != "end":
+                self._unlink(item[0])
+        for _ in range(self.sentence_q.qsize()):
+            try:
+                self.sentence_q.get_nowait()
+            except queue.Empty:
+                break
+
+    @staticmethod
+    def _unlink(path):
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    # ── synthesis worker ─────────────────────────────────────────────────────
+
+    def _synth_worker(self, sq, wq, gen, stop):
+        first = True
+        try:
+            while not stop.is_set():
+                try:
+                    seg = sq.get(timeout=0.2)
+                except queue.Empty:
+                    if self._final_given:
+                        break
+                    continue
+                if stop.is_set() or gen != self._gen:
+                    break
+                is_last = self._final_given and sq.empty()
+                try:
+                    wav, pcm, sr, lead, tail = _synthesize(
+                        seg[0], self.alsa_output, self.volume, self.silence_ms,
+                        pad_lead=first, pad_tail=is_last)
+                except Exception as e:
+                    log.error("Streaming TTS synthesis error: %s", e)
+                    continue
+                first = False
+                if wav is None:
+                    continue
+                if stop.is_set() or gen != self._gen:
+                    self._unlink(wav)
+                    break
+                wq.put((wav, pcm, sr, seg[0], seg[1], lead, tail))
+        finally:
+            wq.put(("end", gen))
+
+    # ── playback worker ──────────────────────────────────────────────────────
+
+    def _playback_worker(self, wq, gen, stop):
+        # Serialize with speak(): wait for the lock (and, like speak(), hold off
+        # while a previous reading is paused awaiting Continue/Replay/Cancel).
+        while True:
+            _speak_lock.acquire()
+            if _paused_speech[0] is None:
+                break
+            _speak_lock.release()
+            time.sleep(0.2)
+        keyed = False
+        _use_ptt = bool(_find_radio_sink()) if (_ptt_alive() and _radio_profile_active[0]) else None
+        if _use_ptt:
+            _ptt_key()
+            keyed = True
+            time.sleep(_ptt_prekey_s())
+            log.info("PTT keyed — streaming turn")
+        _is_speaking[0] = True
+        played_any = False
+        prev_coupling: float | None = None
+        try:
+            while True:
+                if stop.is_set():
+                    if gen == self._gen:
+                        _http_interrupt[0] = False       # consume a buffer-only Stop
+                        self._compose_between_parts_pause(wq)
+                    break
+                try:
+                    item = wq.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "end":
+                    break                                 # normal end of stream
+                if gen != self._gen:
+                    # reset() happened — this generation is defunct
+                    if isinstance(item, tuple) and item:
+                        self._unlink(item[0])
+                    break
+                if not (isinstance(item, tuple) and len(item) == 7):
+                    continue
+                wav, pcm, sr, seg_text, seg_start, lead, tail = item
+                try:
+                    inter, tick_b, cp = _play_audio(
+                        wav, pcm, sr, self.alsa_output,
+                        resumable=False, full_text=seg_text,
+                        lead_pad_samples=lead, tail_pad_added=bool(tail),
+                        coupling=prev_coupling, skip_guard=played_any,
+                        ptt_keyed=keyed, interruptible=True,
+                        skip_auto_reduce=played_any,
+                        on_tick=self._make_tick(seg_text, seg_start, lead, len(pcm), sr))
+                    prev_coupling = cp
+                except Exception as e:
+                    log.error("Streaming TTS playback error: %s", e)
+                    self._unlink(wav)
+                    break
+                played_any = True
+                if inter:
+                    if gen == self._gen:
+                        self._save_pause(seg_text, seg_start, tick_b, lead, tail,
+                                         len(pcm), sr)
+                    break
+        finally:
+            _is_speaking[0] = False
+            with _live_speech_lock:
+                st = _live_speech[0]
+                if st and st.get("seq") == self.seq:
+                    _live_speech[0] = None
+            if keyed:
+                time.sleep(_ptt_tail_s())
+                _ptt_release()
+                log.info("PTT released")
+            _http_interrupt[0] = False
+            _speak_lock.release()
+
+    def _make_tick(self, seg_text: str, seg_start: int, lead: int, pcm_len: int,
+                   sr: int):
+        seq = self.seq
+        # The tick is wall-clock from paplay start, but the audio is heard only
+        # after the output-device latency — subtract it so the highlight tracks
+        # what the listener actually hears, not the write clock.
+        lat_samp = int(_output_latency_ms[0] * sr / 1000)
+        def _tick(samples_played: int):
+            played = samples_played - lat_samp
+            frac = min(1.0, max(0.0, (played - lead) / max(1, pcm_len)))
+            off = int(frac * len(seg_text))
+            pos = seg_start + off
+            with _live_speech_lock:
+                st = _live_speech[0]
+                if st and st.get("seq") == seq:
+                    st["pos"] = pos
+                    st["clause"] = {"text": seg_text, "start": seg_start,
+                                    "off": min(off, len(seg_text))}
+                    st["running"] = True
+        return _tick
+
+    def _save_pause(self, seg_text: str, seg_start: int, tick_at_break: int,
+                    lead: int, tail: int, pcm_len: int, sr: int):
+        content_total = pcm_len - lead - (lead if tail else 0)
+        local_off = 0
+        if content_total > 0:
+            played = tick_at_break - lead
+            played = max(0, min(played, content_total))
+            char_local = int(played / content_total * len(seg_text))
+            local_off = _sentence_start_before(seg_text, char_local)
+        full = self._known_full or ""
+        remaining = full[seg_start + local_off:].strip() or full
+        _paused_speech[0] = {"remaining": remaining, "full": full,
+                             "alsa": self.alsa_output}
+        log.info("Streaming TTS interrupted — %d/%d chars remain for Continue",
+                 len(remaining), len(full))
+
+    def _compose_between_parts_pause(self, wq):
+        """Stop landed between parts (buffer-only, or after a part finished and
+        the next hadn't started).  Resume from the next unplayed sentence — or,
+        if the queue is already empty, the whole reply."""
+        resume_char = None
+        while True:
+            try:
+                item = wq.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, tuple) and item:
+                if item[0] == "end":
+                    continue
+                if resume_char is None:
+                    resume_char = item[4]        # seg_start of next unplayed sentence
+                self._unlink(item[0])
+        full = self._known_full or ""
+        if resume_char is None:
+            resume_char = len(full)
+        remaining = full[resume_char:].strip() or full
+        _paused_speech[0] = {"remaining": remaining, "full": full,
+                             "alsa": self.alsa_output}
+        log.info("Streaming TTS stopped between parts — %d/%d chars remain",
+                 len(remaining), len(full))
 
 # ── OpenClaw gateway client ───────────────────────────────────────────────────
 
@@ -2539,6 +3205,9 @@ class GatewayClient:
         self._reply_futs: dict[str, asyncio.Future] = {}
         # Maps runId → latest assistant-stream text (fallback if chat final empty)
         self._assistant_text: dict[str, str] = {}
+        # Maps runId → queue of assistant-stream payloads ({"text", "delta", ...})
+        # consumed by ask_stream() while a reply is still being generated.
+        self._stream_queues: dict[str, asyncio.Queue] = {}
 
     async def connect(self):
         self._ready.clear()
@@ -2594,9 +3263,18 @@ class GatewayClient:
                     # Track assistant-stream text as a reliable reply source
                     elif event == "agent" and payload.get("stream") == "assistant":
                         rid = payload.get("runId")
-                        atext = (payload.get("data") or {}).get("text", "")
+                        data = payload.get("data") or {}
+                        atext = data.get("text", "")
                         if rid and atext:
                             self._assistant_text[rid] = atext
+                        # Fan out to ask_stream()'s queue so TTS can start as soon
+                        # as the first complete sentence has streamed in.
+                        sq = self._stream_queues.get(rid)
+                        if rid and sq is not None:
+                            try:
+                                sq.put_nowait(data)
+                            except asyncio.QueueFull:
+                                pass
 
                     # Resolve agent replies on final chat event
                     elif event == "chat" and payload.get("state") == "final":
@@ -2649,6 +3327,14 @@ class GatewayClient:
                 if not fut.done():
                     fut.set_exception(ConnectionError("Gateway reconnecting"))
             self._reply_futs.clear()
+            # Wake any ask_stream() waiters; they race reply_fut (exc raised above),
+            # so an empty dict as a sentinel is enough to unblock the queue side.
+            for q in list(self._stream_queues.values()):
+                try:
+                    q.put_nowait({})
+                except asyncio.QueueFull:
+                    pass
+            self._stream_queues.clear()
 
             while not stop_event.is_set():
                 try:
@@ -2697,11 +3383,18 @@ class GatewayClient:
         }))
 
         text = await asyncio.wait_for(reply_fut, timeout=AGENT_TIMEOUT_S + 5)
-        # Codex harness delivers replies via the `message` tool, not chat
-        # content — the chat-final event is empty. Pull the reply from
-        # chat.history where the message-tool call arguments are persisted.
-        # Also catch short gateway status tokens ("Sent.", "Done.", "OK", etc.)
-        # that surface as the chat-final text instead of the real reply.
+        return await self._resolve_reply_text(text, session_key)
+
+    async def _resolve_reply_text(self, text: str, session_key: str) -> str:
+        """Apply ask()/ask_stream()'s shared final-text fallback chain.
+
+        Codex harness delivers replies via the `message` tool, not chat content —
+        the chat-final event is empty. Pull the reply from chat.history where the
+        message-tool call arguments are persisted. Also catch short gateway status
+        tokens ("Sent.", "Done.", "OK", etc.) that surface as the chat-final text
+        instead of the real reply. Rejects a history result identical to the last
+        reply (the agent hasn't produced a new response yet).
+        """
         _stripped = (text or "").strip().rstrip(".")
         _is_status_token = (
             len(text or "") < 25
@@ -2721,6 +3414,82 @@ class GatewayClient:
         if text:
             _last_five_reply[0] = text
         return text
+
+    async def ask_stream(self, message: str, session_key: str = OPENCLAW_SESSION):
+        """Send a message and stream the reply as OpenClaw generates it.
+
+        An async generator yielding ``(kind, payload)`` tuples:
+          ("delta", data) — one assistant-stream event; ``data`` has the
+            cumulative ``text`` plus ``delta``/``replace``/``replaceable``.
+          ("final", text) — the complete reply, resolved with the same fallback
+            chain as ask() (chat-final → assistant stream → status-token/empty
+            → chat.history → stale-reply rejection). Yielded once, then the
+            generator returns.
+
+        If the model doesn't stream assistant text (codex ``message``-tool mode),
+        only ("final", text) is yielded and the consumer falls back to the
+        whole-reply path automatically.
+        """
+        await asyncio.wait_for(self._ready.wait(), timeout=20)
+        loop = asyncio.get_running_loop()
+        idem = str(uuid.uuid4())
+        req_id = f"send:{idem}"
+
+        ack_fut: asyncio.Future = loop.create_future()
+        self._send_acks[req_id] = ack_fut
+        await self._ws.send(json.dumps({
+            "type": "req", "id": req_id, "method": "chat.send",
+            "params": {
+                "sessionKey": session_key,
+                "message": message,
+                "idempotencyKey": idem,
+            },
+        }))
+        ack = await asyncio.wait_for(ack_fut, timeout=10)
+        if not ack.get("ok"):
+            raise RuntimeError(f"chat.send failed: {ack.get('error')}")
+
+        run_id = ack.get("payload", {}).get("runId")
+        if not run_id:
+            raise RuntimeError("chat.send returned no runId")
+
+        reply_fut: asyncio.Future = loop.create_future()
+        self._reply_futs[run_id] = reply_fut
+        await self._ws.send(json.dumps({
+            "type": "req", "id": f"wait:{run_id}", "method": "agent.wait",
+            "params": {"runId": run_id, "timeoutMs": AGENT_TIMEOUT_S * 1000},
+        }))
+
+        sq: asyncio.Queue = asyncio.Queue()
+        self._stream_queues[run_id] = sq
+        raw = ""
+        try:
+            while True:
+                getter = asyncio.ensure_future(sq.get())
+                await asyncio.wait({getter, reply_fut},
+                                   return_when=asyncio.FIRST_COMPLETED)
+                if getter.done():
+                    data = getter.result()
+                    # A reconnect sentinel is an empty data dict.
+                    if data:
+                        yield ("delta", data)
+                    else:
+                        getter.cancel()
+                        raise ConnectionError("Gateway reconnecting")
+                else:
+                    getter.cancel()
+                    if reply_fut.done():
+                        exc = reply_fut.exception()
+                        if exc:
+                            raise exc
+                        raw = reply_fut.result()
+                        break
+        except asyncio.CancelledError:
+            self._stream_queues.pop(run_id, None)
+            raise
+        finally:
+            self._stream_queues.pop(run_id, None)
+        yield ("final", await self._resolve_reply_text(raw, session_key))
 
     async def _reply_from_history(self, session_key: str) -> str:
         """Fetch the latest assistant reply from chat.history.
@@ -3340,12 +4109,16 @@ class RealtimeSession:
             _log_entry("thinking", f"{AGENT_NAME} is thinking...")  # live counter shown on dashboard
             # Prefix tells the agent to ignore cron/heartbeat background context
             voice_msg = f"[voice] {transcript}"
-            _think_task = asyncio.ensure_future(
-                self.gw.ask(voice_msg, session_key=self.session_key)
-            )
-            _current_think_task[0] = _think_task
+            # Stream the reply to TTS as OpenClaw generates it, instead of waiting
+            # for chat-final — _consume_stream() feeds the StreamingSpeaker, which
+            # starts speaking once the RTT_TTS_START threshold is met. _post_busy_until
+            # is NOT set between streamed parts (that would block barge-in); it is
+            # gated once, in the finally below, exactly like the old ask()+speak() path.
+            speaker = StreamingSpeaker(self.alsa_output)
+            _consume = asyncio.ensure_future(self._consume_stream(speaker, voice_msg))
+            _current_think_task[0] = _consume
             try:
-                reply = await _think_task
+                reply = await _consume
             except asyncio.CancelledError:
                 log.info("Thinking interrupted via /interrupt")
                 _log_entry("five", "")   # clears thinking counter
@@ -3353,6 +4126,8 @@ class RealtimeSession:
                 return
             finally:
                 _current_think_task[0] = None
+            if reply is None:
+                return   # timed out — _consume_stream already spoke the apology
             if not reply:
                 log.warning("History fallback also empty — no reply from %s", AGENT_NAME)
                 _log_entry("system", f"No reply from {AGENT_NAME} — please try again.")
@@ -3362,19 +4137,9 @@ class RealtimeSession:
                 )
                 return
             log.info("%s: %s", AGENT_NAME, reply)
-            if _speak_used_this_turn[0]:
-                # This turn already read something aloud via /speak — don't also voice
-                # the reply on top of it (confirmed live: even a one-line reply like
-                # "Re-queued — reading now!" was a second audible thing back to back
-                # with the /speak content). Show it as a de-emphasized status line
-                # instead, same styling as other system/meta log entries, so it's still
-                # visible on the dashboard without being spoken.
-                _log_entry("system", f"{AGENT_NAME} (text only): {reply}")
-            else:
-                _log_entry("five", reply)
-                await asyncio.get_running_loop().run_in_executor(
-                    None, speak, reply, self.alsa_output, -1.0, 300, True, True  # resumable, interruptible
-                )
+            # Playback runs in the speaker's worker threads — wait for the reply to
+            # finish sounding (off the event loop) so the turn behaves like before.
+            await asyncio.get_running_loop().run_in_executor(None, speaker.wait)
         except asyncio.TimeoutError:
             log.error("OpenClaw agent timed out")
             _log_entry("five", "")   # clears the thinking counter on dashboard
@@ -3390,6 +4155,94 @@ class RealtimeSession:
             import time as _t_gate3
             _post_busy_until[0] = _t_gate3.time() + (0.15 if _paused_speech[0] is not None else 0.6)
             self._busy.clear()
+
+    async def _consume_stream(self, speaker: "StreamingSpeaker", voice_msg: str):
+        """Consume ask_stream() and feed the StreamingSpeaker for immediate TTS.
+
+        Returns the agent's reply text, or `""` when there was no usable reply, or
+        `None` when the agent timed out (an apology has already been spoken).  This
+        is the coroutine /interrupt cancels, so the CancelledError handler stops
+        the speaker before re-raising.
+
+        Streaming detail: `replace` events mean the model restarted its answer —
+        the speaker is reset and re-armed, and the read-along clears so the new
+        (rewritten) reply takes over cleanly.
+        """
+        # A stale /interrupt flag from an earlier turn must not cut a fresh turn
+        # (the playback worker's monitor only consumes the flag while a part is
+        # playing; its finally also clears on exit).
+        _http_interrupt[0] = False
+        reply = ""
+        generator = None
+        cleared_thinking = False
+        try:
+            generator = self.gw.ask_stream(voice_msg, session_key=self.session_key)
+            anext_coro = generator.__anext__
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(anext_coro(),
+                                                           timeout=AGENT_TIMEOUT_S)
+                except StopAsyncIteration:
+                    break
+                if kind == "delta":
+                    data = payload or {}
+                    text = data.get("text") or ""
+                    if data.get("replace"):
+                        speaker.reset()                    # model restarted its answer
+                        with _live_speech_lock:
+                            _live_speech[0] = None
+                    if not text or _speak_used_this_turn[0]:
+                        continue
+                    if not cleared_thinking:
+                        cleared_thinking = True
+                        _log_entry("five", "")   # clears thinking counter once speech begins
+                    # Live read-along mirrors the accumulating reply; the TTS
+                    # position (see /speech) lags behind this live text by however
+                    # long synthesis + playback takes.
+                    with _live_speech_lock:
+                        _live_speech[0] = {"seq": speaker.seq, "text": text, "pos": 0,
+                                           "tot": len(text), "clause": None, "running": True}
+                    speaker.feed(text)
+                else:   # "final"
+                    reply = payload or ""
+                    if reply:
+                        if _speak_used_this_turn[0]:
+                            _log_entry("system", f"{AGENT_NAME} (text only): {reply}")
+                        else:
+                            _log_entry("five", reply)
+                            with _live_speech_lock:
+                                st = _live_speech[0]
+                                if st and st.get("seq") == speaker.seq:
+                                    st["text"] = reply
+                                    st["tot"] = len(reply)
+                            speaker.final(reply)
+                    else:
+                        _log_entry("five", "")   # clears thinking counter
+                        _log_entry("system", f"No reply from {AGENT_NAME} — please try again.")
+        except asyncio.CancelledError:
+            speaker.interrupt()
+            raise
+        except asyncio.TimeoutError:
+            log.error("OpenClaw agent timed out")
+            # Stop the streaming speaker: its workers never got a stop signal
+            # (no final(), no interrupt), so without reset() they'd hold
+            # _speak_lock forever and the apology below (and every later turn)
+            # would deadlock on it. reset() bumps the generation so the workers
+            # break cleanly and drop the still-pending text.
+            speaker.reset()
+            _http_interrupt[0] = False   # reset() arms the flag; clear it so the apology isn't cut
+            _log_entry("five", "")   # clears the thinking counter on dashboard
+            await asyncio.get_running_loop().run_in_executor(
+                None, speak, "Sorry, I timed out on that.", self.alsa_output
+            )
+            return None
+        finally:
+            if generator is not None:
+                try:
+                    await generator.aclose()
+                except Exception:
+                    pass
+        return reply
 
     async def _recv_ws(self, ws):
         async for raw in ws:
@@ -4396,6 +5249,10 @@ Restart daemon after training to reload profiles.</p>
   <button class="bS" onclick="stopLoop()">Stop</button>
   <button class="bSet" onclick="setLevel()">Set this level</button>
 </div>
+<div class="row" style="margin:4px 0;">
+  <button class="bL" onclick="runLatencyTest()">Latency test</button>
+  <span id="latstatus" class="info" style="font-size:13px;"></span>
+</div>
 <div id="mstatus" class="info"></div></div>"""
                 auto_cal_section = ("" if is_headset else f"""
 <div class="sect"><h4>Auto calibration (mic leakage)</h4>
@@ -4655,6 +5512,13 @@ function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Playing test loop…';}});}}
 function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
   const m=document.getElementById('mstatus');if(m)m.textContent='Stopped.';}});}}
+function runLatencyTest(){{
+  const m=document.getElementById('latstatus');
+  if(m)m.textContent='Measuring… (plays a chirp)';
+  fetch('/speaker-cal/latency-test').then(r=>r.json()).then(d=>{{
+    if(m)m.textContent=d.ok?('Output latency: '+d.latency_ms+' ms — read-along now compensated.'):('Error: '+d.error);
+  }}).catch(e=>{{if(m)m.textContent='Error: '+e;}});
+}}
 function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
   const m=document.getElementById('mstatus');
   if(m)m.textContent='Level saved: '+d.spk_vol+' PW, '+d.sw_pct+'% SW';
@@ -4894,6 +5758,7 @@ Play the test sentence and adjust until comfortable.</div>
 </div>
 <div class="row">
   <button id="btnSet" onclick="setLevel()">✓ Set this level</button>
+  <button id="btnLat" onclick="runLatencyTest()">Latency test</button>
 </div>
 <div id="status" style="margin-top:12px;color:#aaa;font-size:13px;"></div>
 <div class="sect">
@@ -4913,6 +5778,13 @@ function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
 function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
   document.getElementById('status').textContent='Stopped.';
 }});}}
+function runLatencyTest(){{
+  const m=document.getElementById('status');
+  if(m)m.textContent='Measuring… (plays a chirp)';
+  fetch('/speaker-cal/latency-test').then(r=>r.json()).then(d=>{{
+    if(m)m.textContent=d.ok?('Output latency: '+d.latency_ms+' ms — read-along now compensated.'):('Error: '+d.error);
+  }}).catch(e=>{{if(m)m.textContent='Error: '+e;}});
+}}
 function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
   document.getElementById('status').textContent='✓ Level saved: '+d.spk_vol+' PW, '+d.sw_pct+'% SW';
   stopLoop();
@@ -4975,6 +5847,7 @@ a{{color:#7af;}}</style></head><body>
   <button class="bPlay" onclick="startLoop()">Play test</button>
   <button class="bStop" onclick="stopLoop()">Stop</button>
   <button class="bSet"  onclick="setLevel()">✓ Set this level</button>
+  <button class="bPlay" onclick="runLatencyTest()">Latency test</button>
 </div>
 <div id="mstatus" style="color:#aaa;font-size:13px;margin-top:6px;"></div>
 </div>
@@ -4990,6 +5863,13 @@ function startLoop(){{fetch('/speaker-cal/loop-start').then(()=>{{
 function stopLoop(){{fetch('/speaker-cal/loop-stop').then(()=>{{
   document.getElementById('mstatus').textContent='Stopped.';
 }});}}
+function runLatencyTest(){{
+  const m=document.getElementById('mstatus');
+  if(m)m.textContent='Measuring… (plays a chirp)';
+  fetch('/speaker-cal/latency-test').then(r=>r.json()).then(d=>{{
+    if(m)m.textContent=d.ok?('Output latency: '+d.latency_ms+' ms — read-along now compensated.'):('Error: '+d.error);
+  }}).catch(e=>{{if(m)m.textContent='Error: '+e;}});
+}}
 function setLevel(){{fetch('/speaker-cal/set').then(r=>r.json()).then(d=>{{
   document.getElementById('mstatus').textContent='✓ Level saved: '+d.spk_vol;
   stopLoop();
@@ -5143,6 +6023,92 @@ setInterval(upd, 2000);
                 _headset_cal_proc[0] = None
                 _ptt_release()   # ensure PTT is released if loop was stopped mid-transmission
                 _html(self, 200, "<p>Loop stopped.</p>")
+
+            elif self.path == "/speaker-cal/latency-test":
+                # Measure the output-device latency (paplay start → audio heard
+                # at the mic) and store it as the read-along compensation. The
+                # read-along tick is wall-clock from paplay start, so the
+                # measured delay is exactly what to subtract to keep the word
+                # highlight in sync with what the listener actually hears.
+                import wave as _wv, tempfile as _tf
+                _lat_resp = {"ok": False, "error": "unknown"}
+                _lock_held = _speak_lock.acquire(timeout=5)
+                if not _lock_held:
+                    _lat_resp = {"ok": False, "error": "speaker busy"}
+                else:
+                    _prev_src = None
+                    _prev_vol = None
+                    _sink = None
+                    _wav = None
+                    try:
+                        _sink = _find_usb_speaker_sink_name()
+                        if not _sink:
+                            _lat_resp = {"ok": False, "error": "no USB speaker sink"}
+                        else:
+                            # Bypass the AGC source so sd.rec reads the raw mic.
+                            _prev_src = _get_default_source()
+                            if _agc_source_available() or _prev_src == AGC_SOURCE_NAME:
+                                _set_default_source(RAW_MIC_SOURCE)
+                            # Ensure the chirp is audible; restore the level after.
+                            _prev_vol = _read_sink_volume_pct(_sink)
+                            subprocess.run(["pactl", "set-sink-volume", _sink, "45%"],
+                                           capture_output=True)
+                            _sr = 48000
+                            _dur = 0.3
+                            _lead = 0.5
+                            _margin = 1.0
+                            _n = int(_sr * (_lead + _dur + _margin))
+                            _t = np.arange(int(_sr * _dur)) / _sr
+                            _phase = 2 * np.pi * (500 * _t + (2000 - 500) * _t**2 / (2 * _dur))
+                            _chirp = (np.sin(_phase) * 0.5 * 32767).astype(np.int16)
+                            _fd, _wav = _tf.mkstemp(suffix=".wav")
+                            os.close(_fd)
+                            with _wv.open(_wav, "wb") as _w:
+                                _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(_sr)
+                                _w.writeframes(_chirp.tobytes())
+                            _rec = sd.rec(_n, samplerate=_sr, channels=1, dtype="int16",
+                                          device=None, blocking=False)
+                            def _play_chirp(_wav=_wav, _sink=_sink, _lead=_lead):
+                                time.sleep(_lead)
+                                subprocess.run(["paplay", f"--device={_sink}", _wav],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            _th = threading.Thread(target=_play_chirp, daemon=True)
+                            _th.start()
+                            sd.wait()
+                            _data = _rec[:_n, 0].astype(np.float64)
+                            _corr = np.correlate(_data, _chirp.astype(np.float64), mode="valid")
+                            _peak = int(np.argmax(_corr))
+                            _peak_val = float(_corr[_peak])
+                            _noise = float(np.median(np.abs(_corr)))
+                            if _peak_val < 5 * _noise:
+                                _lat_resp = {"ok": False,
+                                             "error": "mic could not hear the chirp — check speaker volume / coupling"}
+                            else:
+                                _lat_ms = max(0, int(round((_peak / _sr - _lead) * 1000)))
+                                _save_output_latency(_lat_ms)
+                                log.info("Latency test: chirp peak at %.3fs → output latency %d ms",
+                                         _peak / _sr, _lat_ms)
+                                _lat_resp = {"ok": True, "latency_ms": _lat_ms,
+                                             "peak_s": round(_peak / _sr, 3)}
+                    except Exception as _e:
+                        log.error("Latency test error: %s", _e)
+                        _lat_resp = {"ok": False, "error": str(_e)}
+                    finally:
+                        if _wav:
+                            try: os.unlink(_wav)
+                            except Exception: pass
+                        if _prev_vol is not None and _sink:
+                            subprocess.run(["pactl", "set-sink-volume", _sink,
+                                            f"{_prev_vol}%"], capture_output=True)
+                        if _prev_src is not None:
+                            _set_default_source(_prev_src)
+                        _speak_lock.release()
+                _lat_body = json.dumps(_lat_resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(_lat_body)))
+                self.end_headers()
+                self.wfile.write(_lat_body)
 
             elif self.path.startswith("/speaker-cal/adjust"):
                 import json as _json, re as _re5, urllib.parse as _up
@@ -5544,6 +6510,44 @@ setInterval(upd, 2000);
                         _time.sleep(0.1)
                 except Exception:
                     pass
+            elif self.path == "/speech":
+                # Read-along SSE: mirrors /levels. Streams the current TTS reading
+                # position — {"seq","sentence","off","pos","tot","running"} — every
+                # ~0.25 s while `_live_speech` is active, else a pause frame so the
+                # dashboard hides the cue. The dashboard renders the current
+                # sentence with a <mark> on the word being spoken and a progress
+                # bar (pos/tot); the visible lag vs. the live reply text below is
+                # the gap between generation and speech.
+                import time as _time
+                self.send_response(200)
+                self.send_header("Content-Type",  "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection",    "keep-alive")
+                self.end_headers()
+                try:
+                    while True:
+                        with _live_speech_lock:
+                            st = _live_speech[0]
+                        if st:
+                            clause = st.get("clause") or {}
+                            frame = {
+                                "seq":     st.get("seq", 0),
+                                "text":    st.get("text", "") or "",
+                                "pos":     int(st.get("pos", 0) or 0),
+                                "tot":     int(st.get("tot", 0) or 0),
+                                "running": bool(st.get("running", False)),
+                                "sentence": clause.get("text", "") or "",
+                                "off":     int(clause.get("off", 0)) or 0,
+                            }
+                            msg = ("data: " + json.dumps(frame, ensure_ascii=False)
+                                   + "\n\n").encode("utf-8")
+                        else:
+                            msg = b"data: {\"pause\":true}\n\n"
+                        self.wfile.write(msg)
+                        self.wfile.flush()
+                        _time.sleep(0.25)
+                except Exception:
+                    pass
             elif self.path == "/log":
                 # Legacy redirect
                 self.send_response(301)
@@ -5602,6 +6606,12 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 .spkbanner{{background:var(--gnb);border-left:3px solid var(--gn);border-radius:var(--r);padding:8px 10px;margin:3px 0;color:var(--gn);font-style:italic;}}
 .spkbanner.paused{{background:var(--mb);border-color:var(--mon);color:var(--mon);}}
 #dbanner{{min-height:1.2em;font-size:.8em;font-family:'JetBrains Mono',monospace;padding:3px 8px;transition:color .1s;}}
+#nowreading{{flex-shrink:0;margin:6px 14px 0;padding:8px 12px;background:var(--sf2);border:1px solid var(--di);border-radius:var(--r);font-size:14px;line-height:1.55;}}
+#nowreading[hidden]{{display:none;}}
+#nowreading .nrw{{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:4px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;}}
+#nowreading mark.nowr{{background:var(--you);color:#04121f;border-radius:3px;padding:0 2px;}}
+#nowreading .bar{{height:3px;background:var(--di);border-radius:2px;overflow:hidden;margin-top:6px;}}
+#nowreading .bar>div{{height:100%;background:var(--gn);width:0%;transition:width .25s linear;}}
 @media(max-width:520px){{body{{font-size:15px;}}#top{{padding:8px 10px 6px;}}a.btn{{padding:5px 8px;font-size:11px;}}}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
@@ -5609,6 +6619,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 <div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
 <div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}</div>
+<div id="nowreading" hidden></div>
 <div id="log">{speaking_banner}{rows}</div>
 <script>
 setInterval(function(){{
@@ -5654,6 +6665,47 @@ setInterval(function(){{
     var h=document.getElementById('dbanner');
     if(h&&!h.style.background){{h.textContent='';h.style.color='';}}
   }});
+}})();
+(function(){{
+  // ── Live read-along ("now reading") ─────────────────────────────────────
+  // Streams the current TTS speaking position from /speech and renders the
+  // sentence being read with a <mark> on the word in progress plus a progress
+  // bar. The element lives OUTSIDE #log on purpose: the 3s /dashboard-frag
+  // poll replaces #log's innerHTML, which would wipe it.
+  var el=document.getElementById('nowreading');
+  if(!el) return;
+  var head=document.createElement('div'); head.className='nrw';
+  var lbl=document.createElement('span'); lbl.textContent='reading';
+  var pct=document.createElement('span');
+  head.appendChild(lbl); head.appendChild(pct);
+  var sen=document.createElement('div'); sen.className='nrs';
+  var bar=document.createElement('div'); bar.className='bar';
+  var fill=document.createElement('div'); bar.appendChild(fill);
+  function esc(s){{return String(s).replace(/[&<>"']/g,function(c){{
+    return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];}});}}
+  function clamp(v,lo,hi){{return Math.max(lo,Math.min(hi,v));}}
+  function markWord(s,off){{
+    s=String(s||''); if(!s) return '';
+    off=clamp(off,0,s.length);
+    var i=off; while(i>0 && !/\\s/.test(s[i-1])) i--;
+    var j=off; while(j<s.length && !/\\s/.test(s[j])) j++;
+    if(j-i>40){{ i=Math.max(0,off-6); j=Math.min(s.length,off+9); i=Math.min(i,off); j=Math.max(j,off); }}
+    return esc(s.slice(0,i))+'<mark class="nowr">'+esc(s.slice(i,j))+'</mark>'+esc(s.slice(j));
+  }}
+  el.appendChild(head); el.appendChild(sen); el.appendChild(bar);
+  var es=new EventSource('/speech');
+  es.onmessage=function(ev){{
+    var d;
+    try{{ d=JSON.parse(ev.data); }}catch(e){{ return; }}
+    if(!d || d.pause){{ el.hidden=true; return; }}
+    var pos=d.pos||0, tot=d.tot||0;
+    lbl.textContent=d.running?'reading…':'buffered';
+    pct.textContent=(tot>0?Math.round(100*pos/tot):0)+'%';
+    sen.innerHTML=markWord(d.sentence||d.text||'', d.off||0);
+    fill.style.width=(tot>0?clamp(100*pos/tot,0,100):0)+'%';
+    el.hidden=false;
+  }};
+  es.onerror=function(){{ el.hidden=true; }};
 }})();
 </script>
 </body></html>"""
@@ -6632,6 +7684,7 @@ if __name__ == "__main__":
 
     # Load per-device calibration store and apply to current default sink
     _load_cal_store()
+    _load_output_latency()
     _default_sink = subprocess.run(["pactl","get-default-sink"],
                                    capture_output=True,text=True).stdout.strip()
     if _default_sink:
