@@ -1,3 +1,7 @@
+## v3.21.4 — 2026-09-07
+
+Version-number alignment with the Mac fork's v3.21.4 — **no functional change here.** That release adds a top-level `import time` the Mac fork was missing, which crashed every streamed gateway reply with `NameError`. This fork has always imported `time` at module scope, so it was never affected.
+
 ## v3.21.3 — 2026-09-07
 
 Version-number alignment with the Mac fork's v3.21.3 — **no functional change here.** That release anchors the Mac fork's read-along highlight to the wall clock instead of a tick count so it stops drifting behind the audio on long replies; this fork's `_play_audio` already computes read-along position as `(monotonic() - _t0) * sr` (see the "Wall clock at process spawn" note in `_monitor_and_play`), so there was nothing to port.
