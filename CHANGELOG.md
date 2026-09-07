@@ -1,3 +1,16 @@
+## v3.21.2 — 2026-09-07
+
+Kept in lockstep with the Mac fork's v3.21.2. The Mac fork's fourth fix
+(its `speak()` lost `_speak_lock.release()` in the 3.21.0 refactor and
+deadlocked the second consecutive `/continue`) does **not** apply here —
+this fork kept the release, so only the three below were ported.
+
+### Fixed
+
+- **Barge-in during a streamed reply left the synthesis worker running.** A mid-reply interrupt stopped playback but never signalled `StreamingSpeaker`'s synth worker, so it kept calling `_synthesize()` on every remaining sentence — queuing audio nobody would play, and billing ElevenLabs/Edge for any Chinese runs — for as long as the reply had left. The playback worker's interrupt path now sets `_gen_stop` and drains the queues; at most one already-in-flight sentence completes.
+- **A long or quiet streamed reply could interrupt itself on its own echo.** `_play_audio`'s per-tick coupling EMA was allowed to drift downward, and the streaming pipeline hands each sentence's ending `coupling_now` to the next sentence as its skip-guard threshold basis — so the barge-in threshold ratcheted down sentence over sentence until the speaker's own output tripped it. `coupling_now` is now floored at the guard's honest measurement (the per-tick-loudness gate added earlier only reduced how often it drifted; it didn't stop the cross-sentence ratchet). The EMA may still rise for genuinely louder passages.
+- **`/continue` and `/replay` with nothing paused now log the no-op** instead of silently redirecting to the dashboard.
+
 ## v3.20.1 — 2026-09-05
 
 Kept in lockstep with the Mac fork's v3.20.1.

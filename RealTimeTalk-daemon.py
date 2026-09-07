@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.21.1"
+__version__ = "3.21.2"
 
 import argparse
 import asyncio
@@ -2504,6 +2504,14 @@ def _play_audio(final_wav: str, final_pcm, sr: int, alsa_output: str,
         interrupt_threshold = [SPEAK_INTERRUPT_PEAK]
         guard_floor = SPEAK_INTERRUPT_PEAK  # threshold floor set by the guard measurement — see below
         coupling_now = init_coupling      # nonlocal — writes into _play_audio's scope
+        # Floor for coupling_now: the honest guard measurement. The per-tick EMA
+        # below may drift coupling_now UP (echo genuinely grows louder) but never
+        # below what the guard measured. Without this, a long/quiet reply's EMA
+        # ratchets coupling_now — and the value handed to the next streamed
+        # sentence as its skip-guard basis — toward zero, so each sentence starts
+        # with a lower barge-in threshold than the last until the reply
+        # interrupts itself on its own echo.
+        coupling_floor = init_coupling
         if init_coupling is not None:
             interrupt_threshold[0] = max(
                 int(_output_peak * init_coupling * _SAFETY), SPEAK_INTERRUPT_PEAK)
@@ -2541,6 +2549,7 @@ def _play_audio(final_wav: str, final_pcm, sr: int, alsa_output: str,
                 if guard == 0:
                     if guard_max_out > 200:
                         coupling_now = guard_max_mic / guard_max_out
+                        coupling_floor = coupling_now
                         interrupt_threshold[0] = max(
                             int(_output_peak * coupling_now * _SAFETY),
                             SPEAK_INTERRUPT_PEAK,
@@ -2580,6 +2589,8 @@ def _play_audio(final_wav: str, final_pcm, sr: int, alsa_output: str,
                 local = p / tick_out
                 coupling_now = local if coupling_now is None else (
                     coupling_now * (1 - SPEAK_COUPLING_EMA) + local * SPEAK_COUPLING_EMA)
+                if coupling_floor is not None and coupling_now < coupling_floor:
+                    coupling_now = coupling_floor   # never drift below the guard measurement
                 # guard_floor never shrinks below the guard's own measurement: the
                 # guard takes a MAX over a full 2s window, which is statistically
                 # always ≥ any single later EMA sample, so unclamped tracking only
@@ -3105,9 +3116,15 @@ class StreamingSpeaker:
                     break
                 played_any = True
                 if inter:
+                    # Barge-in mid-reply. Stop the synthesis worker too — without
+                    # this it keeps running _synthesize() on every remaining
+                    # sentence long after playback stopped, queuing audio nobody
+                    # will play (and billing ElevenLabs/Edge for the ZH runs).
+                    self._gen_stop.set()
                     if gen == self._gen:
                         self._save_pause(seg_text, seg_start, tick_b, lead, tail,
                                          len(pcm), sr)
+                    self._drain()
                     break
         finally:
             _is_speaking[0] = False
@@ -5027,6 +5044,8 @@ function confirmClear(btn, target) {{
                     threading.Thread(target=speak, args=(saved_text, saved_dev, -1.0, 300, True, True),
                                       daemon=True).start()
                     log.info("HTTP %s — %d chars", self.path.lstrip("/"), len(saved_text))
+                else:
+                    log.info("HTTP %s — nothing paused to resume", self.path.lstrip("/"))
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
