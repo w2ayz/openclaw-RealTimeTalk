@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.21.0"
+__version__ = "3.21.1"
 
 import argparse
 import asyncio
@@ -4583,6 +4583,44 @@ def start_http_server(port: int, on_stop, session_ref: list):
         def log_message(self, fmt, *args):
             log.debug("[http] %s", fmt % args)
 
+        def _queue_speak(self, text, sess):
+            """Queue text for TTS playback — shared by GET and POST /speak.
+
+            Returns (True, char_count) on success, (False, error_message) on
+            failure.  This is the local-only hook an OpenClaw agent (or any
+            process on this machine) uses to push text to the speaker, e.g.
+            reading back a news roundup it gathered on request.
+
+            Long text is streamed through StreamingSpeaker so the reading
+            starts as soon as the first sentence is synthesised, instead of
+            waiting for the whole text to be processed by TTS first (the
+            monolithic speak() path synthesises everything up front, which
+            delays a long news reading by tens of seconds).
+            """
+            text = (text or "").strip()
+            if not text:
+                return False, "missing text"
+            alsa = sess.alsa_output if sess else ALSA_OUTPUT
+            _log_entry("five", text)
+            _speak_used_this_turn[0] = True
+            def _run():
+                import time as _tq
+                speaker = StreamingSpeaker(alsa)
+                clean = strip_markdown(text)
+                # Live read-along for this readout — the playback worker's
+                # _make_tick updates pos/clause as each sentence plays.
+                with _live_speech_lock:
+                    _live_speech[0] = {"seq": speaker.seq, "text": clean, "pos": 0,
+                                       "tot": len(clean), "clause": None, "running": True}
+                speaker.final(text)
+                speaker.wait()
+                # Gate the mic after the reading so the TTS echo doesn't trigger
+                # a new transcription (same as speak()'s finally block).
+                _post_busy_until[0] = _tq.time() + (0.15 if _paused_speech[0] is not None else 0.6)
+            threading.Thread(target=_run, daemon=True).start()
+            log.info("HTTP speak — queued %d chars", len(text))
+            return True, len(text)
+
         def do_GET(self):
             sess = session_ref[0]
             if self.path == "/stop":
@@ -6724,7 +6762,9 @@ setInterval(function(){{
                 # the normal speak() TTS pipeline on demand, independent of
                 # the voice conversation flow — e.g. reading back the result
                 # of a text-triggered task. Ported from the Mac fork's
-                # v3.15.0 /speak feature.
+                # v3.15.0 /speak feature. POST (text in the body) is preferred
+                # for long copy — a URL query string mangles '&', '#', '+'
+                # and other characters that appear in real news text.
                 host = self.client_address[0] if self.client_address else ""
                 if host not in ("127.0.0.1", "::1", "localhost"):
                     body = json.dumps({"ok": False, "error": "local callers only"}).encode()
@@ -6737,22 +6777,16 @@ setInterval(function(){{
                 import urllib.parse as _up
                 parsed = _up.urlparse(self.path)
                 params = _up.parse_qs(parsed.query)
-                text = (params.get("text") or [""])[0].strip()
-                if not text:
-                    body = json.dumps({"ok": False, "error": "missing text"}).encode()
+                ok, res = self._queue_speak((params.get("text") or [""])[0], sess)
+                if not ok:
+                    body = json.dumps({"ok": False, "error": res}).encode()
                     self.send_response(400)
                     self.send_header("Content-Type",   "application/json")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                alsa = sess.alsa_output if sess else ALSA_OUTPUT
-                _log_entry("five", text)
-                _speak_used_this_turn[0] = True
-                threading.Thread(target=speak, args=(text, alsa, -1.0, 300, True, True),
-                                  daemon=True).start()
-                log.info("HTTP speak — queued %d chars", len(text))
-                body = json.dumps({"ok": True, "queued": True, "chars": len(text)}).encode()
+                body = json.dumps({"ok": True, "queued": True, "chars": res}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -6766,6 +6800,50 @@ setInterval(function(){{
                                    "enrolled": _owner_profile[0] is not None,
                                    "enrolled_radio": _owner_profile_radio[0] is not None,
                                    "spk_threshold": _spk_threshold[0]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type",   "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                _html(self, 404, "<h2>Not found</h2>")
+
+        def do_POST(self):
+            sess = session_ref[0]
+            if self.path.startswith("/speak"):
+                # Same local-only endpoint as GET /speak, but the text comes in
+                # the request body — form-encoded `text=...` or raw UTF-8 — so
+                # long news copy with '&', '#', '+' etc. survives intact. This
+                # is the form an OpenClaw agent should use to push text to the
+                # speaker (see AGENTS.md).
+                host = self.client_address[0] if self.client_address else ""
+                if host not in ("127.0.0.1", "::1", "localhost"):
+                    body = json.dumps({"ok": False, "error": "local callers only"}).encode()
+                    self.send_response(403)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                text = ""
+                if "application/x-www-form-urlencoded" in self.headers.get("Content-Type", ""):
+                    import urllib.parse as _up
+                    params = _up.parse_qs(raw.decode("utf-8", errors="replace"))
+                    text = (params.get("text") or [""])[0]
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+                ok, res = self._queue_speak(text, sess)
+                if not ok:
+                    body = json.dumps({"ok": False, "error": res}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = json.dumps({"ok": True, "queued": True, "chars": res}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type",   "application/json")
                 self.send_header("Content-Length", str(len(body)))

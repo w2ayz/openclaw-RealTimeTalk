@@ -5,6 +5,13 @@ Kept in lockstep with the Mac fork's v3.20.1.
 ### Fixed
 - **`_ptt_open()` could flood the log with an identical warning every 3 seconds.** The `_radio_hotplug_watcher` calls `_ptt_alive()` on a 3s loop; when a radio interface is plugged in but its serial port won't open (permissions, a missing `dialout` group membership, a flaky adapter), `_ptt_alive()` retries `_ptt_open()` every tick and each call logged `<iface> PTT unavailable (…) — PTT disabled`. `_ptt_open()` now logs the reason at `warning` **once per failed streak** (new `_ptt_unavail_logged` flag, cleared on a successful open) and at `debug` — below the daemon's log level — thereafter. Narrower on Pi than on Mac: Pi's `_ptt_alive()` already guards the retry on `find_radio_port()` returning a port, so the "no radio attached at all" case only logged once at startup and was never the flood source here.
 
+## v3.21.1 — 2026-09-06
+
+### Added
+
+- **POST `/speak` — OpenClaw can now push long text to the speaker reliably.** The local-only `/speak` endpoint previously accepted text only via the URL query string (`?text=...`), which mangles `&`, `#`, `+` and other characters that appear in real news copy, and was undocumented for the agent. It now also accepts the text in the request body — form-encoded `text=...` or raw UTF-8 — so an OpenClaw agent can read out a gathered news roundup with `curl -s -X POST --data-urlencode "text=<copy>" http://127.0.0.1:19000/speak`. GET still works unchanged. The endpoint works even while RTT is in auto-sleep. Documented for the agent in `~/.openclaw/workspace/AGENTS.md`.
+- **README.md / Deployment.md readout sections updated to the POST syntax** — both still showed the old GET-only `?text=` + manual-URL-encode curl one-liner and a "keep it to a spoken-length summary" caveat; the embedded `TOOLS.md` snippet installers copy into the agent workspace now uses `--data-urlencode`, notes long text streams (reading starts within the first sentence or two), and links the same 127.0.0.1:19000 endpoint.
+
 ## v3.21.0 — 2026-09-06
 
 ### Added
@@ -26,7 +33,6 @@ Kept in lockstep with the Mac fork's v3.20.1.
 - **Live "now reading" cue on the dashboard.** A `#nowreading` panel (outside the 3s-polled `#log`) streams the current speaking position from a new `/speech` SSE endpoint: the sentence being read with the in-progress word highlighted, plus a progress bar (`pos/tot`) that trails the live reply text by however long synthesis+playback takes. Shown for streamed replies and manual readouts (`/speak`, `/continue`, `/replay`) alike.
 - **Voice barge-in still works across streamed sentences.** The playback worker measures the mic↔speaker coupling on the first sentence's guard and passes it to subsequent parts (`skip_guard`), so barge-in is never deaf for 2s at the start of each sentence, and an `on_tick` callback reports read-along position ~20 Hz.
 - **`speak()` refactored** into `_synthesize()` (markdown strip → per-script split → TTS chain → concatenation → volume) + `_play_audio()` (PTT routing/keying, coupling monitor, Continue/Replay bookkeeping, auto-reduce) with no behavior change; the streaming pipeline reuses both. `_synthesize` gained `pad_lead`/`pad_tail` so streamed sentences don't get a 600 ms gap between them — only the first sentence is lead-padded and the last tail-padded.
->>>>>>> 1ddb4c9 (feat: streaming TTS — speak the reply while it's still generating (v3.21.0))
 
 ## v3.20.0 — 2026-09-02
 

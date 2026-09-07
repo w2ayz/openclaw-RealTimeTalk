@@ -309,7 +309,7 @@ only thing on the Pi that uses the mic.
 
 ### Wiring OpenClaw up to push text for readout
 
-RTT has a local-only `GET http://localhost:19000/speak?text=...` endpoint
+RTT has a local-only `POST http://127.0.0.1:19000/speak` endpoint
 (see README.md's ["Pushing text from OpenClaw (or any local
 process)"](README.md#pushing-text-from-openclaw-or-any-local-process) for
 full detail) that any process on this Pi can call to have RTT read
@@ -331,10 +331,13 @@ read me what you find" typed instead of said — call this instead of just
 replying in text:
 
 ​```bash
-curl "http://localhost:19000/speak?text=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "YOUR TEXT HERE")"
+curl -s -X POST --data-urlencode "text=YOUR TEXT HERE" http://127.0.0.1:19000/speak
 ​```
 
-- Local-only, GET, URL-encode the text, keep it to a spoken-length summary.
+- Local-only. Use POST (not `?text=` in the URL) so long copy with `&`,
+  `#`, `+` etc. survives intact.
+- Reading starts streaming within the first sentence or two — long text is
+  fine, no need to summarize first.
 - Success looks like `{"ok": true, "queued": true, "chars": N}`.
 - Only use this when RTT is the actual delivery channel wanted — not as a
   substitute for normal chat replies.
