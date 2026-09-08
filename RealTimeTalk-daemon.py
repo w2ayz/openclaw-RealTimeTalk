@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.21.6"
+__version__ = "3.21.7"
 
 import argparse
 import asyncio
@@ -478,6 +478,9 @@ _http_interrupt:      list = [False]  # set by /interrupt to cut TTS mid-playbac
 _last_mic_cb:         list = [0.0]    # epoch of last _mic_cb call — used for hot-plug detection
 _post_busy_until:     list = [0.0]    # timestamp: mic sends silence until this time after TTS ends
 _is_speaking:         list = [False]  # True while speak() is playing audio
+_last_tts_engine:     list = [""]     # human label ("ElevenLabs"/"Edge"/"OpenAI"/"Piper") of the
+                                       # engine that produced the most recent audio — shown in the
+                                       # dashboard #dp panel, live during playback, last-used when idle
 _speak_lock           = threading.Lock()  # serializes speak() calls — two concurrent callers
                                            # (e.g. two /speak requests) would otherwise race on
                                            # _is_speaking/_http_interrupt and overlap audio; the
@@ -2296,6 +2299,15 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
     if not clean:
         return None, np.array([], dtype=np.int16), 0, 0, False
     segments = _split_by_script(clean)
+    # Track which TTS engine actually produced audio this call, for the dashboard
+    # #dp panel. A single utterance can mix tiers (e.g. a ZH clause via ElevenLabs
+    # + an EN clause via Piper), so report the highest tier that yielded audio.
+    _eng = ""
+    _ENGINE_RANK = {"ElevenLabs": 3, "Edge": 2, "OpenAI": 1, "Piper": 0}
+    def _mark_engine(name: str):
+        nonlocal _eng
+        if not _eng or _ENGINE_RANK.get(name, -1) > _ENGINE_RANK.get(_eng, -1):
+            _eng = name
     # Pad playback so USB/PipeWire sinks do not clip the first or last phoneme.
     import wave as _wave, struct as _struct
     wav_parts: list[str] = []
@@ -2318,12 +2330,15 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
         full_path = tempfile.mktemp(suffix=".wav")
         if _elevenlabs_tts(clean, full_path):
             wav_parts.append(full_path)
+            _mark_engine("ElevenLabs")
             segments = []   # skip per-segment loop below
         elif _edge_tts(clean, full_path):
             wav_parts.append(full_path)
+            _mark_engine("Edge")
             segments = []   # skip per-segment loop below
         elif _openai_tts(clean, full_path):
             wav_parts.append(full_path)
+            _mark_engine("OpenAI")
             segments = []   # skip per-segment loop below
         else:
             log.warning("Multilingual TTS failed — falling back to per-segment Piper")
@@ -2333,14 +2348,17 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
         if lang == 'zh':
             if _elevenlabs_tts(seg_text, part_path):
                 wav_parts.append(part_path)
+                _mark_engine("ElevenLabs")
                 continue
             log.warning("ElevenLabs TTS failed for ZH segment — trying Edge TTS")
             if _edge_tts_seg(seg_text, EDGE_VOICE_ZH, part_path):
                 wav_parts.append(part_path)
+                _mark_engine("Edge")
                 continue
             log.warning("Edge TTS failed for ZH segment — falling back to OpenAI TTS")
             if _openai_tts(seg_text, part_path):
                 wav_parts.append(part_path)
+                _mark_engine("OpenAI")
                 continue
             log.warning("OpenAI TTS failed for ZH segment — falling back to Piper")
         result = subprocess.run(
@@ -2355,6 +2373,10 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
                       result.stderr.decode(errors="replace")[:120])
             continue
         wav_parts.append(part_path)
+        _mark_engine("Piper")
+
+    if _eng:
+        _last_tts_engine[0] = _eng
 
     if pad_tail and silence_ms > 0 and len(wav_parts) >= 1:
         tail_silence_path = tempfile.mktemp(suffix=".wav")
@@ -4574,13 +4596,18 @@ def _dashboard_dynamic(sess) -> dict:
             rows += f'<div class="sys">{ts_span}{e["text"]}</div>'
 
     _ds = _get_device_status()
-    _voice_lbl = ("Owner-only" if owner_only else "Everyone") + \
-                 ("" if enrolled else " (not enrolled)")
+    # Owner-only / Everyone state lives on the highlighted nav button now — the
+    # #dp panel's trailing slot instead shows the live TTS engine: whichever of
+    # the ElevenLabs → Edge → OpenAI → Piper chain produced the audio, brightened
+    # while actually speaking, dimmed to the last-used engine when idle.
+    _tts_eng = _last_tts_engine[0] or "&mdash;"
+    _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
+                if speaking else _tts_eng)
     device_panel = (
         f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
         f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
         f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
-        f' &ensp;&#128100; {_voice_lbl}</div>'
+        f' &ensp;&#128483; TTS: {_tts_seg}</div>'
     )
 
     nav_html = (

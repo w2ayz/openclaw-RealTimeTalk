@@ -1,3 +1,10 @@
+## v3.21.7 — 2026-09-08
+
+Kept in lockstep with the Mac fork's v3.21.7.
+
+### Changed
+- **The dashboard `#dp` device panel's trailing slot now shows the live TTS engine instead of a redundant Owner-only/Everyone label.** The `👤 Owner Only` / `Everyone` nav button directly above the panel already signals that state (and highlights green when owner-only is active), so the panel's `👤 Owner-only` text was duplicating it. That slot now reads `🗣 TTS: <engine>` — brightened (teal, bold) while speaking, dimmed to the last-used engine when idle (`—` before the first utterance). `_synthesize()` records the winning engine in a new module global `_last_tts_engine`; `_dashboard_dynamic()` renders it, so it updates live over the existing 3 s `/dashboard-frag` poll. No layout change beyond the swapped slot. Adapted (not cherry-picked) from the Mac fork: this fork's `_synthesize` mixes tiers per script-segment (a ZH clause via ElevenLabs alongside an EN clause via Piper), so the engine label reports the **highest tier** that produced audio this call (`ElevenLabs > Edge > OpenAI > Piper`), where the Mac fork just takes last-wins over its whole-text chain.
+
 ## v3.21.6 — 2026-09-07
 
 ### Fixed
