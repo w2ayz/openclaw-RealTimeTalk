@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.21.7"
+__version__ = "3.21.8"
 
 import argparse
 import asyncio
@@ -1452,9 +1452,33 @@ def load_openai_key() -> str:
         for part in [p for p in key.get("id", "").split("/") if p]:
             secrets = secrets[part]
         key = secrets
+    # Resolve OpenClaw store SecretRef: {"source":"store","provider":"...","id":"NAME"}
+    # — the named secret may live in the environment, at the top level of any
+    # configured file-based secrets provider, or under that provider's
+    # providers.<name>.apiKey subtree.
+    if isinstance(key, dict) and key.get("source") == "store":
+        name = key.get("id", "")
+        key = os.environ.get(name, "")
+        if not key:
+            for prov in cfg.get("secrets", {}).get("providers", {}).values():
+                try:
+                    secrets = _load_json(os.path.expanduser(prov.get("path", "")))
+                except (OSError, ValueError):
+                    continue
+                key = secrets.get(name, "")
+                if not key:
+                    talk_provider = cfg.get("talk", {}).get("provider", "openai")
+                    key = (secrets.get("providers", {})
+                                  .get(talk_provider, {})
+                                  .get("apiKey", ""))
+                if key:
+                    break
+    if isinstance(key, dict):
+        key = ""  # unresolvable SecretRef — never return the reference itself
     if not key:
         raise RuntimeError(
-            "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json"
+            "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json "
+            "(or its SecretRef is unresolvable)"
         )
     return key
 

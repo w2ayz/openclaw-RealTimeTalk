@@ -1,3 +1,8 @@
+## v3.21.8 — 2026-09-08
+
+### Fixed
+- **Speech-to-text (hearing) was dead: OpenAI Realtime rejected every connect with `3000 invalid_request_error.invalid_api_key`.** `openclaw.json` had been rewritten so `talk.providers.openai.apiKey` held a `{"source":"store","provider":"default","id":"OPENAI_API_KEY"}` SecretRef, but no such store provider exists — and `load_openai_key()` only resolved `source=="file"` refs, so it fell through and returned the reference **dict itself** as the bearer token. Every STT connect since then failed and retried every 5 s; the agent could not hear anything. Two-part fix: (1) the config ref was restored to the working `filemain` format; (2) `load_openai_key()` now also resolves `store` refs — trying the environment variable named by `id`, then the top level of every configured file-based secrets provider — and an unresolvable SecretRef now raises a clear error instead of ever being returned as the key. The underlying key was verified valid (`GET /v1/models` → 200); only the reference was broken. Also guards against any other unrecognized SecretRef shape. Kept in lockstep with the Mac fork (whose shared `_resolve_provider_api_key` helper gained the same `store` handling, fixing both its OpenAI and ElevenLabs loaders).
+
 ## v3.21.7 — 2026-09-08
 
 Kept in lockstep with the Mac fork's v3.21.7.
