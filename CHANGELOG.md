@@ -1,3 +1,7 @@
+## v3.21.6 — 2026-09-07
+
+### Fixed
+- **A `/speak` readout queued while Five's reply was still streaming was never read aloud — and every later player deadlocked.** The `/speak` handler sets `_speak_used_this_turn`, which makes `_consume_stream()` skip `speaker.final(reply)` at chat-final so the reply isn't double-spoken — but nothing ever told the turn's `StreamingSpeaker` it was finished. Its synth worker only breaks on an empty queue once `_final_given` is set, and its playback worker never receives the `"end"` item — so both spin forever, and the playback worker holds `_speak_lock` for the rest of the process's life. The queued `/speak` text waits on that lock forever (observed live: a 3116-char news roundup queued at 21:42 was still silent 10+ minutes later, `_is_speaking` stuck true with the dashboard's "Five is speaking…" banner up, and a third worker thread still waiting on the lock). `StreamingSpeaker` gained `abandon()` — sets `_final_given` so the workers drain what's already queued (the text streamed before the `/speak` arrived still plays) and exit cleanly — and `_consume_stream()` calls it in the `_speak_used_this_turn` branch at chat-final. The timeout branch already had the equivalent via `reset()`.
 ## v3.21.5 — 2026-09-07
 
 Kept in lockstep with the Mac fork's v3.21.5 — docs only.
