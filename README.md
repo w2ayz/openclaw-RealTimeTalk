@@ -1,7 +1,7 @@
 # OpenClaw RealTimeTalk
 
 Headless voice daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it via the
-OpenAI Realtime Transcription API, routes the transcript through the local OpenClaw gateway so
+OpenAI Realtime Transcription API **or Google Gemini 3.5 Transcribe Live**, routes the transcript through the local OpenClaw gateway so
 the AI Agent answers with full memory + tools, then synthesises the reply (Piper TTS for English;
 ElevenLabs → Edge TTS → OpenAI TTS → Piper for Chinese/mixed) and plays it through a USB speaker or
 headset. No browser, no display required — designed for always-on deployments.
@@ -14,7 +14,7 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 ## Features
 
 - Voice conversation routed through the AI Agent's main OpenClaw session (memory, tools, identity)
-- OpenAI Realtime **Transcription** API (`gpt-4o-transcribe`) with server-side VAD
+- **Dual STT engines**: OpenAI Realtime Transcription (`gpt-4o-transcribe`) or Google Gemini 3.5 Transcribe Live, with server-side VAD on both
 - **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
 - Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
@@ -52,6 +52,9 @@ Raspberry Pi (headless)
         ├── OpenAI Realtime ──► wss://api.openai.com/v1/realtime?intent=transcription
         │   (transcription)        server VAD + gpt-4o-transcribe
         │                          session.type: "transcription"
+        │
+        ├── Gemini Transcribe Live ──► wss://generativelanguage.googleapis.com/ws/...
+        │   (transcription)        raw v1alpha WebSocket + 16 kHz PCM16
         │
         ├── Audio IN ─────────► PipeWire AGC source (rtt_agc_source)
         │                        → static fallback: raw USB mic + 16x gain + gate
@@ -92,14 +95,18 @@ USB mic (C-Media PCM2902) ─► PipeWire rtt_agc_source
 │  • noise gate: if peak < 60 (AGC mode) → zeros      │
 │  • gain 2x trim (AGC already normalised)             │
 │  • skip if _busy (AI Agent is speaking)              │
-│  • asyncio.Queue → send to OpenAI                    │
-└─────────────────────────────────────────────────────┘
+│  • asyncio.Queue → send to STT engine (OpenAI or Gemini)│
+└─────────────────────────────────────────────────────────┘
    │
-   ▼  ws.send {input_audio_buffer.append, base64 PCM}
+   ▼  ws.send {input_audio_buffer.append, base64 PCM}   (OpenAI)
+      or {realtime_input: {audio: {data, mime_type: audio/pcm;rate=16000}}}   (Gemini)
 wss://api.openai.com/v1/realtime?intent=transcription
+   │   or wss://generativelanguage.googleapis.com/ws/...
    │
-   ▼  server-side VAD (threshold 0.3, 1100ms silence to end turn)
+   ▼  server-side VAD (threshold 0.3, 1100ms silence to end turn)   (OpenAI)
+      or voiceActivity ACTIVITY_START / ACTIVITY_END events          (Gemini)
 gpt-4o-transcribe  →  transcription.completed
+   │   or inputTranscription → text  (Gemini)
    │
    ▼  _handle_transcript()
        zhconv: Traditional Chinese → Simplified
@@ -308,7 +315,7 @@ Everything below except the OpenClaw gateway itself and the OpenAI API key is in
 | `pulseaudio-utils` (`pactl`) | Used throughout for PipeWire sink/source control |
 | **OpenClaw gateway running locally** | Required — daemon routes all AI through it. Not installed by this script |
 | OpenClaw 2026.5+ | Gateway protocol v4 required |
-| OpenAI API key | Installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. OAuth via OpenClaw `openai-codex` provider also supported |
+| OpenAI or Gemini API key | Installer prompts for an OpenAI key (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Add a Gemini key at `talk.providers.gemini.apiKey` to use Gemini as the default or fallback engine. OAuth via OpenClaw `openai-codex` provider also supported |
 | Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
 | espeak-ng | Required for Chinese TTS phonemisation |
 | `mpg123` | Decodes the Edge TTS skill's MP3 output to WAV (installer adds it) |
@@ -345,7 +352,7 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs all of `requirements.txt`
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected); resolves the optional edge-tts skill (sibling dir → `$OPENCLAW_WORKSPACE` → official path), installs Node.js + its `npm` deps if the skill is present, and records the path in the systemd unit as `RTT_EDGE_TTS_SCRIPT` — warns and continues if the skill is absent
 4. Downloads the CAM++ speaker-verification model
-5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set
+5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set; add a Gemini key later to switch or fall back to Gemini
 6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
 7. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service
@@ -357,6 +364,35 @@ Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SIL
 ---
 
 ## Configuration
+
+### STT engine selection
+
+By default the daemon uses **OpenAI Realtime Transcription**. It can also use **Google Gemini 3.5 Transcribe Live** as the default or fallback engine.
+
+Priority (first match wins):
+1. `--stt-engine gemini` (or `openai`) at startup
+2. `talk.stt.provider` in `~/.openclaw/openclaw.json`
+3. `talk.stt.fallback` if the primary provider's key is unavailable
+4. Whichever of `talk.providers.openai.apiKey` / `talk.providers.gemini.apiKey` is configured
+5. Default: OpenAI
+
+Example `openclaw.json` snippet:
+
+```json
+"talk": {
+  "providers": {
+    "openai": { "apiKey": "sk-..." },
+    "gemini": { "apiKey": "..." }
+  },
+  "stt": {
+    "provider": "gemini",
+    "fallback": "openai",
+    "vocabulary": ["Zeebot", "OpenClaw"]
+  }
+}
+```
+
+If only a Gemini key is present, the daemon starts in Gemini-only mode with no OpenAI key required.
 
 ### Audio devices
 

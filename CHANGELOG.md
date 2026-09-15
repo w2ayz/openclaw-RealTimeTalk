@@ -1,3 +1,14 @@
+## v3.22.0 — 2026-09-15
+
+### Added
+- **Gemini 3.5 Transcribe Live as an alternative / fallback STT engine.** Same `BaseVoiceSession` refactor as the Mac fork: shared mic capture, wake/sleep phrases, owner-only speaker verification, and agent routing, with engine-specific `OpenAIRealtimeSession` and `GeminiTranscribeSession` subclasses. Engine selection follows CLI `--stt-engine`, then `talk.stt.provider/fallback` in `openclaw.json`, then whichever API key is available, defaulting to OpenAI. Gemini uses the raw v1alpha WebSocket, 24 kHz capture downsampled to 16 kHz per chunk, `realtime_input` audio, `voiceActivity` ACTIVITY_START/ACTIVITY_END for owner-only segment capture, `inputTranscription` finals, and a proactive reconnect at 9 minutes to stay ahead of the ~10-minute session cap. Custom vocabulary is built at startup from the agent name, `OpenClaw`, and `talk.stt.vocabulary`. The dashboard `#dp` panel now also shows the active STT engine.
+
+### Changed
+- `load_openai_key()` is now permissive: it logs a warning and returns `""` when no OpenAI key is configured, so the daemon can default to Gemini for users without an OpenAI key. A missing key for the *selected* engine remains fatal.
+
+### Pi-specific
+- Ported to PipeWire/ALSA capture, Piper TTS, OpenWakeWord, DTMF/HTTP controls, and the Pi-specific `_last_activity` idle timer. The deep-sleep DTMF handler now closes the STT WebSocket passed to `_send_mic` instead of the unrelated gateway `self._ws`.
+
 ## v3.21.8 — 2026-09-08
 
 ### Fixed
