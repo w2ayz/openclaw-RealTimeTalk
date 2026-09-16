@@ -369,25 +369,39 @@ Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SIL
 
 By default the daemon uses **OpenAI Realtime Transcription**. It can also use **Google Gemini 3.5 Transcribe Live** as the default or fallback engine.
 
+Engine settings live in the daemon's own config file,
+`~/.openclaw/workspace/rtt_stt_config.json` — NOT in `openclaw.json`. OpenClaw's
+TalkSchema has no `stt` key, so a `talk.stt` block there gets stripped by every
+OpenClaw config rewrite, blocks config hot-reloads, and fails
+`openclaw config validate`. The legacy `openclaw.json` `talk.stt` block is still
+read if the daemon config file is absent, so old configs keep working until
+migrated.
+
 Priority (first match wins):
 1. `--stt-engine gemini` (or `openai`) at startup
-2. `talk.stt.provider` in `~/.openclaw/openclaw.json`
-3. `talk.stt.fallback` if the primary provider's key is unavailable
-4. Whichever of `talk.providers.openai.apiKey` / `talk.providers.gemini.apiKey` is configured
-5. Default: OpenAI
+2. `provider` in `~/.openclaw/workspace/rtt_stt_config.json`
+3. `talk.stt.provider` in `~/.openclaw/openclaw.json` (legacy)
+4. `fallback` if the primary provider's key is unavailable (same source order)
+5. Whichever of `talk.providers.openai.apiKey` / `talk.providers.gemini.apiKey` is configured
+6. Default: OpenAI
 
-Example `openclaw.json` snippet:
+Example `~/.openclaw/workspace/rtt_stt_config.json`:
+
+```json
+{
+  "provider": "gemini",
+  "fallback": "openai",
+  "vocabulary": ["Zeebot", "OpenClaw"]
+}
+```
+
+`openclaw.json` only needs the provider keys:
 
 ```json
 "talk": {
   "providers": {
     "openai": { "apiKey": "sk-..." },
     "gemini": { "apiKey": "..." }
-  },
-  "stt": {
-    "provider": "gemini",
-    "fallback": "openai",
-    "vocabulary": ["Zeebot", "OpenClaw"]
   }
 }
 ```
