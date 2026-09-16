@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.5"
+__version__ = "3.22.6"
 
 import argparse
 import asyncio
@@ -1461,12 +1461,19 @@ def _load_json(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
-def load_openai_key() -> str:
-    cfg = _load_json(OPENCLAW_CONFIG)
+def _resolve_provider_api_key(cfg: dict, provider: str) -> str:
+    """Read talk.providers.<provider>.apiKey, resolving OpenClaw SecretRefs
+    ({"source":"file","provider":"...","id":"/a/b/c"},
+     {"source":"store","provider":"...","id":"NAME"}) if present.
+
+    Returns "" when the key is unset or its SecretRef is unresolvable — never
+    the reference dict itself. A missing key for the *selected* STT engine is
+    what main() treats as fatal, not a missing key in general.
+    """
     key = (
         cfg.get("talk", {})
            .get("providers", {})
-           .get("openai", {})
+           .get(provider, {})
            .get("apiKey", "")
     )
     # Resolve OpenClaw SecretRef: {"source":"file","provider":"...","id":"/a/b/c"}
@@ -1497,20 +1504,38 @@ def load_openai_key() -> str:
                     continue
                 key = secrets.get(name, "")
                 if not key:
-                    talk_provider = cfg.get("talk", {}).get("provider", "openai")
                     key = (secrets.get("providers", {})
-                                  .get(talk_provider, {})
+                                  .get(provider, {})
                                   .get("apiKey", ""))
                 if key:
                     break
     if isinstance(key, dict):
         key = ""  # unresolvable SecretRef — never return the reference itself
-    if not key:
-        raise RuntimeError(
-            "No OpenAI API key at talk.providers.openai.apiKey in openclaw.json "
-            "(or its SecretRef is unresolvable)"
-        )
-    return key
+    return key or ""
+
+
+def load_openai_key() -> str:
+    """Returns the OpenAI API key if present, else "" — STT may fall back to
+    Gemini when no OpenAI key is configured."""
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "openai")
+    except Exception as e:
+        log.warning("Could not load OpenAI key: %s", e)
+        return ""
+
+
+def load_gemini_key() -> str:
+    """Returns the Gemini API key if present, else "".
+
+    v3.22.0–v3.22.5 read this in main() without ever defining it, so every
+    start raised NameError: name 'load_gemini_key' is not defined. Ported from
+    the Mac fork, which has always had it.
+    """
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "gemini")
+    except Exception as e:
+        log.warning("Could not load Gemini key: %s", e)
+        return ""
 
 def load_gateway_token() -> str:
     cfg = _load_json(OPENCLAW_CONFIG)
@@ -2145,6 +2170,8 @@ def _openai_tts(text: str, output_path: str) -> bool:
         except Exception as e:
             log.error("OpenAI TTS: cannot load API key: %s", e)
             return False
+        if not _openai_tts_key:
+            return False   # no OpenAI key configured — caller falls back to Piper
     payload = _json.dumps({
         "model": OPENAI_TTS_MODEL,
         "input": text,
@@ -8174,4 +8201,5 @@ if __name__ == "__main__":
         args.input_device,
         args.alsa_output,
         args.session_key,
+        stt_engine=args.stt_engine,
     ))

@@ -1,3 +1,15 @@
+## v3.22.6 — 2026-09-16
+
+### Fixed
+- **The daemon could not start at all: `load_gemini_key()` was called but never defined, so every run of v3.22.0–v3.22.5 died with `NameError: name 'load_gemini_key' is not defined`.** `main()` calls it unconditionally at startup (right beside `load_openai_key()`), so this was not a Gemini-only or edge-case failure — *any* start, on any config, crashed before the engine was ever resolved. Because the systemd unit sets `Restart=no`, the service then stayed down rather than crash-looping, making the failure look like "RTT silently stopped" instead of a startup error. The v3.22.0 port took the call site from the Mac fork but not the function itself; the Mac has always had it, which is why the fork was unaffected and the gap went unnoticed. An AST sweep of all 8,177 lines confirms it was the only undefined name in the file.
+- **`load_openai_key()` still raised when no OpenAI key was configured, contradicting the v3.22.0 changelog and breaking Gemini-only installs.** v3.22.0 was supposed to make the loader permissive so the daemon could default to Gemini for users without an OpenAI key; that change was never ported either, so a Pi with only a Gemini key exited with `No OpenAI API key at talk.providers.openai.apiKey`. Both loaders now share a ported `_resolve_provider_api_key(cfg, provider)` helper (the Mac fork's), which resolves `file` and `store` SecretRefs and returns `""` when the key is unset or unresolvable. A missing key for the *selected* engine is still fatal — `main()` already guards that with a clear error and `sys.exit(1)` — so the guard moved to the right layer rather than being lost.
+- **`--stt-engine` was silently ignored.** argparse defined it and `main()` read it into `_cli_stt_engine`, but the entrypoint never passed `args.stt_engine` through, so the parameter always fell back to `None` and the CLI override documented in README/Deployment.md did nothing. The entrypoint now passes it, matching the Mac fork. Engine selection via `rtt_stt_config.json` and key availability was unaffected.
+- **`_openai_tts()` would call the API with an empty bearer token** once the loader went permissive; it now returns `False` immediately so the TTS chain falls through to Piper. (`_openai_tts_key` is cached lazily, so a `""` result previously stuck and re-attempted a doomed 401 on every Chinese segment.)
+
+### Notes
+- Pi-only release — the Mac fork already had `load_gemini_key()` and the permissive loader, and already passed `--stt-engine`. Nothing to port back.
+- Unrelated cosmetic leftover, unchanged here: `--stt-engine`'s help text advertises `openai,gemini` / `gemini,openai` / `auto` forms that `_resolve_stt_engine()` does not implement — it accepts only `openai` or `gemini`, and anything else falls through to the OpenAI branch while still being reported on the dashboard. Identical on the Mac.
+
 ## v3.22.5 — 2026-09-16
 
 ### Changed
