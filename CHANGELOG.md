@@ -1,3 +1,8 @@
+## v3.22.3 — 2026-09-15
+
+### Fixed
+- **Auto-sleep log line names the actual STT engine** (`_active_stt_engine`) instead of a hardcoded "disconnecting from OpenAI" (predates Gemini support). Same fix as the Mac fork v3.22.3.
+
 ## v3.22.2 — 2026-09-15
 
 ### Fixed

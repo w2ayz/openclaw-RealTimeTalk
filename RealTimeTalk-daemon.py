@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.2"
+__version__ = "3.22.3"
 
 import argparse
 import asyncio
@@ -4373,7 +4373,7 @@ class BaseVoiceSession:
 
 
     async def _idle_watcher(self, ws):
-        """Close the OpenAI WebSocket after IDLE_SLEEP_MINS of no activity."""
+        """Close the STT WebSocket after IDLE_SLEEP_MINS of no activity."""
         import time as _ti
         while not self.stop_event.is_set():
             await asyncio.sleep(30)
@@ -4382,7 +4382,8 @@ class BaseVoiceSession:
             idle = _ti.time() - _last_activity[0]
             if idle >= IDLE_SLEEP_MINS * 60:
                 mins = int(idle / 60)
-                log.info("Auto-sleep: idle %d min — disconnecting from OpenAI", mins)
+                log.info("Auto-sleep: idle %d min — disconnecting %s", mins,
+                         (_active_stt_engine[0] or _cli_stt_engine[0] or "openai").upper())
                 _log_entry("system", f"Auto-sleep after {mins} min idle. Say 'Hey Jarvis' or press Wake to resume.")
                 if self._monitoring:
                     self._monitoring = False
