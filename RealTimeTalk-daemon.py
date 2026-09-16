@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.1"
+__version__ = "3.22.2"
 
 import argparse
 import asyncio
@@ -508,6 +508,8 @@ _speak_lock           = threading.Lock()  # serializes speak() calls — two con
                                            # disappear mid-playback of the other one
 _current_think_task:  list = [None]   # asyncio.Task for current gw.ask(); cancelled by /interrupt
 _last_activity:       list = [0.0]    # epoch of last wake/route event; seeded in main()
+_cli_stt_engine:      list = [None]   # --stt-engine override from CLI (v3.22.0 used this without declaring it — NameError at startup)
+_active_stt_engine:   list = [None]   # engine actually in use (resolved each session); drives the dashboard #dp label
 _idle_disconnected:   list = [False]  # True when auto-sleep closed the OpenAI WebSocket
 _wake_event:          list = [None]   # threading.Event; set by /wake to reconnect from sleep
 # Live read-along state for the /speech SSE endpoint — which part of the reply
@@ -4601,7 +4603,7 @@ def _dashboard_dynamic(sess) -> dict:
         f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
         f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
         f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
-        f' &ensp;&#128483; TTS: {_tts_seg} &ensp;&#127897; STT: {_cli_stt_engine[0] or "openai"}</div>'
+        f' &ensp;&#128483; TTS: {_tts_seg} &ensp;&#127897; STT: {_active_stt_engine[0] or _cli_stt_engine[0] or "openai"}</div>'
     )
 
     nav_html = (
@@ -7988,6 +7990,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                 break
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
+        _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")

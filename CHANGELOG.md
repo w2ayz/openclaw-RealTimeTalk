@@ -1,3 +1,9 @@
+## v3.22.2 — 2026-09-15
+
+### Fixed
+- **`_cli_stt_engine` was never declared** — v3.22.0 read it in `_resolve_stt_engine()`, the dashboard template, and `main()`, but the module-level declaration was missing, so the first engine resolution raised `NameError` and the daemon would crash-loop on startup (compile-only checks didn't catch it; still awaiting a live Pi test).
+- **Dashboard `#dp` STT label now shows the resolved engine** (`_active_stt_engine`, set by `main()` each session) instead of only the CLI flag — a config-selected Gemini session previously displayed `STT: openai`. Same fix as the Mac fork v3.22.2.
+
 ## v3.22.1 — 2026-09-15
 
 ### Fixed
