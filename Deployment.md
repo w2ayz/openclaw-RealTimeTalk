@@ -22,7 +22,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running locally | RealTimeTalk routes all AI through it (`ws://127.0.0.1:18789`, protocol v4). Won't start without it. |
 | OpenClaw 2026.5+ | Gateway protocol v4 required. |
-| OpenAI API key | Installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. |
+| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. Gemini: `AIza...` key from AI Studio, stored at `talk.providers.gemini.apiKey`. See §3. |
 | ElevenLabs API key (optional) | First tier of the Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper). Read from `~/.openclaw/secrets/elevenlabs`, not `openclaw.json` — see [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 | edge-tts skill + Node.js (optional) | Second tier of that chain — free, no key, native zh/en neural voices. Install at `~/.openclaw/workspace/skills/edge-tts/`; installer resolves it. See [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 
@@ -83,6 +83,7 @@ git, all of it is safe to delete to reset that specific piece of state:
 |---|---|
 | `~/.openclaw/workspace/speaker_cal_store.json` | Per-speaker volume/SW calibration |
 | `~/.openclaw/workspace/rtt_sleep_state.json` | Whether the daemon was asleep at last shutdown (restored on restart) |
+| `~/.openclaw/workspace/rtt_stt_config.json` | Which STT engine to use and (optionally) the fallback: `{"provider": "gemini", "fallback": "openai"}`. Written by the installer; edit this file to switch engines (v3.22.4+). Never put this in `openclaw.json` — the gateway strips unknown `talk.*` keys. |
 | `~/.openclaw/workspace/rtt_voice_profile.json` | Owner-only voice enrollment (mic) |
 | `~/.openclaw/workspace/rtt_voice_profile_radio.json` | Owner-only voice enrollment (radio path — voice characteristics differ enough over radio that a mic-enrolled profile won't reliably match) |
 | `~/.openclaw/workspace/rtt_voice_mode.json` | Owner-only on/off + similarity threshold |
@@ -92,22 +93,53 @@ git, all of it is safe to delete to reset that specific piece of state:
 
 ## 3. Adding API keys
 
-### 3.1 OpenAI
+### 3.1 STT provider key(s) — OpenAI and/or Gemini
 
-The installer prompts for this (hidden input) if it's not already set. To set
-it by hand:
+Either provider works on its own. The installer prompts for whichever you
+choose (choice menu: [1] OpenAI / [2] Gemini / [3] both / [4] keep existing,
+hidden input, verified against the provider API). To set keys by hand:
 
 ```bash
 python3 - <<'PY'
 import json, os
-KEY = "sk-..."   # your OpenAI key — regular sk-... or the openai-codex OAuth profile both work
+KEY    = "sk-..."    # your OpenAI key — regular sk-... or the openai-codex OAuth profile both work; or ""
+GEMKEY = "AIza..."   # your Gemini API key from AI Studio; or ""
 path = os.path.expanduser("~/.openclaw/openclaw.json")
 d = json.load(open(path))
-d.setdefault("talk", {}).setdefault("providers", {}).setdefault("openai", {})["apiKey"] = KEY
+p = d.setdefault("talk", {}).setdefault("providers", {})
+if KEY:
+    p.setdefault("openai", {})["apiKey"] = KEY
+if GEMKEY:
+    p.setdefault("gemini", {})["apiKey"] = GEMKEY
 json.dump(d, open(path, "w"), indent=2)
 os.chmod(path, 0o600)
 PY
 ```
+
+### 3.2 STT engine selection (which provider, and the fallback)
+
+Since v3.22.4 the engine choice lives in the daemon's **own** config file,
+`~/.openclaw/workspace/rtt_stt_config.json` — not in `openclaw.json`
+(`talk.stt` there was never an official key: OpenClaw's gateway strips
+unknown `talk.*` keys on every config write, which is why the setting kept
+disappearing on the Mac fork).
+
+```json
+{ "provider": "gemini", "fallback": "openai" }
+```
+
+- `provider` — the engine to boot with: `openai` (Realtime transcription)
+  or `gemini` (Gemini 3.5 Transcribe Live).
+- `fallback` — used when `provider` is set but its key is missing: the daemon
+  boots on the fallback provider instead (resolved at startup and on each
+  wake from sleep). It is **not** a live-failure failover mid-session.
+
+Resolution order: `--stt-engine` CLI flag > this file > legacy
+`openclaw.json` `talk.stt` (still honored for unmigrated configs, but don't
+add it back) > auto-detect from available keys > `openai`.
+
+To switch engines on a running install, edit the file and restart:
+`systemctl --user restart openclaw-realtimetalk`.
 
 ### 3.5. Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper)
 
@@ -152,7 +184,7 @@ skips what's already installed. The installer:
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs everything in `requirements.txt`
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected: aarch64/x86_64/armv7l); resolves the optional edge-tts skill, installs Node.js + its deps if present, and records `RTT_EDGE_TTS_SCRIPT` in the systemd unit (§3.5)
 4. Downloads the CAM++ speaker-verification model (~28MB)
-5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set
+5. Prompts for STT provider keys — OpenAI and/or Gemini (choice menu, hidden input, each key verified against its provider API before being written to `openclaw.json`); writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json` (§3.2). Lenient: warns and continues if no key is configured, so an offline install still completes
 6. Lists detected audio devices for reference — no manual device index needed; PipeWire's own default source/sink is followed at runtime, changeable from the dashboard
 7. **Prompts for agent name and wake phrase** (see [§5](#5-agent-name--wake-phrase) below), then writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service

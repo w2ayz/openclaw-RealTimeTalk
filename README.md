@@ -352,7 +352,7 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs all of `requirements.txt`
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected); resolves the optional edge-tts skill (sibling dir → `$OPENCLAW_WORKSPACE` → official path), installs Node.js + its `npm` deps if the skill is present, and records the path in the systemd unit as `RTT_EDGE_TTS_SCRIPT` — warns and continues if the skill is absent
 4. Downloads the CAM++ speaker-verification model
-5. Prompts (hidden input) for an OpenAI API key if `talk.providers.openai.apiKey` isn't already set; add a Gemini key later to switch or fall back to Gemini
+5. Prompts for STT provider keys (choice menu: OpenAI / Gemini / both / keep existing) — hidden input, each key verified against its provider API; writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json`. Lenient: warns and continues if neither key is configured
 6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
 7. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service

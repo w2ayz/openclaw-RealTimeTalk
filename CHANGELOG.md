@@ -1,3 +1,8 @@
+## v3.22.5 — 2026-09-16
+
+### Changed
+- **Installer + Deployment.md now support Gemini-only, OpenAI-only, or both STT providers.** Installer step 5 is an interactive choice menu — `[1] OpenAI Realtime / [2] Gemini Transcribe Live / [3] Both / [4] keep existing` — instead of an OpenAI-only prompt: each key is entered with hidden input, format-checked (`sk-...` / `AIza...`, override confirm), and verified against the provider API (best-effort; `401`/`403` keys are refused and not saved; offline installs continue with a warning). Existing keys prompt "Enter to keep, or paste a replacement". With both keys you pick the default engine and the other is written as the fallback; the engine choice goes to `~/.openclaw/workspace/rtt_stt_config.json` (v3.22.4's daemon-owned file — the installer never writes `talk.stt` to `openclaw.json`). Lenient like before: warns and continues if no key is configured. Deployment.md restructured to match (§3.1 provider keys, §3.2 engine selection, §4 step list). Same change as the Mac fork v3.22.5.
+
 ## v3.22.4 — 2026-09-16
 
 ### Changed
