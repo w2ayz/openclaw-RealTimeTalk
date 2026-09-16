@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.0"
+__version__ = "3.22.1"
 
 import argparse
 import asyncio
@@ -4777,6 +4777,14 @@ class GeminiTranscribeSession(BaseVoiceSession):
                         tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in pending:
                         task.cancel()
+
+                    # Auto-sleep closed the socket from _idle_watcher, which
+                    # expects main() to hold at the wake gate. Without this
+                    # return the loop reconnected ~every 30 s while asleep,
+                    # re-firing the idle watcher and spamming the dashboard.
+                    if _idle_disconnected[0]:
+                        return
+
             except Exception as e:
                 log.error("Gemini session error: %s", e)
                 raise

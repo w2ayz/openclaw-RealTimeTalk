@@ -1,3 +1,8 @@
+## v3.22.1 — 2026-09-15
+
+### Fixed
+- **Gemini engine auto-sleep reconnect loop.** `GeminiTranscribeSession._connect_and_run`'s internal reconnect loop (for the 10-min proactive reset) never checked sleep state: when auto-sleep fired, `_idle_watcher` closed the socket and the loop reconnected immediately, re-firing the idle watcher ~every 30 s while asleep ("Auto-sleep after N min idle" spam, endless Gemini reconnects). The loop now returns to `main()` when `_idle_disconnected` is set, so the daemon holds at the wake gate like the OpenAI engine. Same bug and fix as the Mac fork v3.22.1 (`_sleep_requested` there).
+
 ## v3.22.0 — 2026-09-15
 
 ### Added
