@@ -1,3 +1,26 @@
+## v3.22.11 — 2026-09-17
+
+### Added
+- **Pre-commit quality gate + repo-local `CLAUDE.md`.** `.githooks/pre-commit`
+  runs `ruff check --select F821,E9` (undefined names, syntax errors) on
+  staged Python files and blocks the commit on a hit. It exists because of
+  the `load_gemini_key` bug fixed in v3.22.6 — called in `main()` but never
+  defined, a `NameError` on every startup for 6 versions, undetected because
+  nothing exercised that code path — and because the Mac fork independently
+  shipped the same class of bug once too (v3.21.0, a bare `time.monotonic()`
+  with no top-level `import time`). Both are syntactically valid Python;
+  `py_compile` can't catch either. Activate once per clone with
+  `git config core.hooksPath .githooks` — this file is tracked, so it
+  survives cloning, unlike `.git/hooks/`. (`.claude/` stays fully gitignored
+  per the existing policy, so there's no `PreToolUse` auto-activation here —
+  the `git config` step is a manual, one-time command; `CLAUDE.md` says so
+  plainly.) `CLAUDE.md` also documents the two-fork version-lock convention
+  and — specific to this fork — that it has shipped multiple bugs only a
+  live Pi run would catch, so the hook is a floor, not a substitute for an
+  actual boot on real hardware. Same tooling change as the Mac fork v3.22.6
+  / v3.22.7 (that fork's `.claude/` policy landed a version later, once this
+  repo's `60c6390` made the right call clear).
+
 ## v3.22.10 — 2026-09-16
 
 ### Changed
