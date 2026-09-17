@@ -1,3 +1,13 @@
+## v3.22.10 — 2026-09-16
+
+### Changed
+- **ElevenLabs voice switched from Rachel to Lily, and the model from `eleven_multilingual_v2` to `eleven_v3`.** The Pi's primary TTS voice is now `pFZP5JQG7iQjIQuC4Bku` ("Lily - Velvety Actress") on `eleven_v3` — the same voice and model the Mac fork has been using — so the two devices now sound identical on Chinese and mixed replies instead of speaking in two different English-native voices. Since ElevenLabs serves effectively every Chinese/mixed reply (the Edge/OpenAI/Piper tiers below it only run when it fails), this is the voice actually heard day to day. Constants only; no logic changed.
+
+### Notes
+- **Verified before shipping, because the failure mode here is silent.** The Pi requests `output_format=pcm_22050` with `Accept: audio/pcm` (no MP3 decode step, unlike the Mac), and a model that rejected PCM would make `_elevenlabs_tts()` return `False` and drop the whole chain to Edge TTS — a different voice, no error, nothing in the journal. Probed the live API with the Pi's own key: Lily + `eleven_v3` + `pcm_22050` returns HTTP 200 (222 KB of PCM for a 20-char sample), as does the Rachel/`eleven_multilingual_v2` baseline. `pcm_16000` and `pcm_24000` also work. `pcm_44100` returns HTTP 403 `subscription_required` (Pro tier and above) — not used by the Pi, but worth knowing before raising `PIPER_SAMPLE_RATE`.
+- The Mac fork already runs Lily on `eleven_v3`; this change removes a voice divergence rather than introducing one. Its `SAY_VOICE_ZH`/`SAY_VOICE_EN` offline tier remains Mac-only, and the Pi's Piper tier remains Pi-only — the forks' chains are mirror images at the bottom, unchanged here.
+- Companion doc fix, outside this repo: `~/.openclaw/workspace/AGENTS.md` claimed the Pi ran OpenAI `gpt-4o-transcribe` (stale since v3.22.0 — it runs Gemini) and described Piper as the TTS engine with Chinese "auto-selected when reply is >20% CJK". `_is_chinese_text()` is `any(_is_cjk(c) for c in text)` — a **single** CJK character routes the whole reply to the network chain, not a percentage. Both corrected.
+
 ## v3.22.9 — 2026-09-16
 
 ### Changed

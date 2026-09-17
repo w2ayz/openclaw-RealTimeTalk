@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.9"
+__version__ = "3.22.10"
 
 import argparse
 import asyncio
@@ -92,8 +92,8 @@ OPENAI_TTS_VOICE_ZH   = "nova"
 OPENAI_TTS_SAMPLE_RATE = 24000     # OpenAI TTS outputs 24 kHz; resampled to PIPER_SAMPLE_RATE
 _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 
-ELEVENLABS_VOICE_ID    = "21m00Tcm4TlvDq8ikWAM"   # Rachel — multilingual v2
-ELEVENLABS_MODEL       = "eleven_multilingual_v2"
+ELEVENLABS_VOICE_ID    = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress" — matches the Mac fork
+ELEVENLABS_MODEL       = "eleven_v3"
 ELEVENLABS_SECRETS_FILE = os.path.expanduser("~/.openclaw/secrets/elevenlabs")
 _elevenlabs_key: str   = ""        # populated lazily from secrets file
 
