@@ -1,3 +1,14 @@
+## v3.22.8 — 2026-09-16
+
+### Fixed
+- **Speaking Chinese to RTT did nothing: the EN/ZH language gate silently discarded every Chinese sentence that contained Chinese punctuation.** `_is_english_or_chinese()` accepted only ASCII, CJK ideographs (`0x4E00–0x9FFF`, `0x3400–0x4DBF`) and whitespace — so `？` (U+FF1F, Fullwidth Forms), `。` (U+3002, CJK Symbols and Punctuation), `，` (U+FF0C) and `！` (U+FF01) hit the catch-all `return False` and the whole utterance was thrown away. Almost every spoken Chinese sentence ends in one of those, so Chinese appeared completely non-functional while English (whose `?` is ASCII) worked normally. Chinese *transcription* was never at fault — Gemini's transcripts were accurate; the text was dropped after the owner check, which is why the journal showed `Voice check PASS` followed by silence. Two things hid it: the drop logs at `log.debug` (invisible at default level), and punctuation-free input (`你好`) passed, so the failure looked intermittent. Reported from live use 2026-09-16.
+  Fix ports the Mac fork's `_is_english_or_chinese()` verbatim (byte-identical, verified), which short-circuits on `has_cjk` and accepts the CJK-punctuation/fullwidth blocks (`0x3000–0x303F`, `0xFF00–0xFFEF`) before the accented-Latin reject. Also raises the pure-Latin langdetect threshold from ≥2 to ≥3 words and moves its rejection log from `info` to `debug`, both as on the Mac. Verified against the actual transcripts from the affected session plus Japanese/Korean/Arabic/Cyrillic negatives — 14/14 expected outcomes.
+
+### Notes
+- Pi-only port; **the Mac fork never had this bug** — it has carried the fixed implementation all along, which is why this is a port rather than a shared fix. Worth remembering as a general lesson: the Pi's `_is_english_or_chinese()` had silently diverged from the Mac's.
+- Pre-existing cosmetic nit carried over verbatim for parity: the `all_ascii` local is assigned but never read, in both forks' copies of this function.
+- The drop path itself (`log.debug("Dropped non-EN/ZH…")` in the transcript handler) is still debug-level, so future gate rejections remain invisible in the journal — raised separately, not changed here.
+
 ## v3.22.7 — 2026-09-16
 
 ### Fixed

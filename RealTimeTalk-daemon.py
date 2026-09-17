@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.7"
+__version__ = "3.22.8"
 
 import argparse
 import asyncio
@@ -1336,43 +1336,43 @@ _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating
 
 def _is_english_or_chinese(text: str) -> bool:
     """Return True only if the transcript appears to be English or Chinese.
-    Filters out Japanese (hiragana/katakana), Arabic, Cyrillic, Korean, etc.
-    that gpt-4o-transcribe hallucinates when audio is noisy.
+    Filters out Japanese, Arabic, Cyrillic, Korean, and other Latin-script
+    languages (Dutch, French, German, etc.) that gpt-4o-transcribe may
+    hallucinate from background audio.
     """
-    # Reject if it contains Japanese kana, Arabic, Cyrillic, Korean, etc.
+    # Reject non-Latin/non-CJK scripts via unicode range (fast path)
     reject_ranges = (
-        (0x3040, 0x30FF),   # hiragana + katakana (Japanese)
+        (0x3040, 0x30FF),   # hiragana + katakana
         (0x0600, 0x06FF),   # Arabic
         (0x0400, 0x04FF),   # Cyrillic
         (0xAC00, 0xD7AF),   # Korean Hangul
         (0x0900, 0x097F),   # Devanagari
     )
+    has_cjk = False
+    all_ascii = True
     for ch in text:
         cp = ord(ch)
         if any(lo <= cp <= hi for lo, hi in reject_ranges):
             return False
-    # Accept if all characters are ASCII or CJK (Chinese/Japanese kanji — kanji
-    # without kana means it's Chinese in practice here)
-    for ch in text:
-        cp = ord(ch)
-        if cp <= 0x7F:
-            continue  # ASCII = English
         if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
-            continue  # CJK unified ideographs = Chinese
-        if ch in ' \t\n\r':
-            continue
-        # Anything else (accented Latin for German/French/etc.) → reject
-        return False
-    # Pure ASCII — use langdetect on ≥2-word texts to catch other Latin-script
-    # languages (French, Dutch, German, etc.) that GPT-4o hallucinates.
-    # Single words are handled by the extended short-word noise guard downstream
-    # (single words < 9 chars are dropped unless whitelisted).
-    # langdetect is unreliable on single short words so we skip it for them.
-    if _HAVE_LANGDETECT and len(text.split()) >= 2:
+            has_cjk = True
+            all_ascii = False
+        elif 0x3000 <= cp <= 0x303F or 0xFF00 <= cp <= 0xFFEF:
+            pass  # CJK punctuation / fullwidth — ok
+        elif cp > 0x7F and ch not in ' \t\n\r':
+            # Accented Latin (French/German/etc.) — reject
+            return False
+
+    if has_cjk:
+        return True  # Chinese confirmed
+
+    # Pure ASCII — could be English or any other Latin-script language.
+    # Use langdetect on texts with >=3 words to verify; short phrases pass.
+    if _HAVE_LANGDETECT and len(text.split()) >= 3:
         try:
             lang = _langdetect(text)
             if lang not in ("en", "zh-cn", "zh-tw"):
-                log.info("langdetect rejected %r as %r", text[:60], lang)
+                log.debug("langdetect rejected %r as %r", text[:60], lang)
                 return False
         except _LangDetectException:
             pass  # inconclusive — let it through
