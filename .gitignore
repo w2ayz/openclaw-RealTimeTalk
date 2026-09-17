@@ -4,3 +4,7 @@ __pycache__/
 *.swp
 .DS_Store
 ~/.openclaw/secrets/
+
+# Claude Code session artifacts — local only. This repo is public, and these
+# files (transcripts, worktrees, scratch scripts) must never be committed.
+.claude/
