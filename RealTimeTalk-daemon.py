@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.8"
+__version__ = "3.22.9"
 
 import argparse
 import asyncio
@@ -4179,11 +4179,11 @@ class BaseVoiceSession:
         #   "any"           → all languages pass through
         if self._multilang in ("off", "en-zh"):
             if not _is_english_or_chinese(transcript):
-                log.debug("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
+                log.info("Dropped non-EN/ZH (mode=%s): %r", self._multilang, transcript)
                 return
         elif self._multilang == "whitelist":
             if not _is_in_multilang_whitelist(transcript):
-                log.debug("Dropped off-whitelist: %r", transcript)
+                log.info("Dropped off-whitelist: %r", transcript)
                 return
 
         # Monitoring-only mode: passively log captured segments (no AI Agent/TTS).

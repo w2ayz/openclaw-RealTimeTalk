@@ -1,3 +1,11 @@
+## v3.22.9 — 2026-09-16
+
+### Changed
+- **Language-gate rejections now log at `info`, not `debug`.** A transcript dropped by the EN/ZH gate or the whitelist gate was invisible in the journal at default log level, so the symptom was an utterance that passed the owner check and then simply drew no reply — indistinguishable from the agent ignoring you. Both drop paths now report at `info`; the message text is unchanged and there is no behavioural change. This is the exact failure mode that hid the v3.22.8 Chinese-punctuation bug: the gate was discarding every Chinese sentence containing `？` `。` `，` `！` and logging nothing to say so, which is why it presented as "RTT ignores Chinese" rather than as a filter rejection.
+
+### Notes
+- Log-level change only. Ported to the Mac fork as v3.22.4 so the shared core stays aligned.
+
 ## v3.22.8 — 2026-09-16
 
 ### Fixed
