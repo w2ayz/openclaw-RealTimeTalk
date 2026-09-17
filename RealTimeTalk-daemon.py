@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.6"
+__version__ = "3.22.7"
 
 import argparse
 import asyncio
@@ -8033,13 +8033,18 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             _wake_event[0].clear()
             _idle_disconnected[0] = False
             _last_activity[0] = __import__("time").time()
-            log.info("Wake signal received — reconnecting to OpenAI…")
+            # The wake message is logged below, once _resolve_stt_engine() has
+            # run — naming a provider here would have to guess, and it used to
+            # hardcode "OpenAI", misreporting every Gemini session.
             _woke_from_sleep = True
             if stop_event.is_set():
                 break
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
+        if _woke_from_sleep:
+            log.info("Wake signal received — connecting to the %s STT engine…",
+                     engine_name.upper())
         if engine_name == STT_ENGINE_GEMINI:
             if not gemini_key:
                 log.error("Gemini STT requested but no Gemini API key configured")

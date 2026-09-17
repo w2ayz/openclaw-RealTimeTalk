@@ -1,3 +1,11 @@
+## v3.22.7 — 2026-09-16
+
+### Fixed
+- **The wake log line named the wrong STT engine.** Every wake printed `Wake signal received — reconnecting to OpenAI…` regardless of which engine was configured, so a Gemini session was reported as OpenAI in the journal — most misleading exactly when reading the journal to diagnose an STT problem. It now reports the real engine once `_resolve_stt_engine()` has run: `Wake signal received — connecting to the GEMINI STT engine…`, using the same `.upper()` label idiom as v3.22.3's auto-sleep line. The message could not simply be made dynamic in place — it sits *before* the engine is resolved and would have had to guess, which is precisely how the hardcoded "OpenAI" got there.
+
+### Notes
+- Pi-only. The Mac fork still hardcodes the equivalent line (`Wake received — reconnecting to OpenAI…`); worth porting back. This is the wake-side twin of v3.22.3, which fixed only the auto-sleep side.
+
 ## v3.22.6 — 2026-09-16
 
 ### Fixed
