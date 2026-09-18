@@ -1,3 +1,24 @@
+## v3.22.12 — 2026-09-17
+
+### Notes — version-number alignment only, no functional change
+
+The Mac fork ended up at v3.22.12 after discovering its `feat/gemini-stt-
+engine` branch had already been merged into its `main` weeks ago and had
+kept diverging unnoticed all session (two independent fixes for the same
+bugs, one pair even colliding on the same version number with different
+content, plus two older fixes -- macOS Keychain `SecretRef` resolution
+and an ARM ffmpeg-path fix -- the branch never had). Reconciling that cost
+one extra version number on the Mac side that this fork never needed.
+
+Audited every Mac daemon.py commit since the last confirmed-synced point
+(v3.21.8) against this fork's actual code, not just commit titles, before
+bumping: the two Mac-only fixes above are legitimately platform-specific
+(macOS Keychain has no Linux equivalent; this fork never uses ffmpeg at
+all -- confirmed zero references, its ElevenLabs path requests raw PCM
+directly) and every other fix already exists here as its own independent
+port. Bumped to 3.22.12 purely to keep the version number matching across
+forks -- there is nothing new in this file.
+
 ## v3.22.11 — 2026-09-17
 
 ### Added
