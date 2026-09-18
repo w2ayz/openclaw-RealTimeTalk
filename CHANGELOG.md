@@ -1,3 +1,49 @@
+## v3.22.13 — 2026-09-17
+
+### Fixed
+
+- **`GEMINI_CUSTOM_VOCABULARY` was declared but never populated in `main()`
+  on this fork** — Gemini custom vocabulary has been silently inert here
+  since it was introduced. Found while porting the shared-vocabulary
+  feature below; fixed in the same commit.
+
+### Added
+
+- **Shared custom-vocabulary list now hints both STT engines.**
+  `rtt_stt_config.json`'s `"vocabulary"` array now feeds both Gemini's
+  `custom_vocabulary` (fixed above) and OpenAI's `keywords` via a new
+  `OPENAI_TRANSCRIPTION_KEYWORDS`, built from the same source. Terms
+  containing `<`, `>`, CR, or LF are filtered out for OpenAI only (its
+  API rejects the *whole* session update on one bad term; Gemini has no
+  such constraint), with a warning naming any dropped term.
+
+### Changed
+
+- **OpenAI engine switched from `gpt-4o-transcribe` to `gpt-live-transcribe`.**
+  Verified live against the real API before making this change:
+  `gpt-4o-transcribe` hard-rejects the `keywords` field outright.
+  `gpt-live-transcribe` in turn hard-rejects *all* automatic turn detection
+  (`server_vad`, what this daemon used before, and `semantic_vad` are both
+  rejected — confirmed live) — only `turn_detection: null` is accepted.
+  `OpenAIRealtimeSession` now drives its own client-side speech start/stop
+  from mic chunk peak level in `_send_audio_chunk` (~150ms sustained sound
+  to start, ~700ms sustained silence to stop — matches the old `server_vad`
+  config's felt latency) and sends `input_audio_buffer.commit` itself on
+  detected stop, reusing the existing calibrated `_mic_gate_ref`. Verified
+  live before shipping: commit alone produces a transcript, and multiple
+  commits work correctly within one connection. The now-dead
+  `input_audio_buffer.speech_started`/`speech_stopped` branches are removed
+  from `_handle_engine_message`.
+- Added `TRANSCRIPTION_PROMPT` — this fork never sent an OpenAI transcription
+  prompt at all before; the Mac fork always has.
+
+### Notes
+
+- Keywords are a *hint*, not a guarantee, on both engines — verified live:
+  the shared list fixed "Annabel" → "Annabelle" but did not fully correct
+  a synthetic call sign in the same test. Documented in CLAUDE.md and
+  README so this isn't oversold. Same feature as the Mac fork v3.22.13.
+
 ## v3.22.12 — 2026-09-17
 
 ### Notes — version-number alignment only, no functional change
