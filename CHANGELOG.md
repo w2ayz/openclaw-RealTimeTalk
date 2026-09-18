@@ -1,3 +1,22 @@
+## v3.22.15 — 2026-09-18
+
+### Changed
+
+- **ElevenLabs TTS request timeout raised 15s → 30s**, now a named
+  `ELEVENLABS_TIMEOUT` constant instead of a literal in
+  `_elevenlabs_tts()`. Ported from the Mac fork (which shipped it as
+  v3.22.15 on 2026-09-17). Observed there: a news-brief chunk mixing
+  English proper nouns into Chinese text took ElevenLabs >15s to render
+  and hit the timeout, dropping *that one chunk* to the Edge TTS
+  fallback — and Edge, unlike ElevenLabs' single-voice multilingual
+  `eleven_v3` rendering, must split mixed-script text into separate
+  zh/en segments and alternate voices per segment (`_split_by_script`
+  / `_edge_tts_seg` here). That produced an audible voice switch
+  mid-reply. Successful ElevenLabs calls in the same session were
+  already taking up to ~13s, so 15s left almost no headroom. This fork
+  is if anything more exposed: it requests `output_format=pcm_22050`
+  with no MP3 decode, and is the slower of the two machines.
+
 ## v3.22.14 — 2026-09-18
 
 ### Fixed

@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.14"
+__version__ = "3.22.15"
 
 import argparse
 import asyncio
@@ -95,6 +95,7 @@ _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 ELEVENLABS_VOICE_ID    = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress" — matches the Mac fork
 ELEVENLABS_MODEL       = "eleven_v3"
 ELEVENLABS_SECRETS_FILE = os.path.expanduser("~/.openclaw/secrets/elevenlabs")
+ELEVENLABS_TIMEOUT     = 30.0      # a long mixed-script chunk can render slowly
 _elevenlabs_key: str   = ""        # populated lazily from secrets file
 
 # Edge TTS skill — network TTS fallback between ElevenLabs and OpenAI for
@@ -2253,7 +2254,7 @@ def _elevenlabs_tts(text: str, output_path: str) -> bool:
         method="POST",
     )
     try:
-        with _ureq.urlopen(req, timeout=15) as resp:
+        with _ureq.urlopen(req, timeout=ELEVENLABS_TIMEOUT) as resp:
             pcm_bytes = resp.read()
     except Exception as e:
         log.error("ElevenLabs TTS request failed: %s", e)
