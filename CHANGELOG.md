@@ -1,3 +1,30 @@
+## v3.22.16 — 2026-09-18
+
+### Changed
+
+- **`_split_sentences` now also breaks on line breaks, ':', and ';'** —
+  previously it only split on `.!?`/`。！？`, so a `/speak`-pushed bullet
+  list (newline-separated, no periods between items) was queued as a
+  single oversized TTS call. Ported from the Mac fork (which shipped it
+  as v3.22.16 on 2026-09-17). Confirmed there: a 4-item news bullet list
+  rendered as one ~19s ElevenLabs call producing 59.7s of audio, versus
+  8-10s for normal single-sentence chunks. New `_CHUNK_BOUND_RE` (used
+  only by `_split_sentences`, not by `_last_sentence_boundary`/
+  `_release_point` — those still decide when live-streamed text is safe
+  to release, a separate question from how a released region gets sliced
+  for TTS) adds `\n+`, and `:`/`;`/`：`/`；` reusing `_is_fake_boundary`'s
+  digit-adjacency guard, via a small `_is_fake_chunk_boundary` wrapper,
+  so clock times ("4:20") and ratios ("3:1") aren't split mid-number.
+  The wrapper exists because that digit guard would otherwise veto
+  splitting before a numbered list item ("1. xxx") on a line break.
+
+### Notes
+
+- Port verified by differential test against the Mac fork's splitter:
+  13/13 cases produce byte-identical chunk lists, covering the live
+  bullet-list case, colon-led clauses, clock times, ratios, decimals,
+  abbreviations, numbered lists, URLs with a colon, and mixed CJK/Latin.
+
 ## v3.22.15 — 2026-09-18
 
 ### Changed
