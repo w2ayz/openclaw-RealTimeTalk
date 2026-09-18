@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.18"
+__version__ = "3.22.19"
 
 import argparse
 import asyncio
@@ -8353,7 +8353,12 @@ if __name__ == "__main__":
     # are expected to --calibrate away from. The other two paths use the raw
     # mic signal directly, so a stale/uncalibrated gate there really can starve
     # OpenAI's client-side turn detection (see MIC_GATE_PEAK's comment above) —
-    # only warn on those.
+    # only warn on those, and only when nobody ever passed --mic-gate at all: a
+    # low value isn't necessarily wrong (a genuinely quiet room can calibrate
+    # lower than the static default), so compare presence-on-the-command-line
+    # rather than the resulting number, or a real calibrated value could
+    # falsely trip this.
+    _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
     if args.input_source:
         # User explicitly chose a physical mic — set it as PipeWire default
         # and use direct (non-AGC) gain/gate settings.
@@ -8362,10 +8367,11 @@ if __name__ == "__main__":
         MIC_GATE_PEAK = max(MIC_GATE_MIN, args.mic_gate)
         log.info("Explicit --input-source %s — direct mode gain=%.1f gate=%d",
                  args.input_source, MIC_GAIN, MIC_GATE_PEAK)
-        if load_openai_key():
+        if load_openai_key() and not _mic_gate_explicit:
             log.warning("Direct (non-AGC) mic mode with OpenAI STT: gate=%d is the "
-                         "ONLY signal deciding when you've stopped talking (no "
-                         "server-side VAD on gpt-live-transcribe). If transcripts "
+                         "compiled-in default, never calibrated for this mic/room, "
+                         "and is the ONLY signal deciding when you've stopped talking "
+                         "(no server-side VAD on gpt-live-transcribe). If transcripts "
                          "never finalize, run --calibrate for this mic/room.",
                          MIC_GATE_PEAK)
     elif _activate_agc_source():
@@ -8377,7 +8383,7 @@ if __name__ == "__main__":
     else:
         log.info("AGC source unavailable — fallback to static gain=%.1f "
                  "gate=%d", MIC_GAIN, MIC_GATE_PEAK)
-        if load_openai_key():
+        if load_openai_key() and not _mic_gate_explicit:
             log.warning("AGC unavailable — using the static, uncalibrated gate=%d "
                          "with OpenAI STT: this is the ONLY signal deciding when "
                          "you've stopped talking (no server-side VAD on "

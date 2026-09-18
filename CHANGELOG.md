@@ -1,3 +1,18 @@
+## v3.22.19 — 2026-09-18
+
+### Fixed
+
+- **v3.22.18's uncalibrated-gate warnings could false-positive on a
+  genuinely calibrated setup.** They fired whenever an OpenAI key was
+  configured on the two raw-signal paths, regardless of whether
+  `--mic-gate` had ever actually been calibrated — a real, working,
+  intentionally low value would still trip them. Ported from the Mac
+  fork, caught there before restarting to pick up v3.22.18 (its own
+  LaunchAgent passes an explicitly calibrated `--mic-gate 64`, below
+  the old `<= 80` threshold). Now checks whether `--mic-gate` was ever
+  passed on the command line at all (`sys.argv`), not the resulting
+  number.
+
 ## v3.22.18 — 2026-09-18
 
 ### Added
