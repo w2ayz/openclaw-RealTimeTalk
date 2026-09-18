@@ -1,15 +1,43 @@
 # CLAUDE.md — RealTimeTalk (Pi fork)
 
 - Two version-locked forks: this one (Pi, PipeWire/`aplay`/`paplay`, local
-  Piper for English) and the Mac fork
-  (github.com/w2ayz/openclaw-RealTimeTalk-mac, `sounddevice`/PortAudio).
-  Bump `__version__` in `RealTimeTalk-daemon.py` and add matching
-  CHANGELOG entries in both when a fix or feature applies to both fork —
-  port by adapting to each fork's idioms, not by cherry-picking the diff.
-  The two implementations have genuinely diverged internally (e.g. this
-  fork's key loaders inline OpenClaw SecretRef resolution that the Mac
-  fork factors into a shared helper) — check the actual code on both
-  sides before assuming a fix ports 1:1.
+  Piper) and the Mac fork
+  (github.com/w2ayz/openclaw-RealTimeTalk-mac, `sounddevice`/PortAudio,
+  macOS `say` in Piper's place). Bump `__version__` in
+  `RealTimeTalk-daemon.py` and add matching CHANGELOG entries in both when
+  a fix or feature applies to both fork — port by adapting to each fork's
+  idioms, not by cherry-picking the diff. The two implementations have
+  genuinely diverged internally — check the actual code on both sides
+  before assuming a fix ports 1:1. Confirmed example, fixed in v3.23.0: this
+  fork read the ElevenLabs key from a flat `~/.openclaw/secrets/elevenlabs`
+  file (`_elevenlabs_tts()`'s own lazy-load), while the Mac fork already
+  used `talk.providers.elevenlabs.apiKey` via the shared
+  `_resolve_provider_api_key()` helper this fork also already had (for
+  openai/gemini) — migrated onto that same helper via a new
+  `load_elevenlabs_key()`, the old file is no longer read at all.
+
+- As of v3.23.0: STT is optional (`rtt_stt_config.json`'s
+  `"provider": "none"`, or simply no OpenAI/Gemini key at all, resolves to
+  `STT_ENGINE_NONE` in `_resolve_stt_engine()` — `main()` then skips mic/STT
+  session setup entirely and just serves `/speak` — TTS-only, no more
+  crash-looping under systemd waiting for a key). And the TTS engine order
+  is user-configurable (`rtt_tts_config.json`'s `"order"`, resolved once per
+  session into `TTS_ORDER` by `_resolve_tts_order()`) — **and, on request,
+  now applies uniformly to all text**: previously this fork routed English
+  straight to Piper and only tried the ElevenLabs → Edge → OpenAI network
+  tiers for Chinese/mixed text; that language-conditional split is gone,
+  `_synthesize()` now runs the same `TTS_ORDER` chain over the whole text
+  regardless of language, matching the Mac fork exactly. This is a real
+  behavior change worth watching after deploy: English replies will now
+  attempt network TTS first by default (unless reconfigured to
+  `["piper"]`), where they previously never did. Both features are set via
+  `RealTimeTalk-configure.sh` (re-runnable anytime) or the installer's §5,
+  which now calls into `RealTimeTalk-config-lib.sh`'s
+  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — ported from the
+  Mac fork, which got these first; only static-checked here (syntax +
+  `pyflakes`/`ruff --select F821,E9` equivalent, plus the config-lib
+  functions exercised against scratch configs), **not yet verified on real
+  Pi hardware** — see the point below on why that matters.
 
 - This fork has shipped multiple bugs that only a *live* Pi run would
   catch (v3.22.0–v3.22.5: `load_gemini_key()` called but never defined —

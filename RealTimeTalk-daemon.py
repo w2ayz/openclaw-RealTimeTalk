@@ -3,10 +3,13 @@
 RealTimeTalk-daemon.py — OpenClaw RealTimeTalk daemon (gateway-integrated).
 
 Audio flow:
-  Mic → OpenAI Realtime API (VAD + STT only) → transcript
+  Mic → OpenAI/Gemini Realtime STT (or neither — see STT_ENGINE_NONE, TTS-only) → transcript
   transcript → OpenClaw gateway (chat.send / agent.wait) → AI Agent's reply
   AI Agent's reply → ElevenLabs → Edge TTS → OpenAI TTS → Piper → speaker
-                     (Chinese/mixed uses the network tiers; English → Piper)
+                     (TTS engine order is configurable — see rtt_tts_config.json /
+                     DEFAULT_TTS_ORDER below; applies uniformly to all text as of
+                     v3.23.0, not just Chinese/mixed — Piper is just the one engine
+                     that's always kept as the no-key/no-network last resort)
 
 Stop via:
   http://<pi-ip>:19000/dashboard          — phone browser (over Tailscale)
@@ -23,11 +26,11 @@ Requires:
   sudo apt install libportaudio2 alsa-utils mpg123
   piper installed at ~/.local/bin/piper with a voice model
   (optional) edge-tts skill at ~/.openclaw/workspace/skills/edge-tts/ + Node.js
-    — network TTS fallback for Chinese/mixed replies; path resolved by
-    _resolve_edge_tts_script(); MP3 output decoded via mpg123
+    — network TTS fallback; path resolved by _resolve_edge_tts_script();
+    MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.19"
+__version__ = "3.23.0"
 
 import argparse
 import asyncio
@@ -94,9 +97,11 @@ _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 
 ELEVENLABS_VOICE_ID    = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress" — matches the Mac fork
 ELEVENLABS_MODEL       = "eleven_v3"
-ELEVENLABS_SECRETS_FILE = os.path.expanduser("~/.openclaw/secrets/elevenlabs")
 ELEVENLABS_TIMEOUT     = 30.0      # a long mixed-script chunk can render slowly
-_elevenlabs_key: str   = ""        # populated lazily from secrets file
+# v3.23.0: key now comes from talk.providers.elevenlabs.apiKey via
+# load_elevenlabs_key() (same convention as openai/gemini, and the Mac fork)
+# — the old flat ~/.openclaw/secrets/elevenlabs file is no longer read.
+_elevenlabs_key: str   = ""        # populated lazily from load_elevenlabs_key()
 
 # Edge TTS skill — network TTS fallback between ElevenLabs and OpenAI for
 # Chinese/mixed replies. Free, no API key, native zh-CN / en-US neural voices.
@@ -176,6 +181,7 @@ OPENAI_TRANSCRIPTION_KEYWORDS: list = []  # populated at startup, see main()
 # (rtt_stt_config.json) and the legacy openclaw.json `talk.stt` block.
 STT_ENGINE_OPENAI  = "openai"
 STT_ENGINE_GEMINI  = "gemini"
+STT_ENGINE_NONE    = "none"     # no provider key configured — TTS-only, no mic/STT session
 DEFAULT_STT_ENGINE = STT_ENGINE_OPENAI
 # Engine settings live in the daemon's OWN config file, not openclaw.json:
 # OpenClaw's TalkSchema has no `stt` key, so the gateway strips that block on
@@ -188,6 +194,19 @@ STT_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_stt_config.js
 # _ensure_stt_config_seeded() so an update from a pre-v3.22.4 daemon (which
 # never had this file) doesn't silently start the STT keyword hint empty.
 DEFAULT_STT_VOCABULARY = ["OpenClaw", "STT", "TTS", "RealTimeTalk", "RTT"]
+
+# TTS engine chain order — same daemon-owned-file pattern as STT above.
+# RealTimeTalk-configure.sh writes {"order": [...]} here; any engine name it
+# omits is simply never tried (see _resolve_tts_order/TTS_ORDER, populated
+# once per session in main()) except "piper", which is always kept as the
+# last-resort entry since it needs no key or network. v3.23.0: previously
+# this fork routed English straight to Piper and only tried the network
+# tiers (ElevenLabs/Edge/OpenAI) for Chinese/mixed text; TTS_ORDER now
+# applies uniformly to the whole text regardless of language, matching the
+# Mac fork exactly (done on request — the old per-language split is gone).
+TTS_CONFIG_FILE    = os.path.expanduser("~/.openclaw/workspace/rtt_tts_config.json")
+DEFAULT_TTS_ORDER  = ["elevenlabs", "edge", "openai", "piper"]
+TTS_ORDER: list = list(DEFAULT_TTS_ORDER)  # populated at startup, see main()
 
 CHANNELS          = 1
 BLOCKSIZE         = 2400         # 100 ms at 24 kHz
@@ -1565,6 +1584,24 @@ def load_gemini_key() -> str:
         log.warning("Could not load Gemini key: %s", e)
         return ""
 
+def load_elevenlabs_key() -> str:
+    """Returns "" (not an error) if unset — ElevenLabs TTS is optional; the
+    TTS chain just falls to the next configured engine when no key is set.
+
+    v3.23.0: migrated off the flat ~/.openclaw/secrets/elevenlabs file (the
+    ELEVENLABS_SECRETS_FILE _elevenlabs_tts() used to read directly) onto the
+    same talk.providers.elevenlabs.apiKey convention as openai/gemini above
+    and the Mac fork, via the same _resolve_provider_api_key() (SecretRef-
+    aware) helper — done explicitly per Victor's request to unify storage
+    across forks, not a compatibility shim: the old file is no longer read.
+    """
+    try:
+        return _resolve_provider_api_key(_load_json(OPENCLAW_CONFIG), "elevenlabs")
+    except Exception as e:
+        log.warning("Could not load ElevenLabs key: %s", e)
+        return ""
+
+
 def load_gateway_token() -> str:
     cfg = _load_json(OPENCLAW_CONFIG)
     token = cfg.get("gateway", {}).get("auth", {}).get("token", "")
@@ -2219,8 +2256,9 @@ def _split_sentences(segment: str) -> list[tuple[str, int]]:
     return parts
 
 def _openai_tts(text: str, output_path: str) -> bool:
-    """Call OpenAI TTS API for Chinese text, resample to PIPER_SAMPLE_RATE, write WAV.
-    Returns True on success; caller should fall back to Piper on False."""
+    """Call OpenAI TTS API, resample to PIPER_SAMPLE_RATE, write WAV.
+    Returns True on success; caller (TTS_ORDER loop) falls to the next engine
+    on False."""
     import urllib.request as _ureq, json as _json, wave as _wv, io as _io
     global _openai_tts_key
     if not _openai_tts_key:
@@ -2273,17 +2311,19 @@ def _openai_tts(text: str, output_path: str) -> bool:
 
 
 def _elevenlabs_tts(text: str, output_path: str) -> bool:
-    """Call ElevenLabs TTS API for Chinese text, write WAV to output_path.
-    Uses pcm_22050 output — no resampling needed. Falls back to _openai_tts on failure."""
+    """Call ElevenLabs TTS API, write WAV to output_path. Uses pcm_22050
+    output — no resampling needed. Caller (the TTS_ORDER loop in
+    _synthesize()) falls to the next configured engine on failure."""
     import urllib.request as _ureq, json as _json, wave as _wv
     global _elevenlabs_key
     if not _elevenlabs_key:
         try:
-            with open(ELEVENLABS_SECRETS_FILE) as _f:
-                _elevenlabs_key = _f.read().strip()
+            _elevenlabs_key = load_elevenlabs_key()
         except Exception as e:
-            log.error("ElevenLabs: cannot load API key from %s: %s", ELEVENLABS_SECRETS_FILE, e)
+            log.error("ElevenLabs: cannot load API key: %s", e)
             return False
+        if not _elevenlabs_key:
+            return False   # no ElevenLabs key configured — caller falls back down the chain
     payload = _json.dumps({
         "text": text,
         "model_id": ELEVENLABS_MODEL,
@@ -2413,8 +2453,10 @@ def _edge_tts(text: str, output_path: str) -> bool:
 def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
                 silence_ms: int = 300, pad_lead: bool = True, pad_tail: bool = True):
     """Synthesise a single text chunk to a WAV file.  Everything in the legacy
-    speak() up to the playback boundary: markdown strip, per-script split, the
-    multilingual TTS chain, concatenation, silence padding and software volume.
+    speak() up to the playback boundary: markdown strip, the TTS_ORDER engine
+    chain (tried on the whole text, uniformly regardless of language — only
+    the Piper fallback still splits by script internally, for voice
+    selection), concatenation, silence padding and software volume.
 
     pad_lead/pad_tail: the streaming speaker synthesises one sentence per call
     and passes pad_lead=False/pad_tail=False so sentences don't get a 300ms
@@ -2438,16 +2480,7 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
     clean = strip_markdown(text)
     if not clean:
         return None, np.array([], dtype=np.int16), 0, 0, False
-    segments = _split_by_script(clean)
-    # Track which TTS engine actually produced audio this call, for the dashboard
-    # #dp panel. A single utterance can mix tiers (e.g. a ZH clause via ElevenLabs
-    # + an EN clause via Piper), so report the highest tier that yielded audio.
-    _eng = ""
-    _ENGINE_RANK = {"ElevenLabs": 3, "Edge": 2, "OpenAI": 1, "Piper": 0}
-    def _mark_engine(name: str):
-        nonlocal _eng
-        if not _eng or _ENGINE_RANK.get(name, -1) > _ENGINE_RANK.get(_eng, -1):
-            _eng = name
+    _eng = ""   # which engine actually produced usable audio this call — dashboard #dp label
     # Pad playback so USB/PipeWire sinks do not clip the first or last phoneme.
     import wave as _wave, struct as _struct
     wav_parts: list[str] = []
@@ -2462,58 +2495,88 @@ def _synthesize(text: str, alsa_output: str = ALSA_OUTPUT, volume: float = -1.0,
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(PIPER_SAMPLE_RATE)
             wf.writeframes(b'\x00\x00' * int(PIPER_SAMPLE_RATE * silence_ms / 1000))
         wav_parts.append(silence_path)
-    # If text contains Chinese, render it via the network TTS tiers before
-    # falling back to per-segment Piper. Chain: ElevenLabs → Edge TTS →
-    # OpenAI TTS. ElevenLabs/OpenAI take the whole unsplit text in one call;
-    # Edge TTS splits by script internally and uses its native zh/en voices.
-    if _is_chinese_text(clean):
-        full_path = tempfile.mktemp(suffix=".wav")
-        if _elevenlabs_tts(clean, full_path):
-            wav_parts.append(full_path)
-            _mark_engine("ElevenLabs")
-            segments = []   # skip per-segment loop below
-        elif _edge_tts(clean, full_path):
-            wav_parts.append(full_path)
-            _mark_engine("Edge")
-            segments = []   # skip per-segment loop below
-        elif _openai_tts(clean, full_path):
-            wav_parts.append(full_path)
-            _mark_engine("OpenAI")
-            segments = []   # skip per-segment loop below
-        else:
-            log.warning("Multilingual TTS failed — falling back to per-segment Piper")
+    def _try_elevenlabs() -> str | None:
+        p = tempfile.mktemp(suffix=".wav")
+        if _elevenlabs_tts(clean, p):
+            return p
+        try: os.unlink(p)
+        except OSError: pass
+        return None
 
-    for seg_text, lang in segments:
-        part_path = tempfile.mktemp(suffix=".wav")
-        if lang == 'zh':
-            if _elevenlabs_tts(seg_text, part_path):
-                wav_parts.append(part_path)
-                _mark_engine("ElevenLabs")
+    def _try_edge() -> str | None:
+        # Splits by script internally and uses native zh/en voices — one call
+        # handles pure-English, pure-Chinese, or mixed text.
+        p = tempfile.mktemp(suffix=".wav")
+        if _edge_tts(clean, p):
+            return p
+        try: os.unlink(p)
+        except OSError: pass
+        return None
+
+    def _try_openai() -> str | None:
+        p = tempfile.mktemp(suffix=".wav")
+        if _openai_tts(clean, p):
+            return p
+        try: os.unlink(p)
+        except OSError: pass
+        return None
+
+    def _try_piper() -> str | None:
+        # Split by script for correct voice selection (PIPER_VOICE_ZH/EN).
+        parts: list[str] = []
+        for seg_text, lang in _split_by_script(clean):
+            part_path = tempfile.mktemp(suffix=".wav")
+            result = subprocess.run(
+                [PIPER_CMD, "--model", PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN,
+                 "-f", part_path, "-q"],
+                input=seg_text.encode("utf-8"),
+                capture_output=True, env=PIPER_ENV,
+            )
+            if result.returncode != 0 or not os.path.exists(part_path):
+                log.error("Piper failed for %r (rc=%d): %s",
+                          seg_text[:30], result.returncode,
+                          result.stderr.decode(errors="replace")[:120])
                 continue
-            log.warning("ElevenLabs TTS failed for ZH segment — trying Edge TTS")
-            if _edge_tts_seg(seg_text, EDGE_VOICE_ZH, part_path):
-                wav_parts.append(part_path)
-                _mark_engine("Edge")
-                continue
-            log.warning("Edge TTS failed for ZH segment — falling back to OpenAI TTS")
-            if _openai_tts(seg_text, part_path):
-                wav_parts.append(part_path)
-                _mark_engine("OpenAI")
-                continue
-            log.warning("OpenAI TTS failed for ZH segment — falling back to Piper")
-        result = subprocess.run(
-            [PIPER_CMD, "--model", PIPER_VOICE_ZH if lang == 'zh' else PIPER_VOICE_EN,
-             "-f", part_path, "-q"],
-            input=seg_text.encode("utf-8"),
-            capture_output=True, env=PIPER_ENV,
-        )
-        if result.returncode != 0 or not os.path.exists(part_path):
-            log.error("Piper failed for %r (rc=%d): %s",
-                      seg_text[:30], result.returncode,
-                      result.stderr.decode(errors="replace")[:120])
+            parts.append(part_path)
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        merged = tempfile.mktemp(suffix=".wav")
+        with _wave.open(merged, 'wb') as out_wf:
+            for i, part in enumerate(parts):
+                with _wave.open(part, 'rb') as in_wf:
+                    if i == 0:
+                        out_wf.setparams(in_wf.getparams())
+                    out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
+        for part in parts:
+            try: os.unlink(part)
+            except OSError: pass
+        return merged
+
+    # TTS engine chain — order configurable via rtt_tts_config.json (see
+    # TTS_ORDER, resolved once per session by _resolve_tts_order()); default
+    # is ElevenLabs → Edge TTS → OpenAI TTS → Piper, applied uniformly to the
+    # whole text regardless of language (matches the Mac fork).
+    _tts_handlers = {"elevenlabs": _try_elevenlabs, "edge": _try_edge,
+                      "openai": _try_openai, "piper": _try_piper}
+    _tts_labels   = {"elevenlabs": "ElevenLabs", "edge": "Edge",
+                      "openai": "OpenAI", "piper": "Piper"}
+    _result_path = None
+    for _engine in TTS_ORDER:
+        _handler = _tts_handlers.get(_engine)
+        if _handler is None:
             continue
-        wav_parts.append(part_path)
-        _mark_engine("Piper")
+        _result_path = _handler()
+        if _result_path:
+            _eng = _tts_labels[_engine]
+            break
+        log.warning("%s TTS unavailable/failed", _tts_labels.get(_engine, _engine))
+
+    if _result_path:
+        wav_parts.append(_result_path)
+    else:
+        log.error("All TTS engines in TTS_ORDER failed to produce audio for %r", clean[:60])
 
     if _eng:
         _last_tts_engine[0] = _eng
@@ -4694,11 +4757,13 @@ def _dashboard_dynamic(sess) -> dict:
     _tts_eng = _last_tts_engine[0] or "&mdash;"
     _tts_seg = (f'<span style="color:#2dd4bf;font-weight:600;">{_tts_eng}</span>'
                 if speaking else _tts_eng)
+    _stt_eng_raw = _active_stt_engine[0] or _cli_stt_engine[0] or "openai"
+    _stt_eng = "Text-only (no STT)" if _stt_eng_raw == STT_ENGINE_NONE else _stt_eng_raw
     device_panel = (
         f'<div id="dp">&#9673; {_ds["mic"]} &ensp;'
         f'&#9834; {_ds["speaker_name"]} &middot; Vol {_ds["spk_vol"]} &middot; SW {_ds["sw_pct"]}%'
         f' &ensp;Gate {_ds["gate"]} &middot; Gain {_ds["gain"]}x'
-        f' &ensp;&#128483; TTS: {_tts_seg} &ensp;&#127897; STT: {_active_stt_engine[0] or _cli_stt_engine[0] or "openai"}</div>'
+        f' &ensp;&#128483; TTS: {_tts_seg} &ensp;&#127897; STT: {_stt_eng}</div>'
     )
 
     nav_html = (
@@ -8004,6 +8069,54 @@ def _ensure_stt_config_seeded(agent_name: str) -> None:
         log.warning("Could not seed rtt_stt_config.json vocabulary: %s", e)
 
 
+def _load_tts_settings() -> dict:
+    """TTS engine-order settings ({"order": [...]}) — same daemon-owned-file
+    pattern as _load_stt_settings(), no legacy openclaw.json fallback (this
+    config didn't exist before v3.23.0)."""
+    try:
+        cfg = _load_json(TTS_CONFIG_FILE)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _ensure_tts_config_seeded() -> None:
+    """Create rtt_tts_config.json with the default engine order if it's
+    missing. Never overwrites an existing "order" (including a deliberately
+    short one from RealTimeTalk-configure.sh) — mirrors
+    _ensure_stt_config_seeded()'s never-clobber behavior."""
+    try:
+        cfg = _load_json(TTS_CONFIG_FILE) if os.path.isfile(TTS_CONFIG_FILE) else {}
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if "order" in cfg:
+        return
+    cfg["order"] = list(DEFAULT_TTS_ORDER)
+    try:
+        os.makedirs(os.path.dirname(TTS_CONFIG_FILE), exist_ok=True)
+        with open(TTS_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        log.info("Seeded rtt_tts_config.json order: %s", cfg["order"])
+    except Exception as e:
+        log.warning("Could not seed rtt_tts_config.json order: %s", e)
+
+
+def _resolve_tts_order() -> list:
+    """Validate rtt_tts_config.json's "order" against the known TTS engines,
+    dropping unknown names and duplicates, and always keeping "piper" as the
+    last-resort entry even if the user's list omits it (it needs no key or
+    network, so it's the one engine that must never be droppable to zero)."""
+    known = {"elevenlabs", "edge", "openai", "piper"}
+    raw = _load_tts_settings().get("order")
+    order = [str(t).strip().lower() for t in raw] if isinstance(raw, list) else DEFAULT_TTS_ORDER
+    result = [t for t in dict.fromkeys(order) if t in known]
+    if "piper" not in result:
+        result.append("piper")
+    return result or list(DEFAULT_TTS_ORDER)
+
+
 def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
@@ -8012,6 +8125,15 @@ def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
 
     if _cli_stt_engine[0]:
         return _cli_stt_engine[0]
+
+    # No usable key at all — TTS-only, regardless of what "provider" says
+    # (a stale "openai"/"gemini" left over from a since-removed key must not
+    # attempt a connection). Also honors an explicit "none" from the
+    # configure script's Skip option.
+    if not openai_key and not gemini_key:
+        return STT_ENGINE_NONE
+    if configured == STT_ENGINE_NONE:
+        return STT_ENGINE_NONE
 
     if configured:
         if configured == STT_ENGINE_GEMINI and gemini_key:
@@ -8174,6 +8296,11 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         _stt_vocab = _load_stt_settings().get("vocabulary", [])
     except Exception:
         _stt_vocab = []
+
+    # TTS engine order — same populate-once-per-session pattern as the STT
+    # vocabulary above, read by _synthesize() via the module-level TTS_ORDER.
+    _ensure_tts_config_seeded()
+    TTS_ORDER[:] = _resolve_tts_order()
     _vocab_terms = {AGENT_NAME, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip())
     GEMINI_CUSTOM_VOCABULARY.clear()
     for _term in _vocab_terms:
@@ -8214,6 +8341,23 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
 
         engine_name = _resolve_stt_engine(openai_key, gemini_key)
         _active_stt_engine[0] = engine_name   # dashboard #dp shows the real engine, not just the CLI flag
+
+        if engine_name == STT_ENGINE_NONE:
+            # No OpenAI/Gemini key configured (RealTimeTalk-configure.sh's
+            # "Skip" option, or just no key yet) — run TTS-only. The HTTP
+            # server (already started above) keeps serving /speak, /status
+            # and the dashboard with no session at all; openai_key/gemini_key
+            # are only read once at the top of main(), so adding a key later
+            # needs a service restart to take effect, same as any other STT
+            # config change. The OWW wake-word listener thread keeps running
+            # but has nothing to wake into.
+            log.info("No STT provider key configured — running TTS-only "
+                      "(no mic/wake-word listening). OpenClaw can still push "
+                      "text to speak via POST /speak.")
+            session_ref[0] = None
+            await stop_event.wait()
+            break
+
         if _woke_from_sleep:
             log.info("Wake signal received — connecting to the %s STT engine…",
                      engine_name.upper())

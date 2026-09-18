@@ -1,10 +1,12 @@
 # OpenClaw RealTimeTalk
 
 Headless voice daemon for Raspberry Pi. Captures voice from a USB mic, transcribes it via the
-OpenAI Realtime Transcription API **or Google Gemini 3.5 Transcribe Live**, routes the transcript through the local OpenClaw gateway so
-the AI Agent answers with full memory + tools, then synthesises the reply (Piper TTS for English;
-ElevenLabs → Edge TTS → OpenAI TTS → Piper for Chinese/mixed) and plays it through a USB speaker or
-headset. No browser, no display required — designed for always-on deployments.
+OpenAI Realtime Transcription API **or Google Gemini 3.5 Transcribe Live** — or runs TTS-only with
+neither configured — routes the transcript through the local OpenClaw gateway so the AI Agent
+answers with full memory + tools, then synthesises the reply (default chain: ElevenLabs → Edge TTS
+→ OpenAI TTS → Piper, applied to all text and user-configurable/droppable — see "TTS engine order"
+below) and plays it through a USB speaker or headset. No browser, no display required — designed
+for always-on deployments.
 
 Runs as a `systemd` user service that starts automatically on boot. Controlled via a web
 dashboard (port 19000) accessible from any phone browser on the local network or over Tailscale.
@@ -17,7 +19,7 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 - **Dual STT engines**: OpenAI Realtime Transcription (`gpt-live-transcribe`) or Google Gemini 3.5 Transcribe Live; Gemini uses server-side VAD, OpenAI a client-side one (the model rejects all server-side turn detection)
 - **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
-- Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
+- Mixed-language TTS — configurable engine chain (default ElevenLabs → Edge TTS → OpenAI TTS → Piper) applies uniformly to English and Chinese; Piper's own English (`en_US-lessac-medium`) / Chinese (`zh_CN-huayan-medium`) voices are selected per segment when it's the engine that ends up producing the audio; transcribed Chinese normalised to Simplified automatically
 - **Language filter** — by default only English and Chinese are shown/processed; other languages (noise hallucinations) silently dropped; toggleable Multi-lang mode
 - **Wake confirmation** — when a wake phrase is detected in Silent or Monitoring mode, the AI Agent asks "Yes?" before activating; a non-affirmative response or 8-second timeout is logged as a mis-fire and activation is suppressed
 - **Speaker calibration** — acoustic sweep from minimum volume; finds the quietest clearly-audible level; works through PipeWire (no direct-ALSA conflict)
@@ -122,10 +124,10 @@ gpt-live-transcribe  →  transcription.completed
        chat.history fallback  →  extract message-tool arguments.message
    │
    ▼  AI Agent's reply text
-       zhconv normalise  →  split_by_script (EN/ZH segments)
        strip_markdown()  →  remove bold/links/etc.
-       Chinese/mixed:  ElevenLabs → Edge TTS → OpenAI TTS → Piper
-       English:        Piper TTS per segment
+       TTS_ORDER (configurable, default shown) — tried on the whole text,
+       same order for English and Chinese/mixed, first success wins:
+         ElevenLabs → Edge TTS → OpenAI TTS → Piper (per-script voice split)
        →  concatenate WAVs
    │
    ▼  paplay --device=<usb-sink>  (PipeWire; no ALSA-busy conflict)
@@ -173,7 +175,8 @@ machine make the daemon read text aloud on demand — the piece that lets an
 OpenClaw agent do work triggered by keyboard/text (not voice) and still
 deliver the result through RTT. Useful when the request was typed but the
 answer should come back spoken — away from the keyboard, on the radio,
-hands busy, etc.
+hands busy, etc. This is also what makes TTS-only (no STT key configured)
+mode useful rather than just inert — see "STT engine selection" above.
 
 ```bash
 curl -s -X POST --data-urlencode "text=Your text here" http://127.0.0.1:19000/speak
@@ -316,7 +319,8 @@ Everything below except the OpenClaw gateway itself and the OpenAI API key is in
 | `pulseaudio-utils` (`pactl`) | Used throughout for PipeWire sink/source control |
 | **OpenClaw gateway running locally** | Required — daemon routes all AI through it. Not installed by this script |
 | OpenClaw 2026.5+ | Gateway protocol v4 required |
-| OpenAI or Gemini API key | Installer prompts for an OpenAI key (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Add a Gemini key at `talk.providers.gemini.apiKey` to use Gemini as the default or fallback engine. OAuth via OpenClaw `openai-codex` provider also supported |
+| OpenAI or Gemini API key (optional) | Installer prompts for either/both (choice menu, hidden input) — or Skip for TTS-only (no mic/wake-word listening; OpenClaw can still push text via `/speak`). OAuth via OpenClaw `openai-codex` provider also supported for OpenAI |
+| ElevenLabs API key (optional) | `talk.providers.elevenlabs.apiKey` — best multilingual TTS quality, tried first by default. Installer/`RealTimeTalk-configure.sh` prompt for it; without it the chain just falls to the next configured engine |
 | Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
 | espeak-ng | Required for Chinese TTS phonemisation |
 | `mpg123` | Decodes the Edge TTS skill's MP3 output to WAV (installer adds it) |
@@ -353,10 +357,22 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs all of `requirements.txt`
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected); resolves the optional edge-tts skill (sibling dir → `$OPENCLAW_WORKSPACE` → official path), installs Node.js + its `npm` deps if the skill is present, and records the path in the systemd unit as `RTT_EDGE_TTS_SCRIPT` — warns and continues if the skill is absent
 4. Downloads the CAM++ speaker-verification model
-5. Prompts for STT provider keys (choice menu: OpenAI / Gemini / both / keep existing) — hidden input, each key verified against its provider API; writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json`. Lenient: warns and continues if neither key is configured
+5. STT keys/engine, TTS keys/engine order, and STT vocabulary — a choice menu
+   (OpenAI / Gemini / both / keep existing / **skip for TTS-only**), hidden
+   key input verified against each provider's API, an ElevenLabs key prompt,
+   and a reorderable/droppable TTS engine chain. These three steps live in
+   `RealTimeTalk-config-lib.sh` so you can re-run just this part later with
+   `bash RealTimeTalk-configure.sh` — see "Configuration" below
 6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
 7. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service
+
+To change any STT/TTS key, the STT engine choice, the TTS engine order, or
+the STT vocabulary later without repeating the whole install, re-run:
+
+```bash
+bash ~/openclaw-RealTimeTalk/RealTimeTalk-configure.sh
+```
 
 ### 3. Check the dashboard
 
@@ -367,6 +383,18 @@ Open `http://<pi-ip>:19000/dashboard` in a browser. The header should show **SIL
 ## Configuration
 
 ### STT engine selection
+
+STT (mic/wake-word listening) is optional — skip it entirely to run
+TTS-only (OpenClaw can still push text to speak via `POST /speak`; see
+"Pushing text from OpenClaw" below). The easiest way to add, change, or
+remove STT/TTS keys after install is the re-runnable configure script:
+
+```bash
+bash RealTimeTalk-configure.sh
+```
+
+It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
+`GOOGLE_API_KEY`) and offers a key found there before prompting for one.
 
 By default the daemon uses **OpenAI Realtime Transcription**. It can also use **Google Gemini 3.5 Transcribe Live** as the default or fallback engine.
 
@@ -417,6 +445,48 @@ list; it's only read at startup.
 ```
 
 If only a Gemini key is present, the daemon starts in Gemini-only mode with no OpenAI key required.
+
+Set `"provider": "none"` (what `RealTimeTalk-configure.sh`'s Skip option
+writes) to run TTS-only on purpose even if a key is configured. With
+neither an OpenAI nor a Gemini key present at all, the daemon resolves to
+this same TTS-only mode automatically regardless of what `"provider"`
+says — no more crash-looping under systemd waiting for a key.
+
+### ElevenLabs API key (optional)
+
+Best multilingual TTS quality, tried first by default (all text, not just
+Chinese/mixed — see "TTS engine order" below), read from
+`talk.providers.elevenlabs.apiKey`:
+
+```json
+"talk": {
+  "providers": {
+    "elevenlabs": { "apiKey": "..." }
+  }
+}
+```
+
+v3.23.0: migrated off a flat `~/.openclaw/secrets/elevenlabs` file onto this
+same `talk.providers.<name>.apiKey` convention as openai/gemini — the old
+file is no longer read. Optional — if unset, the chain just falls to the
+next configured engine. `bash RealTimeTalk-configure.sh` prompts for this
+key too (checking `$ELEVENLABS_API_KEY` in your environment first).
+
+### TTS engine order (`~/.openclaw/workspace/rtt_tts_config.json`)
+
+```json
+{ "order": ["elevenlabs", "edge", "openai", "piper"] }
+```
+
+Same daemon-owned-config pattern as STT engine selection above. The default
+is ElevenLabs → Edge TTS → OpenAI TTS → Piper, tried in order until one
+produces audio — applied uniformly to English and Chinese/mixed alike as of
+v3.23.0 (previously English always went straight to Piper).
+`RealTimeTalk-configure.sh` lets you reorder this list or drop engines you
+don't want — e.g. `["piper"]` alone restores fully offline/local TTS with
+no network calls at all. `piper` is always kept as the last-resort entry
+even if you leave it out, since it needs no key or network. Restart the
+daemon after editing this file directly; it's only read at startup.
 
 ### Audio devices
 
@@ -519,9 +589,9 @@ Toggle from the dashboard: **Multi-lang: OFF → ON** to see all languages (usef
 
 ### Chinese (Simplified)
 
-All captured Chinese is automatically normalised from Traditional to Simplified using `zhconv`. You can speak mixed sentences naturally — TTS splits by script and voices each run separately.
+All captured Chinese is automatically normalised from Traditional to Simplified using `zhconv`. You can speak mixed sentences naturally — whichever TTS engine ends up producing the audio splits by script and voices each run separately (Piper always does; Edge TTS does internally too).
 
-TTS chain for text containing Chinese: **ElevenLabs → Edge TTS → OpenAI TTS → Piper**. Edge TTS (the [edge-tts skill](https://github.com/w2ayz/openclaw-edge-tts) — free, no API key, native `zh-CN-XiaoxiaoNeural` / `en-US-AriaNeural` neural voices) sits between the paid tiers; its MP3 output is decoded to WAV with `mpg123`. Pure-English replies go straight to the offline Piper `en_US-lessac-medium` voice as before. If the edge-tts skill or Node.js isn't installed, the chain simply skips that tier.
+TTS chain (see "TTS engine order" above): **ElevenLabs → Edge TTS → OpenAI TTS → Piper**, applied to the whole reply regardless of language — not just Chinese/mixed as before v3.23.0. Edge TTS (the [edge-tts skill](https://github.com/w2ayz/openclaw-edge-tts) — free, no API key, native `zh-CN-XiaoxiaoNeural` / `en-US-AriaNeural` neural voices) sits between the paid tiers; its MP3 output is decoded to WAV with `mpg123`. If the edge-tts skill or Node.js isn't installed, the chain simply skips that tier. Reconfigure to `["piper"]` alone to go back to fully offline/local TTS.
 
 ### VAD / STT settings
 

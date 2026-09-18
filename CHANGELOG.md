@@ -1,3 +1,62 @@
+## v3.23.0 — 2026-09-18
+
+### Added
+
+- **STT is now optional — RealTimeTalk can run TTS-only.** With no
+  OpenAI/Gemini key configured (or `rtt_stt_config.json`'s `"provider"`
+  explicitly set to `"none"`), `_resolve_stt_engine()` resolves to the new
+  `STT_ENGINE_NONE` and `main()` skips mic/wake-word session setup
+  entirely instead of `sys.exit(1)`ing. The HTTP server, dashboard, and
+  `POST /speak` keep working, so OpenClaw can still push text to be read
+  aloud — and the systemd service no longer crash-loops waiting for a key
+  the installer already let you skip past. Dashboard shows "Text-only (no
+  STT)" instead of a raw `none`.
+- **TTS engine order is now configurable and droppable**
+  (`~/.openclaw/workspace/rtt_tts_config.json`'s `"order"`, resolved once
+  per session by the new `_resolve_tts_order()` into the module-level
+  `TTS_ORDER`). Default order is ElevenLabs → Edge TTS → OpenAI TTS →
+  Piper; any engine can be dropped except Piper, force-appended as the
+  last-resort entry since it needs no key or network.
+- **Ported from the Mac fork, adapted to this fork's idioms**:
+  `RealTimeTalk-configure.sh` (re-runnable STT/TTS/vocabulary setup,
+  including the Skip → TTS-only option, without repeating apt/venv/Piper-
+  voice/systemd-unit steps) and `RealTimeTalk-config-lib.sh` (the shared
+  `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup`/
+  `ensure_provider_key`/`write_stt_engine` functions behind both the new
+  configure script and the installer's §5). Both check the shell
+  environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`,
+  `ELEVENLABS_API_KEY`) and offer a key found there before prompting.
+
+### Changed
+
+- **TTS engine order now applies uniformly to all text, not just
+  Chinese/mixed.** Previously, English replies always went straight to
+  Piper (zero network calls by design) and only Chinese/mixed text tried
+  the ElevenLabs → Edge → OpenAI network tiers first. That
+  language-conditional split is gone: `_synthesize()` now runs the same
+  `TTS_ORDER` chain over the whole text regardless of language, matching
+  the Mac fork exactly — done on request. **This changes default runtime
+  behavior**: English replies will now attempt network TTS first (cost/
+  latency) unless reconfigured to `["piper"]` via
+  `RealTimeTalk-configure.sh`.
+- **ElevenLabs key migrated off the flat `~/.openclaw/secrets/elevenlabs`
+  file onto `talk.providers.elevenlabs.apiKey`** in `openclaw.json` — same
+  convention as openai/gemini and the Mac fork, via the same
+  `_resolve_provider_api_key()` (SecretRef-aware) helper this fork already
+  had. The old file is no longer read at all; re-run
+  `RealTimeTalk-configure.sh` to move an existing key over.
+- `RealTimeTalk-install-pi.sh`'s STT-key interview (previously inline,
+  §5) now delegates to `RealTimeTalk-config-lib.sh` and includes the new
+  Skip/TTS-only and TTS-order/vocabulary steps.
+
+Verified only via syntax check (`ast.parse`) and a `pyflakes` undefined-
+name/syntax pass (this fork's own pre-commit gate is
+`ruff check --select F821,E9`, unavailable in the environment this port
+was written in) — **not yet booted on real Pi hardware.** Per this file's
+own history (v3.22.0–v3.22.5's `load_gemini_key` NameError, undetected for
+6 versions), boot this on a real Pi and watch a few replies in both
+languages before trusting it.
+
 ## v3.22.19 — 2026-09-18
 
 ### Fixed
