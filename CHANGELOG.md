@@ -1,3 +1,37 @@
+## v3.22.17 — 2026-09-18
+
+### Added
+
+- **`rtt_stt_config.json` now self-seeds a starter `"vocabulary"` on
+  startup** via new `_ensure_stt_config_seeded()`, called from `main()`
+  right before the vocabulary is read for the STT engines. Fixes an
+  upgrade gap: a daemon updated in place (`git pull` + restart, no
+  installer re-run) from a pre-v3.22.4 version — which never had this
+  file at all — silently started with an empty custom-vocabulary hint
+  for both STT engines. Seeds `[agent_name, "OpenClaw", "STT", "TTS",
+  "RealTimeTalk", "RTT"]` when the file is missing, or when it exists
+  but has no `"vocabulary"` key yet (e.g. one written by the installer's
+  `write_stt_engine`, which only ever wrote `provider`/`fallback`).
+  Never touches `provider`/`fallback`, and never overwrites a
+  `"vocabulary"` key that already exists — including a deliberately
+  emptied `[]`, which is left as-is rather than reseeded. Ported from
+  the Mac fork (`RealTimeTalk-daemon.py` here uses the module-level
+  `AGENT_NAME` global rather than Mac's local `_agent_name`; verified
+  it's already resolved from `--agent-name` before `main()`'s body —
+  where the seed call lives — runs, same as the pre-existing vocabulary
+  block right below it).
+
+### Fixed
+
+- **Installer's `write_stt_engine` no longer wipes the config file.**
+  It previously overwrote `rtt_stt_config.json` outright with just
+  `{"provider":..., "fallback":...}` whenever the STT-provider step ran
+  — destroying any `"vocabulary"` list the daemon had seeded or the
+  user had customized. It now merges `provider`/`fallback` into the
+  existing file instead. Ported from the Mac fork's
+  `RealTimeTalk-install-mac.sh`; same fix applied to
+  `RealTimeTalk-install-pi.sh`.
+
 ## v3.22.16 — 2026-09-18
 
 ### Changed
