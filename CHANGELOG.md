@@ -1,3 +1,34 @@
+## v3.22.14 — 2026-09-18
+
+### Fixed
+
+- **README still documented the pre-v3.22.13 OpenAI STT path** —
+  `gpt-4o-transcribe` with server-side VAD, and a "VAD / STT settings"
+  table listing `server_vad`, a 0.3 threshold, an 1100 ms silence
+  window and 300 ms prefix padding, none of which the code has used
+  since v3.22.13 switched to `gpt-live-transcribe` with
+  `turn_detection: null` and a client-side VAD. Corrected in the
+  feature list, both "How it works" diagrams, the timing line, the
+  settings table (now documenting `CLIENT_VAD_START_DEBOUNCE_SECS` /
+  `CLIENT_VAD_STOP_SILENCE_SECS` / `_mic_gate_ref` as the real knobs),
+  and the "speech cut off" troubleshooting row, which pointed at the
+  removed `silence_duration_ms`. Ported from the Mac fork, which made
+  the equivalent correction as its v3.22.14.
+
+### Notes
+
+- **The Mac's v3.22.14 had a second half that does not apply here.** It
+  also replaced generic conceptual references to the default agent name
+  ("Zeebot's reply text") with "the agent"/"Agent" while leaving literal
+  citations intact. This fork's README never had that problem — its only
+  two `Zeebot` mentions (`--agent-name, default **Zeebot**` and the
+  `"vocabulary"` JSON example) are exactly the literal kind the Mac
+  deliberately left untouched, so no change was needed for that half.
+- Not fixed here, because it is shared with the Mac fork and this was a
+  port, not a retune: `SPK_PREROLL_MS`'s comment still reads "matches
+  server VAD prefix_padding_ms so onsets aren't lost", naming a config
+  that no longer exists. Comment-only, identical on both forks.
+
 ## v3.22.13 — 2026-09-17
 
 ### Fixed

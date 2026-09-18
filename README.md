@@ -14,7 +14,7 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 ## Features
 
 - Voice conversation routed through the AI Agent's main OpenClaw session (memory, tools, identity)
-- **Dual STT engines**: OpenAI Realtime Transcription (`gpt-4o-transcribe`) or Google Gemini 3.5 Transcribe Live, with server-side VAD on both
+- **Dual STT engines**: OpenAI Realtime Transcription (`gpt-live-transcribe`) or Google Gemini 3.5 Transcribe Live; Gemini uses server-side VAD, OpenAI a client-side one (the model rejects all server-side turn detection)
 - **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
 - Mixed-language TTS — English (`en_US-lessac-medium`) and Chinese (`zh_CN-huayan-medium`) rendered per segment; transcribed Chinese normalised to Simplified automatically
@@ -50,7 +50,7 @@ Raspberry Pi (headless)
         │                         Model: openai/gpt-5.5 (OAuth, codex harness)
         │
         ├── OpenAI Realtime ──► wss://api.openai.com/v1/realtime?intent=transcription
-        │   (transcription)        server VAD + gpt-4o-transcribe
+        │   (transcription)        client-side VAD + gpt-live-transcribe
         │                          session.type: "transcription"
         │
         ├── Gemini Transcribe Live ──► wss://generativelanguage.googleapis.com/ws/...
@@ -103,9 +103,10 @@ USB mic (C-Media PCM2902) ─► PipeWire rtt_agc_source
 wss://api.openai.com/v1/realtime?intent=transcription
    │   or wss://generativelanguage.googleapis.com/ws/...
    │
-   ▼  server-side VAD (threshold 0.3, 1100ms silence to end turn)   (OpenAI)
+   ▼  client-side VAD: mic peak >= the calibrated gate, 150ms to start /
+      700ms silence to end turn, then input_audio_buffer.commit      (OpenAI)
       or voiceActivity ACTIVITY_START / ACTIVITY_END events          (Gemini)
-gpt-4o-transcribe  →  transcription.completed
+gpt-live-transcribe  →  transcription.completed
    │   or inputTranscription → text  (Gemini)
    │
    ▼  _handle_transcript()
@@ -134,7 +135,7 @@ USB speaker / headset
 You hear the AI Agent
 ```
 
-**Key timing:** ~4–12 s end-to-end — 1100 ms VAD silence window + ~0.5 s transcription + AI Agent thinking + TTS render.
+**Key timing:** ~4–12 s end-to-end — 700 ms VAD silence window + ~0.5 s transcription + AI Agent thinking + TTS render.
 
 ---
 
@@ -512,7 +513,7 @@ The daemon watches connected audio devices via a PipeWire fingerprint polled eve
 
 ### Language filter
 
-By default only **English and Chinese** are shown and routed to the AI Agent. Other languages (Japanese, Korean, Cyrillic, Arabic, etc. that `gpt-4o-transcribe` hallucinates from noise) are silently dropped.
+By default only **English and Chinese** are shown and routed to the AI Agent. Other languages (Japanese, Korean, Cyrillic, Arabic, etc. that the transcription engine hallucinates from noise) are silently dropped.
 
 Toggle from the dashboard: **Multi-lang: OFF → ON** to see all languages (useful for diagnosing capture).
 
@@ -526,11 +527,15 @@ TTS chain for text containing Chinese: **ElevenLabs → Edge TTS → OpenAI TTS 
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Model | `gpt-4o-transcribe` | Set by `OPENAI_TRANSCRIBE_MODEL` |
-| VAD type | `server_vad` | OpenAI server-side |
-| VAD threshold | 0.3 | Lower = more sensitive |
-| Silence window | 1100 ms | Long enough for natural sentence pauses; shorter values cut sentences mid-phrase with AGC gaps |
-| Prefix padding | 300 ms | Lead-in captured before speech detected |
+| Model | `gpt-live-transcribe` | Set by `OPENAI_TRANSCRIBE_MODEL`. Required for `keywords` — `gpt-4o-transcribe` rejects that field outright |
+| VAD type | client-side (`turn_detection: null`) | `gpt-live-transcribe` rejects both `server_vad` and `semantic_vad`, so the daemon drives turn detection itself. Gemini still uses its own server-side `voiceActivity` events |
+| Speech start | 150 ms | `CLIENT_VAD_START_DEBOUNCE_SECS` — sustained mic peak at or above the gate |
+| Silence window | 700 ms | `CLIENT_VAD_STOP_SILENCE_SECS` — sustained silence before the daemon sends `input_audio_buffer.commit` itself |
+| Gate level | `_mic_gate_ref` | The same room-calibrated noise gate (default 500) that drives everything else — deliberately not a second, independent threshold |
+
+With no server-side turn detection there's no `prefix_padding_ms`/`threshold` to
+tune: audio is appended continuously, so everything spoken before the trigger is
+already in the buffer. The two debounce values above are the equivalent knobs.
 
 ### HTTP port
 
@@ -588,7 +593,7 @@ RealTimeTalk/
 |---------|-------------|-----|
 | Gateway connect fails: `protocol mismatch` | OpenClaw updated to v4 protocol | Daemon now negotiates `minProtocol: 4, maxProtocol: 4` — update from v1.6 |
 | AI Agent not responding / empty reply | Codex harness delivers reply via message tool, not chat content | v1.7 fetches from `chat.history` as fallback — update daemon |
-| Speech cut off after 2–3 words | VAD silence window too short + AGC inter-word gaps look like silence | `silence_duration_ms` raised to 1100 ms in v1.7 |
+| Speech cut off after 2–3 words | VAD silence window too short + AGC inter-word gaps look like silence | Raise `CLIENT_VAD_STOP_SILENCE_SECS` (currently 0.7 s) on `OpenAIRealtimeSession` |
 | Voice activated but transcription is garbage / wrong language | Noise hallucinations | Language filter drops non-EN/ZH by default; check mic gate in dashboard |
 | Chinese shows as Traditional characters | Transcriber outputs Traditional | v1.7 normalises to Simplified via zhconv automatically |
 | Speaker calibration hangs or takes 30+ seconds | Old per-step parec capture (v1.6) | v1.7 uses fast sd.rec (~6 s total) |
