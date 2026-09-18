@@ -320,7 +320,7 @@ Everything below except the OpenClaw gateway itself and the OpenAI API key is in
 | **OpenClaw gateway running locally** | Required — daemon routes all AI through it. Not installed by this script |
 | OpenClaw 2026.5+ | Gateway protocol v4 required |
 | OpenAI or Gemini API key (optional) | Installer prompts for either/both (choice menu, hidden input) — or Skip for TTS-only (no mic/wake-word listening; OpenClaw can still push text via `/speak`). OAuth via OpenClaw `openai-codex` provider also supported for OpenAI |
-| ElevenLabs API key (optional) | `talk.providers.elevenlabs.apiKey` — best multilingual TTS quality, tried first by default. Installer/`RealTimeTalk-configure.sh` prompt for it; without it the chain just falls to the next configured engine |
+| ElevenLabs API key (optional) | `talk.providers.elevenlabs.apiKey` — best multilingual TTS quality, tried first by default. Installer/`RTT-Config.sh` prompt for it; without it the chain just falls to the next configured engine |
 | Piper TTS (rhasspy native binary) | `~/.local/bin/piper-native/piper` with EN + ZH voice models |
 | espeak-ng | Required for Chinese TTS phonemisation |
 | `mpg123` | Decodes the Edge TTS skill's MP3 output to WAV (installer adds it) |
@@ -362,7 +362,7 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
    key input verified against each provider's API, an ElevenLabs key prompt,
    and a reorderable/droppable TTS engine chain. These three steps live in
    `RealTimeTalk-config-lib.sh` so you can re-run just this part later with
-   `bash RealTimeTalk-configure.sh` — see "Configuration" below
+   `bash RTT-Config.sh` — see "Configuration" below
 6. Lists detected audio devices for reference — no manual device index needed; the daemon follows PipeWire's own default source/sink, which you can change from the dashboard
 7. Writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service
@@ -371,7 +371,7 @@ To change any STT/TTS key, the STT engine choice, the TTS engine order, or
 the STT vocabulary later without repeating the whole install, re-run:
 
 ```bash
-bash ~/openclaw-RealTimeTalk/RealTimeTalk-configure.sh
+bash ~/openclaw-RealTimeTalk/RTT-Config.sh
 ```
 
 ### 3. Check the dashboard
@@ -390,7 +390,7 @@ TTS-only (OpenClaw can still push text to speak via `POST /speak`; see
 remove STT/TTS keys after install is the re-runnable configure script:
 
 ```bash
-bash RealTimeTalk-configure.sh
+bash RTT-Config.sh
 ```
 
 It also checks your shell environment (`OPENAI_API_KEY`, `GEMINI_API_KEY`/
@@ -446,7 +446,7 @@ list; it's only read at startup.
 
 If only a Gemini key is present, the daemon starts in Gemini-only mode with no OpenAI key required.
 
-Set `"provider": "none"` (what `RealTimeTalk-configure.sh`'s Skip option
+Set `"provider": "none"` (what `RTT-Config.sh`'s Skip option
 writes) to run TTS-only on purpose even if a key is configured. With
 neither an OpenAI nor a Gemini key present at all, the daemon resolves to
 this same TTS-only mode automatically regardless of what `"provider"`
@@ -469,7 +469,7 @@ Chinese/mixed — see "TTS engine order" below), read from
 v3.23.0: migrated off a flat `~/.openclaw/secrets/elevenlabs` file onto this
 same `talk.providers.<name>.apiKey` convention as openai/gemini — the old
 file is no longer read. Optional — if unset, the chain just falls to the
-next configured engine. `bash RealTimeTalk-configure.sh` prompts for this
+next configured engine. `bash RTT-Config.sh` prompts for this
 key too (checking `$ELEVENLABS_API_KEY` in your environment first).
 
 ### TTS engine order (`~/.openclaw/workspace/rtt_tts_config.json`)
@@ -482,7 +482,7 @@ Same daemon-owned-config pattern as STT engine selection above. The default
 is ElevenLabs → Edge TTS → OpenAI TTS → Piper, tried in order until one
 produces audio — applied uniformly to English and Chinese/mixed alike as of
 v3.23.0 (previously English always went straight to Piper).
-`RealTimeTalk-configure.sh` lets you reorder this list or drop engines you
+`RTT-Config.sh` lets you reorder this list or drop engines you
 don't want — e.g. `["piper"]` alone restores fully offline/local TTS with
 no network calls at all. `piper` is always kept as the last-resort entry
 even if you leave it out, since it needs no key or network. Restart the

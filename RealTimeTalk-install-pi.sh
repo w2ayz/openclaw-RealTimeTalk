@@ -196,7 +196,7 @@ fi
 # talk.stt block as a fallback source, but this installer never writes one.
 #
 # All three interview steps live in RealTimeTalk-config-lib.sh so
-# RealTimeTalk-configure.sh can re-run them later without repeating the rest
+# RTT-Config.sh can re-run them later without repeating the rest
 # of this installer. run_stt_setup now includes a Skip option (TTS-only, no
 # STT key at all) — the daemon resolves that to STT_ENGINE_NONE and runs
 # text-only instead of crash-looping under systemd waiting for a key.

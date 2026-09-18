@@ -31,7 +31,7 @@
   behavior change worth watching after deploy: English replies will now
   attempt network TTS first by default (unless reconfigured to
   `["piper"]`), where they previously never did. Both features are set via
-  `RealTimeTalk-configure.sh` (re-runnable anytime) or the installer's §5,
+  `RTT-Config.sh` (re-runnable anytime) or the installer's §5,
   which now calls into `RealTimeTalk-config-lib.sh`'s
   `run_stt_setup`/`run_tts_setup`/`run_vocabulary_setup` — ported from the
   Mac fork, which got these first; only static-checked here (syntax +

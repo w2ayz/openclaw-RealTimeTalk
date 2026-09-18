@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RealTimeTalk-configure.sh — re-runnable setup for STT keys/engine, TTS
+# RTT-Config.sh — re-runnable setup for STT keys/engine, TTS
 # keys/engine order, and STT custom vocabulary. Safe to run anytime after
 # the initial install (RealTimeTalk-install-pi.sh) — it never touches apt
 # packages, the Python venv, Piper voices, or the systemd user service unit.
@@ -7,7 +7,7 @@
 # add more vocabulary terms.
 #
 # Usage:
-#   bash RealTimeTalk-configure.sh
+#   bash RTT-Config.sh
 
 set -euo pipefail
 
@@ -34,7 +34,7 @@ echo "=== RealTimeTalk configure ==="
 echo ""
 echo "  Every step below can be skipped — press Enter to keep what's already"
 echo "  there. This whole script is safe to re-run anytime:"
-echo "    bash \"$SKILL_DIR/RealTimeTalk-configure.sh\""
+echo "    bash \"$SKILL_DIR/RTT-Config.sh\""
 echo "  Run it again later to add a key you skipped now, change the TTS engine"
 echo "  order, or add more STT vocabulary."
 echo ""
@@ -55,4 +55,4 @@ case "$DO_RESTART" in
         ;;
 esac
 echo ""
-echo "Re-run this anytime: bash \"$SKILL_DIR/RealTimeTalk-configure.sh\""
+echo "Re-run this anytime: bash \"$SKILL_DIR/RTT-Config.sh\""

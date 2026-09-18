@@ -1,3 +1,24 @@
+## v3.24.0 — 2026-09-18
+
+### Added
+
+- **RTT-Config button on the Calibration page**, next to Monitor — ported
+  from the Mac fork. Opens a small panel with the exact
+  `bash <absolute-path>/RTT-Config.sh` command and a Copy button (SSH-
+  friendly, since this fork is normally headless) rather than trying to
+  drive the script's interactive prompts from the browser, which isn't
+  possible. New `RTT_CONFIG_SCRIPT` module constant computes the absolute
+  path so the command is correct regardless of install location. Zero new
+  server-side surface — pure client-side JS, no new HTTP endpoint.
+
+### Changed
+
+- **`RealTimeTalk-configure.sh` renamed to `RTT-Config.sh`** (shorter,
+  matches the dashboard button's label), matching the Mac fork. All
+  references updated; `RealTimeTalk-config-lib.sh` keeps its name (sourced
+  internally). Old CHANGELOG entries below still say
+  `RealTimeTalk-configure.sh` — left as historical record.
+
 ## v3.23.1 — 2026-09-18
 
 ### Fixed

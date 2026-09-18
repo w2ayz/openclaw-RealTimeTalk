@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RealTimeTalk-config-lib.sh — shared interview functions for the STT/TTS/
 # vocabulary setup steps, sourced by both RealTimeTalk-install-pi.sh (as part
-# of a fresh install) and RealTimeTalk-configure.sh (re-runnable anytime, no
+# of a fresh install) and RTT-Config.sh (re-runnable anytime, no
 # apt/venv/systemd-unit steps). Keeping this in one file means the two entry
 # points can't drift out of sync with each other. Mirrors the Mac fork's
 # RealTimeTalk-config-lib.sh in structure, adapted to this fork's idioms
@@ -243,7 +243,7 @@ PYEOF
         read -rp "      Continue anyway in TTS-only (no STT) mode? [Y/n]: " CONT_TEXT_ONLY
         case "$CONT_TEXT_ONLY" in [Nn]*)
             echo "      ✗ No STT key configured. Re-run this when you have one:"
-            echo "        bash \"$SKILL_DIR/RealTimeTalk-configure.sh\""
+            echo "        bash \"$SKILL_DIR/RTT-Config.sh\""
             return 1
             ;;
         esac
