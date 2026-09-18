@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.23.0"
+__version__ = "3.23.1"
 
 import argparse
 import asyncio
@@ -1471,6 +1471,26 @@ def _normalize(text: str) -> str:
     t = re.sub(r'\b5\b', 'five', t)
     return " ".join(t.split())
 
+def _matches_phrase_exact(transcript: str, phrases: set) -> bool:
+    """True if the transcript contains any trigger phrase as a literal substring
+    after normalisation — no fuzzy word-overlap pass.
+
+    Use this (not _matches_phrase) for any command that fires immediately with
+    no confirmation step and no fallback to normal agent routing on a false
+    positive — sleep, monitoring on/off, owner-only on/off, continue. Ported
+    from the Mac fork (confirmed live there): _matches_phrase's 60%-of-the-
+    PHRASE's-words fuzzy pass false-fired on ordinary questions — e.g.
+    "what's ON your keyword list?" matched a 3-word "<name> monitor on"
+    phrase via the agent name + "on" alone, "monitor"/"monitoring" never
+    said — and hijacked the turn. WAKE_PHRASES' equally loose fuzzy match is
+    safe because it's gated by a "Yes?" confirmation; nothing else here is.
+    """
+    t = _normalize(transcript)
+    for phrase in phrases:
+        if _normalize(phrase) in t:
+            return True
+    return False
+
 def _matches_phrase(transcript: str, phrases: set) -> bool:
     """True if the transcript contains any trigger phrase, or is a fuzzy word-overlap match.
 
@@ -1478,6 +1498,10 @@ def _matches_phrase(transcript: str, phrases: set) -> bool:
     1. Exact substring after normalisation.
     2. Fuzzy: if the transcript shares ≥ 60% of a phrase's words it counts as a match
        (handles car-noise garbling like 'five wake up' → 'five break up').
+
+    Only safe for phrase sets where a false positive is cheap to recover from
+    — currently just WAKE_PHRASES, gated by a confirmation step right after.
+    Everything else uses _matches_phrase_exact (see its docstring for why).
     """
     t = _normalize(transcript)
     for phrase in phrases:
@@ -4198,7 +4222,7 @@ class BaseVoiceSession:
             return
 
         # Sleep phrase — only meaningful when active
-        if _matches_phrase(normalized, SLEEP_PHRASES):
+        if _matches_phrase_exact(normalized, SLEEP_PHRASES):
             if self._active:
                 self._active = False
                 _persist_active[0] = False
@@ -4220,7 +4244,7 @@ class BaseVoiceSession:
             return
 
         # Monitoring toggle — works regardless of active state
-        if _matches_phrase(normalized, MONITOR_ON_PHRASES):
+        if _matches_phrase_exact(normalized, MONITOR_ON_PHRASES):
             if not self._monitoring:
                 self._monitoring = True
                 _persist_monitoring[0] = True
@@ -4230,7 +4254,7 @@ class BaseVoiceSession:
                     None, speak, "Monitoring started.", self.alsa_output
                 )
             return
-        if _matches_phrase(normalized, MONITOR_OFF_PHRASES):
+        if _matches_phrase_exact(normalized, MONITOR_OFF_PHRASES):
             if self._monitoring:
                 self._monitoring = False
                 _persist_monitoring[0] = False
@@ -4242,7 +4266,7 @@ class BaseVoiceSession:
             return
 
         # Owner-only mode toggles — already owner-gated by _verify_speaker above
-        if _matches_phrase(normalized, OWNER_ONLY_ON_PHRASES):
+        if _matches_phrase_exact(normalized, OWNER_ONLY_ON_PHRASES):
             if not _verification_available():
                 await asyncio.get_running_loop().run_in_executor(
                     None, speak,
@@ -4266,7 +4290,7 @@ class BaseVoiceSession:
                         "anyone over radio until you add one.",
                         self.alsa_output)
             return
-        if _matches_phrase(normalized, OWNER_ONLY_OFF_PHRASES):
+        if _matches_phrase_exact(normalized, OWNER_ONLY_OFF_PHRASES):
             if _owner_only[0]:
                 _owner_only[0] = False
                 _save_voice_mode()
@@ -4278,7 +4302,7 @@ class BaseVoiceSession:
             return
 
         # Continue phrase — resume paused TTS (from where it was cut off) without asking the AI Agent again
-        if _matches_phrase(normalized, CONTINUE_PHRASES):
+        if _matches_phrase_exact(normalized, CONTINUE_PHRASES):
             saved = _paused_speech[0]
             if saved and not self._busy.is_set():
                 _paused_speech[0] = None  # clear immediately so concurrent tasks don't re-enter

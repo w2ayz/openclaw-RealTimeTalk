@@ -1,3 +1,38 @@
+## v3.23.1 — 2026-09-18
+
+### Fixed
+
+- **Fuzzy voice-command matching false-fired on ordinary questions,
+  hijacking the turn.** Ported from the Mac fork, where it was caught
+  live: asking "what's on your keyword list?" triggered "monitoring ON"
+  instead of being answered. `_matches_phrase`'s fuzzy pass only requires
+  60% of a *phrase*'s words to appear in the transcript — for short
+  phrases where one word is the agent name (in nearly every utterance) and
+  another is a common word ("on", "start", "to"), any unrelated sentence
+  containing both cleared the bar without the actual command word
+  ("monitor"/"monitoring"/"sleep"/etc.) ever being said. Same class hits
+  `MONITOR_ON/OFF_PHRASES` ("turn on the porch light", "start a timer"),
+  `SLEEP_PHRASES` (worst case — silences the daemon, no confirmation, no
+  fallback — "go to the store website..."), and `OWNER_ONLY_ON_PHRASES`
+  ("get that book to me...").
+  Added `_matches_phrase_exact()` (substring-only, no fuzzy pass) and
+  switched every phrase set that fires immediately with no confirmation
+  step — `SLEEP_PHRASES`, `MONITOR_ON/OFF_PHRASES`,
+  `OWNER_ONLY_ON/OFF_PHRASES`, `CONTINUE_PHRASES` — to use it.
+  `WAKE_PHRASES` keeps the fuzzy `_matches_phrase` (verified still working:
+  "zeebot break up" still fuzzy-matches "zeebot wake up") since a false
+  wake is cheap — it only asks "Yes?" and self-corrects on no reply. This
+  fork's phrase sets are built by `_build_phrase_sets()` (a cleaner,
+  already-refactored design than the Mac fork's inline literal-set +
+  manual rebuild) and were left as-is — only the matcher used at each call
+  site changed, no phrase-set content needed touching since exact-substring
+  matching is safe regardless.
+
+Verified via `ast.parse` + `pyflakes` (no undefined names/syntax errors)
+and the real phrase sets exercised against both the reported false
+positives (all now correctly fall through) and legitimate commands (all
+still fire) — not yet booted on real Pi hardware, same caveat as v3.23.0.
+
 ## v3.23.0 — 2026-09-18
 
 ### Added

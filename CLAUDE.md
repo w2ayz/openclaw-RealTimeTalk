@@ -39,6 +39,26 @@
   functions exercised against scratch configs), **not yet verified on real
   Pi hardware** — see the point below on why that matters.
 
+- **Voice-command phrase matching: `_matches_phrase`'s fuzzy pass is only
+  safe for `WAKE_PHRASES`.** It counts a match at ≥60% of a *phrase*'s
+  words present anywhere in the transcript — fine for wake, which asks
+  "Yes?" and self-corrects on a false positive, but every other phrase set
+  (`SLEEP_PHRASES`, `MONITOR_ON/OFF_PHRASES`, `OWNER_ONLY_ON/OFF_PHRASES`,
+  `CONTINUE_PHRASES`) fires immediately with no confirmation. Ported from
+  the Mac fork in v3.23.1, caught live there: short phrases combining the
+  agent name (in nearly every utterance) with one common word ("on",
+  "start", "to") false-fired on ordinary questions — "what's on your
+  keyword list?" → monitoring ON; "go to the store website" → sleep (worst
+  case: silences the daemon, no fallback). Use `_matches_phrase_exact()`
+  (substring-only) for any new phrase set unless it has its own
+  confirmation gate like wake's. Note this fork's phrase sets are built by
+  `_build_phrase_sets(name_lc, wake_phrase)` — a cleaner, already-
+  refactored single-function design, unlike the Mac fork's inline literal
+  set + a separate manual-rebuild block in `main()` that has to be kept in
+  sync by hand (and did drift once — the Mac fork's `WAKE_PHRASES` rebuild
+  silently drops its STT-mishearing variants like "zibob wake up" that the
+  base set defines, since it replaces rather than merges).
+
 - This fork has shipped multiple bugs that only a *live* Pi run would
   catch (v3.22.0–v3.22.5: `load_gemini_key()` called but never defined —
   `NameError` on every single startup, undetected for 6 versions because
