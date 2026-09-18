@@ -1,3 +1,26 @@
+## v3.22.18 — 2026-09-18
+
+### Added
+
+- **Startup warnings for an uncalibrated noise gate with OpenAI STT.**
+  Ported from the Mac fork's finding: `gpt-live-transcribe`
+  (`turn_detection: null`) has no server-side voice detection anymore —
+  this daemon's own noise gate is the sole signal deciding when
+  someone's stopped talking, so a stale gate can leave OpenAI
+  transcripts never finalizing. This fork's own `MIC_GATE_PEAK = 300`
+  and `AGC_MIC_GATE = 60` already reflect deliberate reasoning for this
+  exact concern (the Mac fork's old default of 20 didn't) — so the
+  numeric defaults are untouched here. Added a `log.warning` on the two
+  *raw*-signal paths (explicit `--input-source`, and the static
+  fallback when the WebRTC AGC source is unavailable) reminding to run
+  `--calibrate` if transcripts don't finalize; deliberately **not**
+  added to the AGC-active path, since AGC normalizes gain/noise
+  upstream and `AGC_MIC_GATE` is a fixed light-touch constant by
+  design, not something `--calibrate`'s room-noise measurement is
+  meant to override. Also added a matching reminder to
+  `RealTimeTalk-install-pi.sh`'s post-install notes when an OpenAI key
+  is configured.
+
 ## v3.22.17 — 2026-09-18
 
 ### Added

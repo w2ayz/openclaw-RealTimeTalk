@@ -27,7 +27,7 @@ Requires:
     _resolve_edge_tts_script(); MP3 output decoded via mpg123
 """
 
-__version__ = "3.22.17"
+__version__ = "3.22.18"
 
 import argparse
 import asyncio
@@ -236,7 +236,14 @@ TTS_START_KIND, TTS_START_VALUE = _parse_tts_start(RTT_TTS_START)
 TTS_MAX_SENTENCE = int(os.environ.get("RTT_TTS_MAX_SENTENCE", "500") or "500")
 MIC_GAIN          = 3.0          # headset boom mic is close-talking — 16× was over-amplifying
 MIC_GATE_PEAK     = 300          # headset mic is close-talking — lower gate than desk mic
-                                 # (lets OpenAI's VAD see real silence between words)
+                                 # (lets real silence between words register). Since the
+                                 # move to gpt-live-transcribe (turn_detection: null — no
+                                 # server-side VAD, see OpenAIRealtimeSession's client-side
+                                 # VAD ~4809), this gate (or AGC_MIC_GATE below, whichever
+                                 # path is active) is the SOLE signal deciding when OpenAI
+                                 # thinks a turn has ended — too low and ambient noise never
+                                 # reads as silence, so transcripts never finalize. Verify
+                                 # with --calibrate rather than trusting either static value.
 MIC_GATE_MIN      = 30           # calibration clamp — quietest usable room
 MIC_GATE_MAX      = 15000        # calibration clamp — raised for AIOC line-level input
 # WebRTC AGC virtual source (PipeWire module-echo-cancel). When present it
@@ -8341,6 +8348,12 @@ if __name__ == "__main__":
     MIC_GATE_PEAK = args.mic_gate
     if args.spk_threshold is not None:
         _spk_threshold_cli[0] = max(0.2, min(0.9, args.spk_threshold))
+    # AGC (below) is a self-normalizing path — WebRTC cleans gain/noise upstream,
+    # so AGC_MIC_GATE is a deliberate light-touch constant, not something users
+    # are expected to --calibrate away from. The other two paths use the raw
+    # mic signal directly, so a stale/uncalibrated gate there really can starve
+    # OpenAI's client-side turn detection (see MIC_GATE_PEAK's comment above) —
+    # only warn on those.
     if args.input_source:
         # User explicitly chose a physical mic — set it as PipeWire default
         # and use direct (non-AGC) gain/gate settings.
@@ -8349,6 +8362,12 @@ if __name__ == "__main__":
         MIC_GATE_PEAK = max(MIC_GATE_MIN, args.mic_gate)
         log.info("Explicit --input-source %s — direct mode gain=%.1f gate=%d",
                  args.input_source, MIC_GAIN, MIC_GATE_PEAK)
+        if load_openai_key():
+            log.warning("Direct (non-AGC) mic mode with OpenAI STT: gate=%d is the "
+                         "ONLY signal deciding when you've stopped talking (no "
+                         "server-side VAD on gpt-live-transcribe). If transcripts "
+                         "never finalize, run --calibrate for this mic/room.",
+                         MIC_GATE_PEAK)
     elif _activate_agc_source():
         MIC_GAIN      = AGC_MIC_GAIN
         MIC_GATE_PEAK = AGC_MIC_GATE
@@ -8358,6 +8377,12 @@ if __name__ == "__main__":
     else:
         log.info("AGC source unavailable — fallback to static gain=%.1f "
                  "gate=%d", MIC_GAIN, MIC_GATE_PEAK)
+        if load_openai_key():
+            log.warning("AGC unavailable — using the static, uncalibrated gate=%d "
+                         "with OpenAI STT: this is the ONLY signal deciding when "
+                         "you've stopped talking (no server-side VAD on "
+                         "gpt-live-transcribe). If transcripts never finalize, run "
+                         "--calibrate for this mic/room.", MIC_GATE_PEAK)
     _mic_gate_ref[0] = MIC_GATE_PEAK
 
     # Load per-device calibration store and apply to current default sink
