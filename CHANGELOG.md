@@ -1,3 +1,38 @@
+## v3.25.1 — 2026-09-24
+
+### Added
+
+- **ElevenLabs TTS voice is now configurable**, not hardcoded to "Lily" —
+  ported from the Mac fork. `_resolve_elevenlabs_voice_id()` reads an
+  `elevenlabsVoiceId` key from `rtt_tts_config.json` at startup (falling
+  back to `DEFAULT_ELEVENLABS_VOICE_ID` — Lily — if absent/blank).
+  Adapted to this fork's plain-module-global idiom (`global
+  _elevenlabs_voice_id` inside `__main__`, matching `_elevenlabs_key`'s
+  existing pattern) rather than Mac's mutable-list-cell trick, since this
+  fork's `main()` body already runs as top-level code under `__main__`
+  and its other lazily-resolved TTS/STT values use plain globals, not
+  list cells. **No interactive setup prompt writes this key yet** — add
+  it to `rtt_tts_config.json` by hand for now.
+
+### Fixed
+
+- **`RealTimeTalk-config-lib.sh`'s TTS-order setup step no longer
+  clobbers the rest of `rtt_tts_config.json`** — same bug as the Mac
+  fork, same fix: `json.dump({"order": terms}, ...)` overwrote the whole
+  file (destroying `elevenlabsVoiceId` above, or anything else set by
+  hand) every time `RTT-Config.sh`'s TTS-order step ran. Now reads the
+  existing config first and merges `terms` into it before writing back.
+
+### Not ported
+
+- **Mac fork's v3.25.0 (auto-build the mic-permission wrapper app on
+  install)** does not apply here — this fork already has no
+  microphone-permission wrapper step (see Deployment.md's install
+  section: "no microphone-permission wrapper needed"), since Linux/
+  PipeWire has no TCC-equivalent privacy subsystem to work around.
+  Version bumped straight past 3.25.0 to keep in lockstep with the Mac
+  fork's version number without introducing a no-op step here.
+
 ## v3.24.0 — 2026-09-18
 
 ### Added
