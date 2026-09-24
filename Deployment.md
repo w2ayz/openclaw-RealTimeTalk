@@ -22,7 +22,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running locally | RealTimeTalk routes all AI through it (`ws://127.0.0.1:18789`, protocol v4). Won't start without it. |
 | OpenClaw 2026.5+ | Gateway protocol v4 required. |
-| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. Gemini: `AIza...` key from AI Studio, stored at `talk.providers.gemini.apiKey`. See §3. |
+| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. Gemini: `AQ.` key (usually 53 characters) or legacy `AIza...` key from AI Studio, stored at `talk.providers.gemini.apiKey`. See §3. |
 | ElevenLabs API key (optional) | First tier of the Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper). Read from `~/.openclaw/secrets/elevenlabs`, not `openclaw.json` — see [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 | edge-tts skill + Node.js (optional) | Second tier of that chain — free, no key, native zh/en neural voices. Install at `~/.openclaw/workspace/skills/edge-tts/`; installer resolves it. See [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 
@@ -103,7 +103,7 @@ hidden input, verified against the provider API). To set keys by hand:
 python3 - <<'PY'
 import json, os
 KEY    = "sk-..."    # your OpenAI key — regular sk-... or the openai-codex OAuth profile both work; or ""
-GEMKEY = "AIza..."   # your Gemini API key from AI Studio; or ""
+GEMKEY = "AQ...."   # your Gemini API key from AI Studio; or ""
 path = os.path.expanduser("~/.openclaw/openclaw.json")
 d = json.load(open(path))
 p = d.setdefault("talk", {}).setdefault("providers", {})

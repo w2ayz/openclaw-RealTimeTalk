@@ -43,9 +43,11 @@ has_any_stt_key() {
 # since a fresh Pi can already have one exported for other tools. Returns 0
 # if the provider has a usable key afterwards, 1 otherwise.
 ensure_provider_key() {
-    local prov="$1" prefix="^sk-"
-    [ "$prov" = "gemini" ] && prefix="^AIza"
-    [ "$prov" = "elevenlabs" ] && prefix=""
+    local prov="$1" prefix="^sk-" prefix_hint="sk-..."
+    # Gemini keys come in two formats: the newer "AQ." keys (usually 53 chars,
+    # checked below) and legacy "AIza" keys (39 chars).
+    [ "$prov" = "gemini" ] && { prefix="^(AQ\\.|AIza)"; prefix_hint="AQ.... or AIza..."; }
+    [ "$prov" = "elevenlabs" ] && { prefix=""; prefix_hint=""; }
     local existing
     existing=$("$PYTHON" - "$OPENCLAW_CONFIG" "$prov" <<'PYEOF'
 import json, sys
@@ -91,7 +93,11 @@ PYEOF
 
     if [ -n "$prefix" ] && ! echo "$KEY" | grep -qE "$prefix"; then
         local reply
-        read -rp "      ⚠ That doesn't look like a $prov key (expected ${prefix#^}...). Use it anyway? [y/N]: " reply
+        read -rp "      ⚠ That doesn't look like a $prov key (expected $prefix_hint). Use it anyway? [y/N]: " reply
+        case "$reply" in [Yy]|yes|Yes) ;; *) return 1 ;; esac
+    elif [ "$prov" = "gemini" ] && [[ "$KEY" == AQ.* ]] && [ "${#KEY}" -ne 53 ]; then
+        local reply
+        read -rp "      ⚠ Gemini AQ. keys are usually 53 characters; this one is ${#KEY} (truncated paste?). Use it anyway? [y/N]: " reply
         case "$reply" in [Yy]|yes|Yes) ;; *) return 1 ;; esac
     fi
 
@@ -188,7 +194,7 @@ PYEOF
     echo ""
     echo "      STT engine setup — which provider key(s) do you want to use?"
     echo "        [1] OpenAI Realtime        (regular sk-... API key — NOT the ChatGPT OAuth profile)"
-    echo "        [2] Gemini Transcribe Live (Gemini API key, AIza...)"
+    echo "        [2] Gemini Transcribe Live (Gemini API key, AQ.... or AIza...)"
     echo "        [3] Both                   (pick the default engine; the other becomes the fallback)"
     echo "        [4] Keep existing configuration"
     echo "        [5] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"

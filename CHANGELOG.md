@@ -1,3 +1,24 @@
+## Unreleased
+
+### Fixed
+
+- **`RealTimeTalk-config-lib.sh` (RTT-Config / installer) now accepts
+  Gemini API keys starting with `AQ.`** — the newer key format, usually
+  53 characters. It previously only accepted the legacy `AIza...` format
+  (39 characters, still accepted), so a real `AQ.` key hit the "doesn't
+  look like a gemini key" warning and was refused unless overridden. An
+  `AQ.` key that isn't 53 characters gets a "truncated paste?" confirm
+  rather than a hard rejection. `Deployment.md` updated to match. Pi fork
+  only so far — the Mac fork's config-lib still checks `^AIza`.
+- **The daemon ignored SIGTERM (and `/stop`) while auto-sleeping**, so
+  `systemctl --user restart` (and `RealTimeTalk-toggle.sh restart`, and
+  RTT-Config's "restart now?" prompt) hung for systemd's full 90 s
+  `TimeoutStopSec` before SIGKILL. `main()` parks in
+  `run_in_executor(None, _wake_event[0].wait)` while asleep and only
+  watched `stop_event` afterwards; both stop paths now go through a
+  `_request_stop()` that also sets `_wake_event`. Not yet checked whether
+  the Mac fork has the same wait.
+
 ## v3.25.1 — 2026-09-24
 
 ### Added

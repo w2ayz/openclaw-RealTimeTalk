@@ -8285,8 +8285,16 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     loop       = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
+    def _request_stop():
+        stop_event.set()
+        # While auto-sleeping, main() blocks in an executor thread on
+        # _wake_event.wait() and never looks at stop_event — without this the
+        # daemon ignores SIGTERM/`/stop` until systemd SIGKILLs it (90 s).
+        if _wake_event[0]:
+            _wake_event[0].set()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop_event.set)
+        loop.add_signal_handler(sig, _request_stop)
 
     openai_key = load_openai_key()
     gemini_key = load_gemini_key()
@@ -8383,7 +8391,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                     len(_openai_kw_rejected), _openai_kw_rejected)
 
     session_ref: list = [None]
-    start_http_server(http_port, lambda: loop.call_soon_threadsafe(stop_event.set), session_ref)
+    start_http_server(http_port, lambda: loop.call_soon_threadsafe(_request_stop), session_ref)
     log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or '%s wake up' to activate)", AGENT_NAME)
 
     while not stop_event.is_set():
