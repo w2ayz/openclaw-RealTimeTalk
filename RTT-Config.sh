@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # RTT-Config.sh — re-runnable setup for STT keys/engine, TTS
-# keys/engine order, and STT custom vocabulary. Safe to run anytime after
+# keys/engine order, ElevenLabs voice/model, and STT custom vocabulary. Safe to run anytime after
 # the initial install (RealTimeTalk-install-pi.sh) — it never touches apt
 # packages, the Python venv, Piper voices, or the systemd user service unit.
 # Use it to add a key you skipped earlier, change the TTS engine order, or
@@ -36,11 +36,12 @@ echo "  Every step below can be skipped — press Enter to keep what's already"
 echo "  there. This whole script is safe to re-run anytime:"
 echo "    bash \"$SKILL_DIR/RTT-Config.sh\""
 echo "  Run it again later to add a key you skipped now, change the TTS engine"
-echo "  order, or add more STT vocabulary."
+echo "  order, pick the ElevenLabs voice/model, or add more STT vocabulary."
 echo ""
 
 run_stt_setup
 run_tts_setup
+run_elevenlabs_setup
 run_vocabulary_setup
 
 echo ""

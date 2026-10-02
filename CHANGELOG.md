@@ -1,3 +1,18 @@
+## v3.25.6 — 2026-10-02
+
+### Added
+
+- **ElevenLabs voice and model step in `RTT-Config.sh`** (and the
+  installer), via a new `run_elevenlabs_setup` in
+  `RealTimeTalk-config-lib.sh`. It lists the account's own voices
+  (cloned/professional/generated, plus Lily) and every TTS-capable model
+  live from the ElevenLabs API, marks the current choice, and writes
+  `elevenlabsVoiceId` / `elevenlabsModel` to `rtt_tts_config.json`. Enter
+  keeps the current values; a voice ID can also be pasted directly, which
+  is the fallback when the key lacks `voices_read`. Skipped when there's no
+  ElevenLabs key or `elevenlabs` isn't in the TTS order. Not yet ported to
+  the Mac fork.
+
 ## v3.25.5 — 2026-10-02
 
 ### Added

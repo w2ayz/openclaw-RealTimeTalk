@@ -331,6 +331,133 @@ PYEOF
     echo "      ✓ TTS order saved to $TTS_CFG: $SAVED_ORDER"
 }
 
+# run_elevenlabs_setup — pick the ElevenLabs voice and model, written to
+# $TTS_CFG as elevenlabsVoiceId / elevenlabsModel (read by the daemon at
+# startup, v3.25.5+). Lists the account's own voices and the TTS-capable
+# models live from the ElevenLabs API, so it needs a key with voices_read and
+# models_read; without those it falls back to pasting an ID by hand. Skipped
+# when no ElevenLabs key is configured or elevenlabs isn't in the TTS order.
+run_elevenlabs_setup() {
+    echo ""
+    echo "ElevenLabs voice and model"
+    # stdin stays on the terminal (python -c, not a heredoc) so input() works.
+    "$PYTHON" -c "$(cat <<'PYEOF'
+import json, os, sys, urllib.request, urllib.error
+
+oc_path, tts_path = sys.argv[1], sys.argv[2]
+DEFAULT_VOICE = "pFZP5JQG7iQjIQuC4Bku"   # Lily — matches DEFAULT_ELEVENLABS_VOICE_ID
+DEFAULT_MODEL = "eleven_v3"              # matches DEFAULT_ELEVENLABS_MODEL
+MODEL_NOTES = {
+    "eleven_v4": "newest, expressive",
+    "eleven_v4_turbo": "v4, lower latency",
+    "eleven_v3": "daemon default; instant clones drift toward a generic voice",
+    "eleven_multilingual_v2": "closest likeness for instant clones",
+    "eleven_turbo_v2_5": "fast, good likeness",
+    "eleven_flash_v2_5": "fastest, lower quality",
+}
+
+try:
+    cfg = json.load(open(tts_path))
+except Exception:
+    cfg = {}
+order = cfg.get("order") or ["elevenlabs"]
+if "elevenlabs" not in order:
+    print("      → elevenlabs isn't in the TTS order — skipping")
+    sys.exit(0)
+key = (json.load(open(oc_path)).get("talk", {}).get("providers", {})
+       .get("elevenlabs", {}).get("apiKey", ""))
+if not isinstance(key, str):
+    key = ""
+key = key or os.environ.get("ELEVENLABS_API_KEY", "")
+if not key:
+    print("      → no ElevenLabs key configured — skipping")
+    sys.exit(0)
+
+def get(path):
+    req = urllib.request.Request("https://api.elevenlabs.io" + path,
+                                 headers={"xi-api-key": key})
+    return json.load(urllib.request.urlopen(req, timeout=20))
+
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+cur_voice = cfg.get("elevenlabsVoiceId") or DEFAULT_VOICE
+cur_model = cfg.get("elevenlabsModel") or DEFAULT_MODEL
+
+# ── Voice ──
+voices = []
+try:
+    data = get("/v2/voices?page_size=100")
+    voices = [(v["voice_id"], v.get("name", "?"), v.get("category", ""))
+              for v in data.get("voices", []) if v.get("category") != "premade"]
+except urllib.error.HTTPError as e:
+    print(f"      → can't list voices (HTTP {e.code} — key may lack voices_read)")
+except Exception as e:
+    print(f"      → can't list voices ({e})")
+if not any(v[0] == DEFAULT_VOICE for v in voices):
+    voices.append((DEFAULT_VOICE, "Lily (RTT default)", "premade"))
+if not any(v[0] == cur_voice for v in voices):
+    voices.append((cur_voice, "(current, not in your voice list)", ""))
+print("      Voices:")
+for i, (vid, name, cat) in enumerate(voices, 1):
+    mark = "  ← current" if vid == cur_voice else ""
+    print(f"        {i}) {name} [{cat}] {vid}{mark}")
+new_voice = cur_voice
+while True:
+    a = ask("      Voice number, or paste a voice ID [Enter to keep current]: ")
+    if not a:
+        break
+    if a.isdigit() and 1 <= int(a) <= len(voices):
+        new_voice = voices[int(a) - 1][0]
+        break
+    if len(a) >= 16 and a.isalnum():
+        new_voice = a
+        break
+    print(f"      → enter 1-{len(voices)} or a voice ID")
+
+# ── Model ──
+models = []
+try:
+    models = [m["model_id"] for m in get("/v1/models")
+              if m.get("can_do_text_to_speech")]
+except Exception as e:
+    print(f"      → can't list models ({e})")
+for m in (cur_model, DEFAULT_MODEL):
+    if m not in models:
+        models.append(m)
+print("      Models:")
+for i, m in enumerate(models, 1):
+    note = MODEL_NOTES.get(m, "")
+    mark = "  ← current" if m == cur_model else ""
+    print(f"        {i}) {m}" + (f" — {note}" if note else "") + mark)
+new_model = cur_model
+while True:
+    a = ask("      Model number [Enter to keep current]: ")
+    if not a:
+        break
+    if a.isdigit() and 1 <= int(a) <= len(models):
+        new_model = models[int(a) - 1]
+        break
+    print(f"      → enter 1-{len(models)}")
+
+if (new_voice, new_model) == (cur_voice, cur_model):
+    print(f"      ✓ keeping voice {cur_voice} on {cur_model}")
+    sys.exit(0)
+try:
+    cfg = json.load(open(tts_path))
+except Exception:
+    cfg = {}
+cfg["elevenlabsVoiceId"] = new_voice
+cfg["elevenlabsModel"] = new_model
+json.dump(cfg, open(tts_path, "w"), indent=2)
+print(f"      ✓ ElevenLabs voice {new_voice} on {new_model} saved to {tts_path}")
+PYEOF
+)" "$OPENCLAW_CONFIG" "$TTS_CFG" || echo "      → ElevenLabs voice/model step failed — edit $TTS_CFG by hand"
+}
+
 # run_vocabulary_setup — review/extend the STT custom-vocabulary hint list.
 run_vocabulary_setup() {
     echo ""
