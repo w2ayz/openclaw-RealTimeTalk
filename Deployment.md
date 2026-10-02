@@ -72,7 +72,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 | `~/.local/share/piper/voices/` | English + Chinese Piper voice models |
 | `~/.openclaw/workspace/skills/edge-tts/scripts/node_modules/` | edge-tts skill deps — `npm install`ed by the installer if the skill is present |
 | `~/.local/share/rtt/speaker/` | CAM++ speaker-verification model (owner-only mode) |
-| `~/.config/pipewire/pipewire.conf.d/99-rtt-agc*.conf` | WebRTC AGC virtual-mic PipeWire config, written at runtime by the daemon itself, not the installer |
+| `~/.config/pipewire/pipewire.conf.d/99-rtt-agc*.conf` | WebRTC AGC profile record (radio vs mic, capture device), written at runtime by the daemon itself, not the installer. Since v3.25.4 every line is commented out so PipeWire never loads a module from it; the daemon loads the module itself. Older `99-rtt-agc-radio.conf` files are stale and safe to delete |
 
 ### Runtime state (created by the daemon itself, first run)
 

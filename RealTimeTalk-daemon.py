@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.25.3"
+__version__ = "3.25.4"
 
 import argparse
 import asyncio
@@ -817,6 +817,51 @@ def _ptt_open() -> None:
 _AGC_CONF      = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf")
 _AGC_CONF_RADIO = os.path.expanduser("~/.config/pipewire/pipewire.conf.d/99-rtt-agc-radio.conf")
 
+
+def _write_agc_conf(content: str) -> None:
+    """Persist the AGC profile with every line commented out. PipeWire must
+    NOT load an echo-cancel module from this file: a native context.modules
+    instance can't be removed without restarting PipeWire (pactl unload →
+    "Access denied", pw-cli destroy → silent no-op, live-confirmed
+    2026-10-02), so it outlived every mic↔radio hot-swap as a stale
+    rtt_agc_source the STT stream kept binding to. The daemon loads the
+    module itself via pactl; this file only records the chosen profile
+    (target.object, radio vs mic) for the next startup."""
+    lines = [l if l.startswith("#") or not l.strip() else "# " + l
+             for l in content.splitlines()]
+    os.makedirs(os.path.dirname(_AGC_CONF), exist_ok=True)
+    with open(_AGC_CONF, "w") as f:
+        f.write("# Written by RealTimeTalk — state record only, intentionally inert.\n"
+                + "\n".join(lines) + "\n")
+
+
+def _native_agc_modules() -> list:
+    """IDs of echo-cancel modules PipeWire loaded from conf.d at its own
+    startup (legacy, pre-v3.25.4 configs). These survive hot-swaps."""
+    try:
+        mods = subprocess.run(["pactl", "list", "short", "modules"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    return [l.split()[0] for l in mods.splitlines()
+            if "libpipewire-module-echo-cancel" in l]
+
+
+def _unload_agc_modules() -> None:
+    """Unload every pactl-loaded echo-cancel module before loading a fresh one.
+    Warns if a native conf-loaded one is present — it can't be removed live and
+    will shadow the fresh rtt_agc_source until PipeWire restarts."""
+    mods = subprocess.run(["pactl", "list", "short", "modules"],
+                          capture_output=True, text=True).stdout
+    for line in mods.splitlines():
+        if "echo-cancel" in line and "libpipewire-module-echo-cancel" not in line:
+            subprocess.run(["pactl", "unload-module", line.split()[0]], capture_output=True)
+    if _native_agc_modules():
+        log.warning("Stale conf-loaded echo-cancel module(s) %s still present — "
+                    "STT may stay bound to the old rtt_agc_source. Run: systemctl "
+                    "--user restart pipewire pipewire-pulse wireplumber",
+                    ",".join(_native_agc_modules()))
+
 _AGC_PROFILE_RADIO = """\
 # RealTimeTalk AGC — Radio mode (active radio interface: AIOC, Digirig, ...).
 # voice_detection=false: WebRTC VAD suppresses audio that doesn't match
@@ -881,6 +926,7 @@ def _apply_agc_profile(radio: bool) -> None:
             # Never allow the virtual AGC source itself as source_master (self-referential loop)
             _candidates = [
                 _pre_radio_mic[0],
+                RAW_MIC_SOURCE,
                 _find_always_on_mic_source(),
                 _FALLBACK_MIC,
             ]
@@ -891,33 +937,11 @@ def _apply_agc_profile(radio: bool) -> None:
             )
             content = _AGC_PROFILE_MIC.format(mic_src=mic_src)
 
-        with open(_AGC_CONF, "w") as f:
-            f.write(content)
+        _write_agc_conf(content)
 
-        # Hot-swap echo-cancel module. Two different loaders can create an
-        # echo-cancel instance here: our own pactl load-module call below
-        # (module name "module-echo-cancel", unloads cleanly via pactl), and
-        # a persistent one PipeWire itself loads at its own startup from
-        # _AGC_CONF (module name "libpipewire-module-echo-cancel", written
-        # above for resilience across a PipeWire restart) — live-confirmed
-        # (2026-08-16) that `pactl unload-module` returns "Access denied" on
-        # that one, since it's a native context.modules entry, not a
-        # pulse-compat module. Left alive, its stale node coexists under the
-        # identical name "rtt_agc_source" alongside the fresh one, and
-        # WirePlumber's default-source resolution was observed binding real
-        # capture clients (the daemon's own STT stream) to the OLD stale
-        # node — so a mic↔radio switch silently stopped reaching actual
-        # speech recognition even though the logs claimed success. Only
-        # `pw-cli destroy` can remove it.
-        mods = subprocess.run(["pactl", "list", "short", "modules"],
-                              capture_output=True, text=True).stdout
-        for line in mods.splitlines():
-            if "echo-cancel" not in line:
-                continue
-            mod_id = line.split()[0]
-            subprocess.run(["pactl", "unload-module", mod_id], capture_output=True)
-            if "libpipewire-module-echo-cancel" in line:
-                subprocess.run(["pw-cli", "destroy", mod_id], capture_output=True)
+        # Hot-swap echo-cancel module (see _write_agc_conf for why only
+        # pactl-loaded instances exist).
+        _unload_agc_modules()
         _ta.sleep(0.5)
         subprocess.run(["pactl", "load-module", "module-echo-cancel",
                         "aec_method=webrtc",
@@ -1667,25 +1691,11 @@ def _update_agc_capture_source(physical_source: str) -> bool:
             f'target.object = "{physical_source}"',
             content,
         )
-        with open(config, "w") as f:
-            f.write(content)
+        _write_agc_conf(content)
         # Update RAW_MIC_SOURCE so speaker-cal captures from the right mic
         globals()['RAW_MIC_SOURCE'] = physical_source
-        # Hot-swap: unload old echo-cancel module, load new one. The
-        # config-loaded "libpipewire-module-echo-cancel" instance rejects
-        # pactl's unload ("Access denied" — it's a native context.modules
-        # entry, not pulse-compat) and needs pw-cli instead, or it survives
-        # as a stale, identically-named duplicate — see _apply_agc_profile
-        # for the live-confirmed failure mode this caused.
-        mods = subprocess.run(["pactl", "list", "short", "modules"],
-                              capture_output=True, text=True).stdout
-        for line in mods.splitlines():
-            if "echo-cancel" not in line:
-                continue
-            mid = line.split()[0]
-            subprocess.run(["pactl", "unload-module", mid], capture_output=True)
-            if "libpipewire-module-echo-cancel" in line:
-                subprocess.run(["pw-cli", "destroy", mid], capture_output=True)
+        # Hot-swap: unload old echo-cancel module, load new one.
+        _unload_agc_modules()
         import time as _t2; _t2.sleep(0.5)
         subprocess.run([
             "pactl", "load-module", "module-echo-cancel",
@@ -1721,10 +1731,27 @@ def _activate_agc_source() -> bool:
     Returns True when AGC is active (daemon should use AGC-tuned gain/gate),
     False when it should fall back to the static --mic-gain / --mic-gate.
     """
+    if _native_agc_modules():
+        # Legacy conf-loaded module: can't be replaced live, so keep using it
+        # this session; rewriting the conf inert retires it on the next
+        # PipeWire restart.
+        try:
+            _write_agc_conf(open(_AGC_CONF).read())
+        except Exception:
+            pass
+    else:
+        # Recreate from the recorded profile every start, so a module left
+        # over from a previous run can't carry a stale mode/device.
+        try:
+            _conf = open(_AGC_CONF).read()
+        except Exception:
+            _conf = ""
+        _radio = (("AIOC" in _conf or "All-In-One" in _conf
+                   or "gain_control = false" in _conf)
+                  and bool(find_radio_source()))
+        _apply_agc_profile(radio=_radio)
     if not _agc_source_available():
-        _apply_agc_profile(radio=False)
-        if not _agc_source_available():
-            return False
+        return False
     try:
         subprocess.run(
             ["pactl", "set-default-source", AGC_SOURCE_NAME],
@@ -8587,6 +8614,9 @@ if __name__ == "__main__":
     # rather than the resulting number, or a real calibrated value could
     # falsely trip this.
     _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
+    # Load the per-device calibration store first: _activate_agc_source() may
+    # switch the default sink and apply its calibration.
+    _load_cal_store()
     if args.input_source:
         # User explicitly chose a physical mic — set it as PipeWire default
         # and use direct (non-AGC) gain/gate settings.
@@ -8619,8 +8649,7 @@ if __name__ == "__main__":
                          "--calibrate for this mic/room.", MIC_GATE_PEAK)
     _mic_gate_ref[0] = MIC_GATE_PEAK
 
-    # Load per-device calibration store and apply to current default sink
-    _load_cal_store()
+    # Apply saved calibration to the current default sink (store loaded above)
     _load_output_latency()
     _default_sink = subprocess.run(["pactl","get-default-sink"],
                                    capture_output=True,text=True).stdout.strip()

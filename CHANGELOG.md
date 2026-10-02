@@ -1,3 +1,36 @@
+## v3.25.4 — 2026-10-02
+
+### Fixed
+
+- **Speech over the radio never reached speech recognition; only the
+  local USB mic was heard.** PipeWire held three nodes all named
+  `rtt_agc_source`, and the daemon's STT stream was bound to a stale one
+  fed by the C-Media USB mic, while the AIOC-fed one the daemon had just
+  loaded sat unused (DTMF still worked because its listener reads the
+  AIOC directly). Cause: `99-rtt-agc.conf` (and a leftover
+  `99-rtt-agc-radio.conf` pointing at an old AIOC serial) made PipeWire
+  load a native `libpipewire-module-echo-cancel` at its own startup, and
+  that module **can't be removed while PipeWire runs**: `pactl
+  unload-module` returns "Access denied" and `pw-cli destroy` is a silent
+  no-op (live-confirmed). The v3.12.3 fix relied on `pw-cli destroy`, so
+  every mic↔radio switch made without a PipeWire restart could still leave
+  the stale duplicate in place. Now:
+  - `_write_agc_conf()` writes the profile with every line commented out,
+    as a state record only (radio vs mic, `target.object`), so PipeWire
+    never loads a module from it.
+  - The daemon is the only owner of the echo-cancel module (via pactl).
+    `_activate_agc_source()` recreates it from the recorded profile on
+    every start, choosing radio mode when the conf names a radio interface
+    and one is connected.
+  - Mic mode now prefers the user-selected `RAW_MIC_SOURCE` when picking
+    the capture device, since the conf module no longer preserves it.
+  - If a legacy native module is still loaded, the daemon keeps using it
+    for that session, rewrites the conf to the inert form, and logs a
+    warning to restart `pipewire pipewire-pulse wireplumber`.
+  - `_load_cal_store()` now runs before AGC activation, so the radio sink
+    no longer briefly drops to the 1% "unknown device" level at startup.
+  Pi-only: the Mac fork doesn't use PipeWire.
+
 ## v3.25.3 — 2026-10-02
 
 ### Fixed

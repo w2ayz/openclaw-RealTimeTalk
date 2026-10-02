@@ -38,7 +38,7 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 Raspberry Pi (headless)
 │
 ├── PipeWire
-│       └── rtt_agc_source  (WebRTC AGC virtual mic, loaded from ~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf)
+│       └── rtt_agc_source  (WebRTC AGC virtual mic, loaded by the daemon via pactl; profile recorded in ~/.config/pipewire/pipewire.conf.d/99-rtt-agc.conf)
 │               captures C-Media USB mic → applies AGC + noise suppression
 │
 ├── systemd user service: openclaw-realtimetalk
