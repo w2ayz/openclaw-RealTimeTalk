@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.25.6"
+__version__ = "3.25.7"
 
 import argparse
 import asyncio
@@ -8268,6 +8268,9 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
                session_key: str = OPENCLAW_SESSION,
                stt_engine: str = None):
     global ALSA_OUTPUT
+    # Without this, the TTS-config block below bound function locals and
+    # _elevenlabs_tts() kept using the module defaults (Lily / eleven_v3).
+    global _elevenlabs_voice_id, _elevenlabs_model
     ALSA_OUTPUT = alsa_output   # sync global to CLI arg so HTTP handlers use the right device
     # Recover or clean up loopback modules left from a previous run.
     # Keep valid loopbacks (source still exists); kill only stale ones.

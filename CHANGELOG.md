@@ -1,3 +1,22 @@
+## v3.25.7 — 2026-10-02
+
+### Fixed
+
+- **The configured ElevenLabs voice and model were never used; RTT always
+  spoke as Lily on `eleven_v3`.** The TTS-config block that sets
+  `_elevenlabs_voice_id` / `_elevenlabs_model` runs inside `async def
+  main()`, which declared only `global ALSA_OUTPUT`, so both assignments
+  bound function locals. `_elevenlabs_tts()` kept reading the module
+  defaults, while the startup log printed the local copy and reported the
+  configured voice, hiding the bug. Affects the `elevenlabsVoiceId`
+  setting since it was introduced and the `elevenlabsModel` setting since
+  v3.25.5. Verified live in radio mode: with Kevin Tu configured, the
+  played audio's speaker embedding matched Kevin 0.80 and Lily 0.04
+  (before the fix: Lily 0.45, Kevin -0.01). An AST scan of `main()` found no
+  other module globals assigned without a `global` declaration. The Mac
+  fork's voice-id plumbing uses a different idiom (mutable list cell) and
+  should be checked separately.
+
 ## v3.25.6 — 2026-10-02
 
 ### Added
