@@ -1,3 +1,19 @@
+## v3.25.3 — 2026-10-02
+
+### Fixed
+
+- **DTMF commands didn't take effect on the Gemini STT engine until the
+  next transcript.** DTMF `123` while Five was awake-but-silent logged
+  `DTMF wake '123' received` and then did nothing: the force flags
+  (active / silent / monitor / deep-sleep) were only applied in
+  `BaseVoiceSession._send_mic`, which the OpenAI engine uses but
+  `GeminiTranscribeSession` doesn't (it has its own `_gemini_sender`).
+  On Gemini, active/silent waited for the next transcript in
+  `_handle_transcript`, and monitor and deep-sleep (`456`/`654`/`987` on
+  a live session) were never applied at all. The flag handling now lives
+  in a shared `_apply_dtmf_flags(ws)` that both send loops call each
+  iteration. Not yet checked against the Mac fork.
+
 ## v3.25.2 — 2026-09-24
 
 ### Fixed
