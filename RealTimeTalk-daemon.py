@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.25.4"
+__version__ = "3.25.5"
 
 import argparse
 import asyncio
@@ -96,13 +96,14 @@ OPENAI_TTS_SAMPLE_RATE = 24000     # OpenAI TTS outputs 24 kHz; resampled to PIP
 _openai_tts_key: str  = ""         # populated lazily from load_openai_key()
 
 DEFAULT_ELEVENLABS_VOICE_ID = "pFZP5JQG7iQjIQuC4Bku"   # "Lily - Velvety Actress" — matches the Mac fork
-ELEVENLABS_MODEL       = "eleven_v3"
+DEFAULT_ELEVENLABS_MODEL = "eleven_v3"   # instant clones track their samples far better on eleven_multilingual_v2
 ELEVENLABS_TIMEOUT     = 30.0      # a long mixed-script chunk can render slowly
 # v3.23.0: key now comes from talk.providers.elevenlabs.apiKey via
 # load_elevenlabs_key() (same convention as openai/gemini, and the Mac fork)
 # — the old flat ~/.openclaw/secrets/elevenlabs file is no longer read.
 _elevenlabs_key: str   = ""        # populated lazily from load_elevenlabs_key()
 _elevenlabs_voice_id: str = DEFAULT_ELEVENLABS_VOICE_ID  # set from rtt_tts_config.json in __main__
+_elevenlabs_model: str    = DEFAULT_ELEVENLABS_MODEL     # set from rtt_tts_config.json in __main__
 
 # Edge TTS skill — network TTS fallback between ElevenLabs and OpenAI for
 # Chinese/mixed replies. Free, no API key, native zh-CN / en-US neural voices.
@@ -2381,7 +2382,7 @@ def _elevenlabs_tts(text: str, output_path: str) -> bool:
             return False   # no ElevenLabs key configured — caller falls back down the chain
     payload = _json.dumps({
         "text": text,
-        "model_id": ELEVENLABS_MODEL,
+        "model_id": _elevenlabs_model,
         "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }).encode("utf-8")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{_elevenlabs_voice_id}?output_format=pcm_22050"
@@ -8218,6 +8219,14 @@ def _resolve_elevenlabs_voice_id() -> str:
     return DEFAULT_ELEVENLABS_VOICE_ID
 
 
+def _resolve_elevenlabs_model() -> str:
+    """Read the ElevenLabs model id from rtt_tts_config.json, falling back to eleven_v3."""
+    raw = _load_tts_settings().get("elevenlabsModel")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return DEFAULT_ELEVENLABS_MODEL
+
+
 def _resolve_stt_engine(openai_key: str, gemini_key: str) -> str:
     """Pick the active STT engine from CLI arg, config, or key availability."""
     stt_cfg = _load_stt_settings()
@@ -8411,7 +8420,9 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     _ensure_tts_config_seeded()
     TTS_ORDER[:] = _resolve_tts_order()
     _elevenlabs_voice_id = _resolve_elevenlabs_voice_id()
-    log.info("ElevenLabs voice id loaded from TTS config: %s", _elevenlabs_voice_id)
+    _elevenlabs_model = _resolve_elevenlabs_model()
+    log.info("ElevenLabs voice id loaded from TTS config: %s (model %s)",
+             _elevenlabs_voice_id, _elevenlabs_model)
     _vocab_terms = {AGENT_NAME, "OpenClaw"} | set(str(t).strip() for t in _stt_vocab if str(t).strip())
     GEMINI_CUSTOM_VOCABULARY.clear()
     for _term in _vocab_terms:

@@ -1,3 +1,17 @@
+## v3.25.5 — 2026-10-02
+
+### Added
+
+- **`elevenlabsModel` in `rtt_tts_config.json`** selects the ElevenLabs
+  model (default `eleven_v3`, unchanged). The model was hardcoded, which
+  made an instant voice clone sound very different from the ElevenLabs
+  website: `eleven_v3` reinterprets voices heavily, and a quick clone built
+  from 2 short samples drifted toward a generic voice. Measured against the
+  clone's own preview audio with the daemon's speaker-embedding model:
+  `eleven_v3` 0.53, `eleven_flash_v2_5` 0.68, `eleven_turbo_v2_5` 0.73,
+  `eleven_multilingual_v2` 0.77. The startup log line now prints the model
+  next to the voice id. Not yet ported to the Mac fork.
+
 ## v3.25.4 — 2026-10-02
 
 ### Fixed

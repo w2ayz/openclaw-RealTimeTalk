@@ -488,6 +488,21 @@ no network calls at all. `piper` is always kept as the last-resort entry
 even if you leave it out, since it needs no key or network. Restart the
 daemon after editing this file directly; it's only read at startup.
 
+Two optional keys pick the ElevenLabs voice and model:
+
+```json
+{ "order": ["elevenlabs", "edge", "openai", "piper"],
+  "elevenlabsVoiceId": "pFZP5JQG7iQjIQuC4Bku",
+  "elevenlabsModel": "eleven_v3" }
+```
+
+Both default to the values shown (Lily on `eleven_v3`). For an instant
+voice clone, set `elevenlabsModel` to `eleven_multilingual_v2`: `eleven_v3`
+reinterprets the voice heavily, and a clone built from a couple of short
+samples drifts toward a generic voice on it (measured: speaker-embedding
+similarity to the clone's own preview 0.53 on `eleven_v3` vs 0.77 on
+`eleven_multilingual_v2`).
+
 ### Audio devices
 
 By default the daemon uses:
