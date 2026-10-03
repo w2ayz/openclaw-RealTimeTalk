@@ -268,8 +268,9 @@
   played audio's speaker embedding matched Kevin 0.80 and Lily 0.04
   (before the fix: Lily 0.45, Kevin -0.01). An AST scan of `main()` found no
   other module globals assigned without a `global` declaration. The Mac
-  fork's voice-id plumbing uses a different idiom (mutable list cell) and
-  should be checked separately.
+  fork isn't affected: it mutates list cells (`_elevenlabs_voice_id[0]`,
+  `_elevenlabs_model[0]`), which work from any scope. Its v3.25.7 is a
+  version-lock bump only.
 
 ## v3.25.6 — 2026-10-02
 
@@ -283,8 +284,9 @@
   `elevenlabsVoiceId` / `elevenlabsModel` to `rtt_tts_config.json`. Enter
   keeps the current values; a voice ID can also be pasted directly, which
   is the fallback when the key lacks `voices_read`. Skipped when there's no
-  ElevenLabs key or `elevenlabs` isn't in the TTS order. Not yet ported to
-  the Mac fork.
+  ElevenLabs key or `elevenlabs` isn't in the TTS order. Ported to the Mac
+  fork in its v3.25.6 (Python helper run from a `mktemp` file there, for
+  Bash 3.2).
 
 ## v3.25.5 — 2026-10-02
 
@@ -298,7 +300,7 @@
   clone's own preview audio with the daemon's speaker-embedding model:
   `eleven_v3` 0.53, `eleven_flash_v2_5` 0.68, `eleven_turbo_v2_5` 0.73,
   `eleven_multilingual_v2` 0.77. The startup log line now prints the model
-  next to the voice id. Not yet ported to the Mac fork.
+  next to the voice id. Ported to the Mac fork in its v3.25.5.
 
 ## v3.25.4 — 2026-10-02
 
@@ -347,7 +349,7 @@
   `_handle_transcript`, and monitor and deep-sleep (`456`/`654`/`987` on
   a live session) were never applied at all. The flag handling now lives
   in a shared `_apply_dtmf_flags(ws)` that both send loops call each
-  iteration. Not yet checked against the Mac fork.
+  iteration. The Mac fork had the same gap; ported in its v3.25.3.
 
 ## v3.25.2 — 2026-09-24
 
