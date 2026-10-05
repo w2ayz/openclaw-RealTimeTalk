@@ -1,3 +1,18 @@
+## v3.27.4 — 2026-10-05
+
+### Changed
+
+- **Step-2 wake confirmation now also accepts a bare `"<AgentName>"` or
+  `"yes <AgentName>"` reply** (alongside existing `"yes"`/`"ok"`/etc.),
+  by request. Ported from the Mac fork's v3.27.4, adapted: that fork
+  needed a second fix because its "drop bare prompt echo" filter ate the
+  bare-name reply before it ever reached the confirmation check — this
+  fork has no such filter, and its noise-hallucination filter already
+  sits after the `_pending_wake_confirm` block's unconditional early
+  return, so only the accepted-phrase widening (`AGENT_NAME_LC` /
+  `f"yes {AGENT_NAME_LC}"`, derived rather than hardcoded so a custom
+  `--agent-name` gets it for free) applies here.
+
 ## v3.27.3 — 2026-10-05
 
 ### Changed

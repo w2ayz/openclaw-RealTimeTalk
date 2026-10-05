@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.3"
+__version__ = "3.27.4"
 
 import argparse
 import asyncio
@@ -1417,6 +1417,15 @@ def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
 # Wake confirmation — affirmative responses accepted after the agent asks
 # "<AGENT_NAME>?" (echoes its own name back, rather than a generic "Yes?",
 # so the confirmation itself re-confirms which agent is being addressed).
+#
+# Bare "<AgentName>" and "yes <AgentName>" are ALSO accepted — handled
+# separately in _handle_transcript (not added as literal strings here)
+# because AGENT_NAME_LC is rebuilt per --agent-name at startup, and this
+# set is not. Ported from the Mac fork's v3.27.4 (by request, not a Pi
+# bug fix — Pi's noise-hallucination filter already runs after this
+# block's unconditional early return, so it never had the Mac fork's
+# bare-prompt-echo-drop problem; only the accepted-phrase widening
+# applies here).
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
     "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
@@ -4196,7 +4205,10 @@ class BaseVoiceSession:
             if elapsed > _WAKE_CONFIRM_TIMEOUT:
                 log.info("Wake confirmation timed out (%.1fs) — mis-fire: %r", elapsed, transcript)
                 _log_entry("system", "Wake mis-fire (timeout) — staying silent")
-            elif normalized in _WAKE_CONFIRM_AFFIRM or _matches_phrase(normalized, WAKE_PHRASES):
+            elif (normalized in _WAKE_CONFIRM_AFFIRM
+                  or normalized == AGENT_NAME_LC                 # bare "<AgentName>"
+                  or normalized == f"yes {AGENT_NAME_LC}"        # "yes <AgentName>"
+                  or _matches_phrase(normalized, WAKE_PHRASES)):
                 log.info("Wake confirmed — voice active")
                 _log_entry("system", "Voice activated")
                 self._busy.set()
