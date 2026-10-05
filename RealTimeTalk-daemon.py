@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.1"
+__version__ = "3.27.2"
 
 import argparse
 import asyncio
@@ -4174,11 +4174,26 @@ class BaseVoiceSession:
 
         # Owner-only gate — BEFORE wake/sleep/control phrases so that in
         # owner-only mode EVERYTHING requires the enrolled voice. Web portal
-        # buttons and DTMF remain ungated fallbacks by design.
-        if not await self._verify_speaker(transcript):
-            return
+        # buttons and DTMF remain ungated fallbacks by design. Still called
+        # unconditionally even when about to be bypassed below
+        # (_pending_wake_confirm case) — it unconditionally pops the
+        # matching audio segment off the FIFO regardless of verification
+        # result, and skipping the call entirely would desync that FIFO
+        # against the next real transcript.
+        _speaker_verified = await self._verify_speaker(transcript)
 
-        # Wake confirmation pending — check affirmative response before anything else
+        # Wake confirmation pending — check affirmative response before
+        # anything else, and BEFORE the owner-only gate below applies to it.
+        # The wake phrase that set this flag already passed _verify_speaker
+        # (gated above on every transcript), so this round-trip is not a
+        # fresh command needing its own biometric check — it's just a
+        # mis-fire safety confirmation. That matters because it's often a
+        # one-word reply ("yes", "<AgentName>"): confirmed live (on the Mac
+        # fork) that _verify_speaker's SPK_MIN_SECS (0.8s) floor routinely
+        # rejects utterances that short as "too short to verify", which
+        # previously fell through to the gate's early return below and left
+        # _pending_wake_confirm stuck True — the daemon never left Silent no
+        # matter what was said next.
         if self._pending_wake_confirm:
             import time as _twc
             elapsed = _twc.time() - self._pending_wake_t
@@ -4205,6 +4220,13 @@ class BaseVoiceSession:
             else:
                 log.info("Wake mis-fire — not confirmed: %r", transcript)
                 _log_entry("system", f"Wake mis-fire — ignored ({transcript!r})")
+            return
+
+        # Owner-only gate applies to everything from here on (the
+        # _pending_wake_confirm reply above is deliberately exempt — see its
+        # comment). Web portal buttons and DTMF remain ungated fallbacks by
+        # design.
+        if not _speaker_verified:
             return
 
         # Wake phrase — always checked regardless of active state
