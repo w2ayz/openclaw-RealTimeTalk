@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.0"
+__version__ = "3.27.1"
 
 import argparse
 import asyncio
@@ -4224,30 +4224,18 @@ class BaseVoiceSession:
                 finally:
                     self._busy.clear()
                 return
-            # Silent or monitoring — normally ask for confirmation before activating
-            # (avoids self-triggering off the agent's own TTS or background chatter
-            # that happens to include the wake phrase) — UNLESS owner-only mode
-            # already biometrically verified this transcript came from the enrolled
-            # voice (via _verify_speaker above), in which case the confirmation
-            # round-trip is redundant and skipped.
-            if _owner_only[0] and _verification_available(_radio_profile_active[0]):
-                log.info("Wake phrase detected — owner voice verified, activating immediately")
-                _log_entry("system", "Voice activated (owner verified)")
-                self._busy.set()
-                try:
-                    if self._monitoring:
-                        self._monitoring = False
-                        _persist_monitoring[0] = False
-                    self._active = True
-                    _persist_active[0] = True
-                    import time as _tact3; _last_activity[0] = _tact3.time()
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "I'm listening.", self.alsa_output
-                    )
-                finally:
-                    self._busy.clear()
-                return
-            # Silent or monitoring — ask for confirmation before activating
+            # Silent or monitoring — always ask for confirmation before
+            # activating (avoids self-triggering off the agent's own TTS or
+            # background chatter that happens to include the wake phrase).
+            # Owner-voice verification (via _verify_speaker above) used to
+            # skip this round-trip entirely — removed: confirmed live that
+            # it let the agent go straight to Active on just hearing its
+            # name from the owner's voice, with no "<AgentName>?"
+            # reconfirmation at all. In a multi-agent room that's exactly
+            # the ambiguity step 2 exists to resolve, so owner verification
+            # no longer bypasses it — it only gates who's allowed to speak
+            # commands at all (see _verify_speaker), not whether this
+            # specific wake still gets reconfirmed.
             import time as _twc2
             self._pending_wake_confirm = True
             self._pending_wake_t = _twc2.time()

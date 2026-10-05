@@ -1,3 +1,21 @@
+## v3.27.1 — 2026-10-05
+
+### Fixed
+
+- **Owner-voice verification was bypassing step-2 confirmation entirely** —
+  confirmed live on the Mac fork: the agent went straight to Active off
+  its wake phrase alone when the speaker biometrically verified as the
+  owner, with no "<AgentName>?" reconfirmation ever asked. That bypass
+  (`_owner_only[0] and _verification_available(...)` in the
+  `WAKE_PHRASES` branch) predates v3.27.0's multi-agent isolation work and
+  defeats it — in a room with several agents sharing "Hey Jarvis", the
+  owner's voice being verified says nothing about *which* agent they
+  meant to address, which is exactly what the name + "<AgentName>?"
+  round-trip exists to pin down. Removed the bypass: owner verification
+  still gates who's allowed to speak commands at all (`_verify_speaker`,
+  unchanged), but no longer skips the confirmation round-trip for this
+  agent's own wake phrase.
+
 ## v3.27.0 — 2026-10-05
 
 ### Changed
