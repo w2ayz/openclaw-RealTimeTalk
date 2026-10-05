@@ -82,7 +82,7 @@ git, all of it is safe to delete to reset that specific piece of state:
 | File | Purpose |
 |---|---|
 | `~/.openclaw/workspace/speaker_cal_store.json` | Per-speaker volume/SW calibration |
-| `~/.openclaw/workspace/rtt_sleep_state.json` | Whether the daemon was asleep at last shutdown (restored on restart) |
+| `~/.openclaw/workspace/rtt_sleep_state.json` | Tracks live sleep state for diagnostics; no longer read at startup (v3.27.3+) — the daemon always boots into Sleeping Mode regardless of what this says |
 | `~/.openclaw/workspace/rtt_stt_config.json` | Which STT engine to use and (optionally) the fallback: `{"provider": "gemini", "fallback": "openai"}`. Written by the installer; edit this file to switch engines (v3.22.4+). Never put this in `openclaw.json` — the gateway strips unknown `talk.*` keys. |
 | `~/.openclaw/workspace/rtt_voice_profile.json` | Owner-only voice enrollment (mic) |
 | `~/.openclaw/workspace/rtt_voice_profile_radio.json` | Owner-only voice enrollment (radio path — voice characteristics differ enough over radio that a mic-enrolled profile won't reliably match) |

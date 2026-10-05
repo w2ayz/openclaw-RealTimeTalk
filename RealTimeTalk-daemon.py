@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.2"
+__version__ = "3.27.3"
 
 import argparse
 import asyncio
@@ -1864,21 +1864,16 @@ def _read_sink_volume_pct(sink: str) -> int | None:
         return None
 
 def _save_sleep_state(sleeping: bool) -> None:
-    """Persist sleep state to disk so it survives service restarts."""
+    """Persist sleep state to disk. Not read back at startup (the daemon
+    always boots into Sleeping Mode regardless — see main()); this just
+    keeps SLEEP_STATE_FILE accurate for anything inspecting it externally
+    (e.g. while diagnosing a restart)."""
     try:
         os.makedirs(os.path.dirname(SLEEP_STATE_FILE), exist_ok=True)
         with open(SLEEP_STATE_FILE, "w") as f:
             json.dump({"sleeping": sleeping}, f)
     except Exception as e:
         log.warning("Could not save sleep state: %s", e)
-
-def _load_sleep_state() -> bool:
-    """Return True if the daemon was sleeping when it last stopped."""
-    try:
-        with open(SLEEP_STATE_FILE) as f:
-            return bool(json.load(f).get("sleeping", False))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
 
 # ── Speaker verification (owner-only mode) ───────────────────────────────────
 
@@ -8468,10 +8463,16 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     _thr.Thread(target=_playback_worker, daemon=True, name="playback-worker").start()
     _thr.Thread(target=_radio_hotplug_watcher, daemon=True, name="radio-hotplug").start()
 
-    # Restore sleep state persisted across service restarts (e.g. mic device change)
-    if _load_sleep_state():
-        _idle_disconnected[0] = True
-        log.info("Restored sleep state from disk — waiting for wake signal…")
+    # Always boot into Sleeping Mode, regardless of whatever was persisted
+    # from the previous run — a restart (service bounce, mic device change,
+    # crash recovery) is exactly the moment nobody is necessarily in the
+    # room to notice it reconnected Active/Silent on its own. Previously
+    # this read SLEEP_STATE_FILE (via the now-removed _load_sleep_state)
+    # and restored whatever was last written, which meant a restart while
+    # already Active/Silent came back the same way with no re-confirmation
+    # at all. _save_sleep_state calls elsewhere are unaffected.
+    _idle_disconnected[0] = True
+    _save_sleep_state(True)
 
     # Speaker verification: restore mode/threshold and the enrolled profile.
     _load_voice_mode()
@@ -8531,10 +8532,11 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
 
     session_ref: list = [None]
     start_http_server(http_port, lambda: loop.call_soon_threadsafe(_request_stop), session_ref)
-    log.info("OpenClaw RealTimeTalk daemon starting — silent mode (say 'Hey Jarvis' or '%s wake up' to activate)", AGENT_NAME)
+    log.info("OpenClaw RealTimeTalk daemon starting — Sleeping Mode (say 'Hey Jarvis', then "
+              "'%s wake up', or press Wake, to activate)", AGENT_NAME)
 
     while not stop_event.is_set():
-        # If sleeping (restored from disk or just auto-slept), wait for wake before connecting
+        # If sleeping (just booted — always starts here now — or auto-slept), wait for wake before connecting
         _woke_from_sleep = False
         if _idle_disconnected[0]:
             log.info("Auto-sleep active — waiting for wake signal…")

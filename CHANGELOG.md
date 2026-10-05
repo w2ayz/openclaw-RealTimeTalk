@@ -1,3 +1,20 @@
+## v3.27.3 — 2026-10-05
+
+### Changed
+
+- **The daemon now always boots into Sleeping Mode**, regardless of
+  whatever was persisted from the previous run. This fork actually had
+  the identical restore-from-disk behavior as the Mac fork, not a
+  guaranteed "always starts asleep" — v3.26.x's "SLEEPING state lost on
+  service restart" fix added persistence so a restart *while already
+  sleeping* stayed asleep, but a restart while Active or Silent came back
+  the same way too, with no re-confirmation at all, silently defeating
+  the step-1/step-2 wake gate until the next deliberate sleep. Removed
+  the now-dead `_load_sleep_state` (startup no longer reads the file at
+  all); `_save_sleep_state` calls elsewhere are unchanged and still keep
+  the file accurate for diagnostics. Ported from the Mac fork (confirmed
+  live there first).
+
 ## v3.27.2 — 2026-10-05
 
 ### Fixed
