@@ -1,3 +1,19 @@
+## v3.26.2 — 2026-10-04
+
+### Fixed
+
+- **SLEEP_PHRASES voice command was a no-op from Silent mode** — the
+  default state on every fresh daemon start, and also where you land
+  after OpenWakeWord's step-1 reconnect. The `if self._active:` guard
+  made sense for the old light-sleep behavior (skipping an already-silent
+  session was a sensible no-op then); it silently blocked the sleep
+  phrase entirely once Sleep meant a full STT disconnect. The HTTP
+  `/sleep` handler here never had this problem — its own guard was always
+  just `if sess:` — only the voice phrase needed the fix. Found on the Mac
+  fork first (same bug there, in both the HTTP handler and the voice
+  phrase — see that fork's v3.26.2 CHANGELOG), then confirmed by reading
+  this fork's own code rather than assumed to be present.
+
 ## v3.26.1 — 2026-10-04
 
 ### Version-lock only — no functional change on this fork

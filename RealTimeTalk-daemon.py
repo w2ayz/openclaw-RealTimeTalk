@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.26.1"
+__version__ = "3.26.2"
 
 import argparse
 import asyncio
@@ -4270,20 +4270,26 @@ class BaseVoiceSession:
         # to Silent on "Hey Jarvis" since it treats this the same as any
         # other _idle_disconnected state — no OWW changes needed for this.
         if _matches_phrase_exact(normalized, SLEEP_PHRASES):
-            if self._active:
-                log.info("Sleep phrase detected — entering Sleeping Mode")
-                _log_entry("system", "Voice silenced — Sleeping Mode")
-                self._busy.set()
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak,
-                        f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
-                        "or press Wake, to resume.",
-                        self.alsa_output
-                    )
-                finally:
-                    self._busy.clear()
-                _dtmf_force_deepsleep[0] = True
+            # No active-only guard: a live transcript can only arrive from a
+            # connected session, Active, Silent, or Monitoring — all three
+            # are reachable states to disconnect from now that this means a
+            # full STT disconnect, not just going quiet. (The old
+            # self._active-only guard was correct for the old light-sleep
+            # behavior, where going silent from an already-silent session
+            # was a no-op worth skipping; it isn't anymore.)
+            log.info("Sleep phrase detected — entering Sleeping Mode")
+            _log_entry("system", "Voice silenced — Sleeping Mode")
+            self._busy.set()
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, speak,
+                    f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
+                    "or press Wake, to resume.",
+                    self.alsa_output
+                )
+            finally:
+                self._busy.clear()
+            _dtmf_force_deepsleep[0] = True
             return
 
         # Calibration — works in both modes (audio feedback either way)
