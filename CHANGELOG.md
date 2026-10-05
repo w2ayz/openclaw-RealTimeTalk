@@ -1,3 +1,23 @@
+## v3.27.5 — 2026-10-05
+
+### Changed
+
+- **Step-2 wake confirmation tightened to require the agent's own name**,
+  by request. Ported from the Mac fork's v3.27.5: `_WAKE_CONFIRM_AFFIRM`
+  had `"wake up"`/`"wake"` as literal accepted strings — removed, since
+  neither names the agent, and the `WAKE_PHRASES` repeat-check switched
+  from `_matches_phrase`'s fuzzy ≥60%-of-words pass to
+  `_matches_phrase_exact` (the fuzzy pass let bare `"wake up"` satisfy
+  the 3-word default phrase `"<name> wake up"` without the name ever
+  being said — unsafe here specifically because this check IS the
+  confirmation gate, nothing after it to catch a false positive). Also
+  fixed: `"Yes, Zeebot"` (comma) didn't match `f"yes {name}"` because
+  the shared `normalized` var only strips trailing punctuation — now
+  uses `_normalize()` for this comparison. Not independently verified
+  live on Pi hardware from this session (ported by direct code mirror
+  + lint only, no local Pi runtime available) — verify on real hardware
+  before relying on it.
+
 ## v3.27.4 — 2026-10-05
 
 ### Changed
