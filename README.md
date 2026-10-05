@@ -69,7 +69,7 @@ Raspberry Pi (headless)
         │
         └── HTTP :19000 ──────► /dashboard  — conversation log + controls
                                  /wake       — activate voice
-                                 /sleep      — silence
+                                 /sleep      — Sleeping Mode (full STT disconnect)
                                  /monitor/start  — passive capture display
                                  /monitor/stop
                                  /reset      — clear screen
@@ -156,7 +156,7 @@ The dashboard auto-refreshes every 3 s and shows:
 | Link | Action |
 |------|--------|
 | Wake | Activate voice (same as saying "AI Agent wake up") |
-| Sleep | Silence (same as "AI Agent go to sleep") |
+| Sleep | Sleeping Mode — full STT disconnect (same as "AI Agent go to sleep") |
 | Start Monitor | Enter passive capture-display mode — listens and shows transcribed words, no AI Agent routing |
 | Stop Monitor | Exit monitoring mode |
 | Reset | Clear the on-screen log |
@@ -244,12 +244,13 @@ required.
 | Say | Effect |
 |-----|--------|
 | "AI Agent wake up" | Request activation — the AI Agent asks "Yes?" for confirmation |
-| "Hey Jarvis" | Request activation — the AI Agent asks "Yes?" for confirmation |
+| "Hey Jarvis" *(while Sleeping, STT disconnected)* | Reconnects to Silent only — say "AI Agent wake up" next to actually activate |
+| "Hey Jarvis" *(while Silent, STT still connected)* | Request activation — the AI Agent asks "Yes?" for confirmation |
 | "Real Time Talk on" | Request activation — the AI Agent asks "Yes?" for confirmation |
 | "Yes" / "Yeah" / "OK" / "Sure" | Confirm activation — the AI Agent says "I'm listening." |
 | "AI Agent wake up" *(second time)* | Also accepted as confirmation |
-| "AI Agent go to sleep" | Silence |
-| "Real Time Talk off" | Silence |
+| "AI Agent go to sleep" | Sleeping Mode — full STT disconnect |
+| "Real Time Talk off" | Sleeping Mode — full STT disconnect |
 | "Calibrate mic" / "Calibrate microphone" | Run mic noise calibration |
 
 **Wake confirmation:** When the AI Agent is in Silent or Monitoring mode, a wake phrase triggers a confirmation prompt ("Yes?") rather than immediate activation. The AI Agent waits up to 8 seconds for an affirmative reply. If no clear "yes" is received the event is logged as a mis-fire and the AI Agent stays silent. This prevents accidental activation from radio noise or passing speech. DTMF 123 and the web Wake button bypass confirmation and activate immediately.

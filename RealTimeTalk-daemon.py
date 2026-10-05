@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.25.7"
+__version__ = "3.26.0"
 
 import argparse
 import asyncio
@@ -4262,20 +4262,28 @@ class BaseVoiceSession:
                 self._busy.clear()
             return
 
-        # Sleep phrase — only meaningful when active
+        # Sleep phrase — only meaningful when active. Goes to full Sleeping
+        # Mode (STT disconnect, same as DTMF 987) rather than just going
+        # quiet while still connected — _apply_dtmf_flags (polled by
+        # _send_mic) does the actual disconnect once this returns. The
+        # existing OWW listener (_oww_wakeword_listener) already wakes this
+        # to Silent on "Hey Jarvis" since it treats this the same as any
+        # other _idle_disconnected state — no OWW changes needed for this.
         if _matches_phrase_exact(normalized, SLEEP_PHRASES):
             if self._active:
-                self._active = False
-                _persist_active[0] = False
-                log.info("Sleep phrase detected — going silent")
-                _log_entry("system", "Voice silenced")
+                log.info("Sleep phrase detected — entering Sleeping Mode")
+                _log_entry("system", "Voice silenced — Sleeping Mode")
                 self._busy.set()
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        None, speak, f"Going silent now. Say {AGENT_NAME} wake up to resume.", self.alsa_output
+                        None, speak,
+                        f"Going to sleep now. Say Hey Jarvis, then {AGENT_NAME} wake up, "
+                        "or press Wake, to resume.",
+                        self.alsa_output
                     )
                 finally:
                     self._busy.clear()
+                _dtmf_force_deepsleep[0] = True
             return
 
         # Calibration — works in both modes (audio feedback either way)
@@ -5257,13 +5265,15 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 self.send_header("Location", "/dashboard")
                 self.end_headers()
             elif self.path == "/sleep":
+                # Sleeping Mode: full STT disconnect, same as DTMF 987 — not
+                # just going quiet while still connected. _apply_dtmf_flags
+                # (polled by _send_mic at least every 0.5s) does the actual
+                # close; the existing OWW listener already covers
+                # voice-triggered wake while STT is down (see
+                # _oww_wakeword_listener's _idle_disconnected branch).
                 if sess:
-                    sess._active = False
-                    if sess._monitoring:
-                        sess._monitoring = False
-                        _persist_monitoring[0] = False
-                        log.info("HTTP sleep: monitoring cleared")
-                    log.info("HTTP sleep")
+                    _dtmf_force_deepsleep[0] = True
+                    log.info("HTTP sleep — Sleeping Mode (disconnecting)")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
                 self.end_headers()

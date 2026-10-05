@@ -1,3 +1,27 @@
+## v3.26.0 — 2026-10-04
+
+### Changed
+
+- **Sleep button and the "`<agent name>` go to sleep" voice phrase now
+  trigger full Sleeping Mode (STT disconnect, same as DTMF `987`)**,
+  instead of just going quiet while staying connected (that lighter
+  behavior is now only reachable via DTMF `321`). Both call sites now just
+  set `_dtmf_force_deepsleep[0] = True`, reusing `_apply_dtmf_flags`'s
+  existing close-the-websocket path (polled by `_send_mic` at least every
+  0.5s). No changes needed to `_oww_wakeword_listener` — it already treats
+  this the same as auto-sleep's `_idle_disconnected` state, so "Hey
+  Jarvis" already worked for button/phrase-triggered sleep once this
+  landed; it just couldn't be reached that way before, since the button
+  and phrase weren't actually disconnecting STT.
+
+  **Lockstep note:** ported from the Mac fork, which built this feature —
+  including an independent, lesser OpenWakeWord implementation it mistook
+  for new — without first checking that this fork already had one. Mac's
+  version has since been reworked to match this fork's existing design
+  (wake-to-Silent-only, not straight to Active; `0.60` threshold) rather
+  than the reverse. See the Mac fork's v3.26.0 CHANGELOG entry for the
+  full story.
+
 ## v3.25.7 — 2026-10-02
 
 ### Fixed
