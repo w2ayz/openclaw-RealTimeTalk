@@ -1,3 +1,35 @@
+## v3.27.0 — 2026-10-05
+
+### Changed
+
+- **Step 2 (Silent→Active) now requires this agent's own name, with a 20s
+  deadline, for multi-agent setups sharing "Hey Jarvis" as step 1** — OWW
+  has no per-agent wake-word model, so "Hey Jarvis" wakes every agent
+  instance on the box the same way (step 1, unchanged). `_build_phrase_sets`
+  previously also put generic "hey jarvis"/"jarvis"/"hej jarvis"/"hay
+  jarvis" into `WAKE_PHRASES`, and `_oww_wakeword_listener` primed
+  `_oww_confirm_pending` so the *next transcript after "Hey Jarvis" —
+  whatever it said* — was accepted as the step-2 trigger. Both let any
+  agent be confirmed Active by a generic utterance that was never actually
+  directed at it. Removed `_oww_confirm_pending`/`_oww_confirm_t`/
+  `_OWW_CONFIRM_WINDOW` and the generic jarvis entries entirely; step 2 now
+  requires this agent's own name-derived phrase, full stop. New
+  `NAME_WAKE_TIMEOUT` (20s) + `_name_wake_deadline`/`_name_wake_watcher`:
+  `_oww_wakeword_listener` arms the deadline whenever "Hey Jarvis" wakes
+  this agent to Silent (or primes it while already connected); if its own
+  name isn't heard before the deadline, it drops straight back to full
+  Sleep rather than lingering in Silent (previously unbounded short of
+  `IDLE_SLEEP_MINS`). Every explicit/authenticated wake path (DTMF
+  wake/wake-silent/monitor-on, HTTP `/wake` and `/monitor`) clears the
+  deadline instead of being subject to it — the name-check only applies to
+  the shared voice-triggered OWW path. Ported from the Mac fork, adapted to
+  this fork's `_idle_disconnected`/`_oww_wakeword_listener` idioms rather
+  than Mac's `_is_sleeping`/`_oww_listener`.
+- **Step-2 confirmation prompt changed from generic "Yes?" to
+  "`<AgentName>`?"** — e.g. the agent now asks "Zeebot?" instead of "Yes?"
+  once it hears its own wake phrase, making it audible which agent
+  responded in a multi-agent room.
+
 ## v3.26.2 — 2026-10-04
 
 ### Fixed

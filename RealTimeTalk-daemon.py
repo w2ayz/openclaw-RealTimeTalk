@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.26.2"
+__version__ = "3.27.0"
 
 import argparse
 import asyncio
@@ -142,9 +142,18 @@ EDGE_TTS_TIMEOUT  = 10             # seconds per Edge segment
 # copy-pasteable command regardless of where this skill is installed.
 RTT_CONFIG_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RTT-Config.sh")
 
-_oww_confirm_pending: list = [False]  # OWW fired in silent mode; next transcript triggers "Yes?"
-_oww_confirm_t:       list = [0.0]    # epoch time OWW set the flag (guard against stale transcripts)
-_OWW_CONFIRM_WINDOW        = 3.0      # seconds after OWW fire to accept the wake-word transcript
+NAME_WAKE_TIMEOUT = 20.0   # "Hey Jarvis" has no per-agent model, so step 1 (wake to Silent, or
+                            # priming confirmation if already connected) wakes every agent instance
+                            # on the box at once. This bounds step 2 (Silent->Active): this agent's
+                            # own name must be heard within NAME_WAKE_TIMEOUT or it drops back to
+                            # full Sleep (see _name_wake_deadline/_name_wake_watcher). Replaces the
+                            # old _oww_confirm_pending/_OWW_CONFIRM_WINDOW mechanism, which primed
+                            # confirmation off ANY next transcript (not even the agent's own name) —
+                            # unsafe once multiple agents share one wake word.
+_name_wake_deadline: list = [0.0]  # 0.0 = no pending name check; else epoch by which THIS agent's
+                                    # own wake phrase must be heard. Armed only by OWW's shared
+                                    # "Hey Jarvis" detection — DTMF/web-portal wake are explicit/
+                                    # authenticated and clear it instead of being subject to it.
 
 # gpt-live-transcribe, not gpt-4o-transcribe: only the "live" model supports
 # `keywords` custom-vocabulary hinting (verified live against the real API —
@@ -1368,15 +1377,18 @@ def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
 
     `wake_phrase` overrides the primary wake phrase (e.g. a custom phonetic
     respelling); "<name> wake up" is always kept as an additional recognised
-    phrase alongside it. "Hey Jarvis" stays fixed regardless of agent name —
-    it's tied to openwakeword's pretrained hey_jarvis_v0.1.onnx model, not a
-    phrase this daemon can rename.
+    phrase alongside it. "Hey Jarvis" is NOT in this set — it's openwakeword's
+    shared, fixed pretrained model (hey_jarvis_v0.1.onnx, same for every agent
+    instance on the box), handled entirely by _oww_wakeword_listener for step
+    1 (wake to Silent / prime the name-check deadline). It deliberately does
+    NOT also count as step 2's (Silent->Active) confirmation here — v3.26.1
+    added it for that too, but with multiple agents sharing one wake word
+    that let a generic "Hey Jarvis"/"Jarvis" confirm an agent nobody actually
+    named. See NAME_WAKE_TIMEOUT.
     """
     primary = (wake_phrase or "").strip().lower() or f"{name_lc} wake up"
     wake = {primary, f"{name_lc} wake up", "real time talk on", "real-time talk on", "realtimetalk on",
-            f"{name_lc} 醒来", f"{name_lc} 醒", f"{name_lc} 开始", f"wake up {name_lc}",
-            "hey jarvis", "hey jarvis wake up",
-            "hej jarvis", "hay jarvis", "jarvis"}  # also caught by openwakeword in SLEEP state
+            f"{name_lc} 醒来", f"{name_lc} 醒", f"{name_lc} 开始", f"wake up {name_lc}"}
     if name_lc == "five":
         wake |= {"5 wake up", "wake up 5"}  # digit synonym, historical default agent name
     sleep = {f"{name_lc} go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
@@ -1402,7 +1414,9 @@ def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
 (WAKE_PHRASES, SLEEP_PHRASES, MONITOR_ON_PHRASES, MONITOR_OFF_PHRASES,
  CONTINUE_PHRASES, OWNER_ONLY_ON_PHRASES, OWNER_ONLY_OFF_PHRASES) = _build_phrase_sets(AGENT_NAME_LC)
 
-# Wake confirmation — affirmative responses accepted after the agent asks "Yes?"
+# Wake confirmation — affirmative responses accepted after the agent asks
+# "<AGENT_NAME>?" (echoes its own name back, rather than a generic "Yes?",
+# so the confirmation itself re-confirms which agent is being addressed).
 _WAKE_CONFIRM_AFFIRM = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
     "go ahead", "wake up", "wake", "activate", "please", "do it", "yes please",
@@ -4164,25 +4178,6 @@ class BaseVoiceSession:
         if not await self._verify_speaker(transcript):
             return
 
-        # OWW fired in silent mode — use the next incoming transcript as the trigger for "Yes?"
-        if _oww_confirm_pending[0] and not self._active and not self._pending_wake_confirm:
-            import time as _toww
-            if _toww.time() - _oww_confirm_t[0] <= _OWW_CONFIRM_WINDOW:
-                _oww_confirm_pending[0] = False
-                self._pending_wake_confirm = True
-                self._pending_wake_t = _toww.time()
-                log.info("OWW wake — requesting voice confirmation")
-                self._busy.set()
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, speak, "Yes?", self.alsa_output
-                    )
-                finally:
-                    self._busy.clear()
-                return
-            else:
-                _oww_confirm_pending[0] = False  # stale — clear
-
         # Wake confirmation pending — check affirmative response before anything else
         if self._pending_wake_confirm:
             import time as _twc
@@ -4214,6 +4209,10 @@ class BaseVoiceSession:
 
         # Wake phrase — always checked regardless of active state
         if _matches_phrase(normalized, WAKE_PHRASES):
+            # This agent's own name was heard — satisfies any pending shared
+            # "Hey Jarvis" name-check deadline (see NAME_WAKE_TIMEOUT); the
+            # _WAKE_CONFIRM_TIMEOUT round-trip below takes over from here.
+            _name_wake_deadline[0] = 0.0
             if self._active:
                 # Already active — acknowledge as before
                 self._busy.set()
@@ -4255,8 +4254,12 @@ class BaseVoiceSession:
             log.info("Wake phrase detected — requesting confirmation")
             self._busy.set()
             try:
+                # Echo the agent's own name back (instead of a generic
+                # "Yes?") — with multiple agents sharing "Hey Jarvis" for
+                # step 1, this makes it audible which agent responded and
+                # re-confirms it's the one actually being addressed.
                 await asyncio.get_running_loop().run_in_executor(
-                    None, speak, "Yes?", self.alsa_output
+                    None, speak, f"{AGENT_NAME}?", self.alsa_output
                 )
             finally:
                 self._busy.clear()
@@ -4639,6 +4642,40 @@ class BaseVoiceSession:
                 await ws.close()
                 return
 
+    async def _name_wake_watcher(self, ws):
+        """Enforce NAME_WAKE_TIMEOUT: _oww_wakeword_listener arms
+        _name_wake_deadline whenever "Hey Jarvis" (shared, no per-agent
+        model) wakes this agent to Silent or primes it while already
+        connected. If this agent's own name isn't heard — clearing the
+        deadline, see the WAKE_PHRASES branch in _handle_transcript —
+        before the deadline passes, drop straight back to full Sleep
+        rather than lingering in Silent. Important with multiple agents
+        sharing one wake word: an agent nobody actually addressed shouldn't
+        sit there connected (and listening) indefinitely. Polls at 1s
+        resolution, unlike _idle_watcher's 30s — this window is a fraction
+        of IDLE_SLEEP_MINS. No-op whenever _name_wake_deadline[0] is 0.0.
+        """
+        import time as _nw
+        while not self.stop_event.is_set():
+            await asyncio.sleep(1.0)
+            deadline = _name_wake_deadline[0]
+            if not deadline or self._active:
+                continue
+            if _nw.time() < deadline:
+                continue
+            log.info("Name-wake window elapsed with no match — back to full Sleep")
+            _log_entry("system", f"No \"{AGENT_NAME}\" within {int(NAME_WAKE_TIMEOUT)}s — back to sleep")
+            _name_wake_deadline[0] = 0.0
+            self._pending_wake_confirm = False
+            if self._monitoring:
+                self._monitoring = False
+                _persist_monitoring[0] = False
+            _persist_active[0] = False
+            _idle_disconnected[0] = True
+            _save_sleep_state(True)
+            await ws.close()   # closes STT WS; run()'s reconnect loop holds at the wake gate
+            return
+
     async def _open_mic_stream(self):
         import time as _st
         _last_mic_cb[0] = _st.time()   # seed so watchdog doesn't fire immediately
@@ -4930,6 +4967,7 @@ class OpenAIRealtimeSession(BaseVoiceSession):
                 asyncio.create_task(self.stop_event.wait()),
                 asyncio.create_task(self._watch_mic_stream()),
                 asyncio.create_task(self._idle_watcher(ws)),
+                asyncio.create_task(self._name_wake_watcher(ws)),
             ]
             done, pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -5067,16 +5105,18 @@ class GeminiTranscribeSession(BaseVoiceSession):
                         asyncio.create_task(self._gemini_receiver(ws)),
                         asyncio.create_task(self._watch_mic_stream()),
                         asyncio.create_task(self._idle_watcher(ws)),
+                        asyncio.create_task(self._name_wake_watcher(ws)),
                     ]
                     done, pending = await asyncio.wait(
                         tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in pending:
                         task.cancel()
 
-                    # Auto-sleep closed the socket from _idle_watcher, which
-                    # expects main() to hold at the wake gate. Without this
-                    # return the loop reconnected ~every 30 s while asleep,
-                    # re-firing the idle watcher and spamming the dashboard.
+                    # Auto-sleep (or a name-wake timeout) closed the socket —
+                    # either watcher expects main() to hold at the wake gate.
+                    # Without this return the loop reconnected ~every 30 s
+                    # while asleep, re-firing the idle watcher and spamming
+                    # the dashboard.
                     if _idle_disconnected[0]:
                         return
 
@@ -5255,6 +5295,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                     # Reconnect from auto-sleep
                     _last_activity[0] = __import__("time").time()
                     _wake_activate[0] = True
+                    _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                     _save_sleep_state(False)
                     _wake_event[0].set()
                     log.info("HTTP wake — reconnecting from auto-sleep")
@@ -5279,6 +5320,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                 # _oww_wakeword_listener's _idle_disconnected branch).
                 if sess:
                     _dtmf_force_deepsleep[0] = True
+                    _name_wake_deadline[0] = 0.0   # no pending name-check once back in Sleeping Mode
                     log.info("HTTP sleep — Sleeping Mode (disconnecting)")
                 self.send_response(302)
                 self.send_header("Location", "/dashboard")
@@ -5294,6 +5336,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                         _persist_monitoring[0] = True
                         _persist_active[0] = False   # monitoring is silent, not active
                         import time as _tmon_w; _last_activity[0] = _tmon_w.time()
+                        _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                         _wake_event[0].set()
                         log.info("HTTP monitor START — waking from sleep into monitoring")
                         _log_entry("system", "Waking into monitoring mode…")
@@ -5316,6 +5359,7 @@ def start_http_server(port: int, on_stop, session_ref: list):
                         # Wake from sleep if needed — monitoring requires OpenAI connection
                         if _idle_disconnected[0] and _wake_event[0]:
                             import time as _tmon_w; _last_activity[0] = _tmon_w.time()
+                            _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                             _wake_event[0].set()
                             log.info("HTTP monitor START — waking from sleep")
                     elif not new_state and sess._monitoring:
@@ -7614,6 +7658,7 @@ def _dtmf_listener() -> None:
             if _idle_disconnected[0] and _wake_event[0]:
                 _last_activity[0] = now; _wake_activate[0] = True
                 _persist_active[0] = True; _save_sleep_state(False)
+                _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                 _wake_event[0].set()
             elif _wake_event[0]:
                 _persist_active[0] = True; _wake_activate[0] = True
@@ -7631,6 +7676,7 @@ def _dtmf_listener() -> None:
             _persist_active[0] = False
             _wake_activate[0] = False        # discard any stale activation intent
             _persist_monitoring[0] = False   # clear monitoring when going to deep sleep
+            _name_wake_deadline[0] = 0.0     # no pending name-check once back in Sleeping Mode
             _dtmf_force_deepsleep[0] = True
         elif DTMF_MONITOR_ON_SEQ in seq:
             seq = ""
@@ -7642,6 +7688,7 @@ def _dtmf_listener() -> None:
             if _idle_disconnected[0] and _wake_event[0]:
                 # Sleeping → wake into monitoring (no _wake_activate so session starts silent+monitoring)
                 _last_activity[0] = now
+                _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                 _save_sleep_state(False)
                 _wake_event[0].set()
         elif DTMF_MONITOR_OFF_SEQ in seq:
@@ -7659,6 +7706,7 @@ def _dtmf_listener() -> None:
             _persist_monitoring[0] = False   # not monitoring
             if _idle_disconnected[0] and _wake_event[0]:
                 _last_activity[0] = now
+                _name_wake_deadline[0] = 0.0   # explicit/authenticated wake — skip the name-check window
                 _save_sleep_state(False)
                 _wake_event[0].set()
             # If already awake (silent/monitoring), nothing extra needed
@@ -8014,6 +8062,13 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
     SLEEP state (when the OpenAI WebSocket is closed).  Says "Hey Jarvis" to
     wake the AI Agent from sleep; also refreshes _last_activity while awake so a user
     speaking is never mis-counted as idle.
+
+    "Hey Jarvis" has no per-agent model, so this wakes/arms every agent
+    instance on the box the same way — it only reconnects to Silent (or, if
+    already connected, arms a name-check deadline); it never activates on
+    its own. Either way it arms _name_wake_deadline (NAME_WAKE_TIMEOUT), and
+    only this agent's own wake phrase (checked in _handle_transcript) clears
+    it — otherwise _name_wake_watcher drops this agent back to full Sleep.
     """
     import queue as _q
     import time as _ti
@@ -8103,20 +8158,24 @@ def _oww_wakeword_listener(input_device, stop_flag: list) -> None:
                     if score >= _THRESHOLD and (now - last_trigger) >= _DEBOUNCE:
                         last_trigger = now
                         log.info("Wake word detected (score=%.2f)", score)
+                        # "Hey Jarvis" has no per-agent model — every agent instance on
+                        # the box hears this the same way. Arm (or refresh) this agent's
+                        # own name-check deadline either way; only its own name (see
+                        # WAKE_PHRASES match in _handle_transcript) clears it before it
+                        # expires, else _name_wake_watcher drops it back to full Sleep.
                         if _idle_disconnected[0] and _wake_event[0]:
-                            _log_entry("system", f"Wake word detected — entering silent mode. Say '{AGENT_NAME} wake up' to activate.")
+                            _log_entry("system", f"Wake word detected — entering silent mode. "
+                                                  f"Say '{AGENT_NAME} wake up' within {int(NAME_WAKE_TIMEOUT)}s to activate.")
                             _last_activity[0] = now
+                            _name_wake_deadline[0] = now + NAME_WAKE_TIMEOUT
                             # Intentionally NOT setting _wake_activate — OWW wakes to Silent,
                             # not Active. User must say the wake phrase to go Active.
                             _save_sleep_state(False)
                             _wake_event[0].set()
-                        else:
+                        elif not _persist_active[0]:
                             _last_activity[0] = now
-                            # Session running in silent/monitoring mode — prime confirmation
-                            if not _persist_active[0] and not _oww_confirm_pending[0]:
-                                _oww_confirm_pending[0] = True
-                                _oww_confirm_t[0] = now
-                                log.info("OWW: silent mode — priming wake confirmation")
+                            _name_wake_deadline[0] = now + NAME_WAKE_TIMEOUT
+                            log.info("OWW: already connected, silent — arming name-check deadline")
         if not stop_flag[0]:
             log.info("AGC source switched — reopening wake-word listener stream")
             buf = np.array([], dtype=np.int16)
