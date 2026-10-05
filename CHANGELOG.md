@@ -1,3 +1,16 @@
+## v3.26.1 — 2026-10-04
+
+### Version-lock only — no functional change on this fork
+
+- Mac fork's `WAKE_PHRASES` was missing `"hey jarvis"` / `"hey jarvis wake
+  up"` / `"hej jarvis"` / `"hay jarvis"` / `"jarvis"` entirely, so saying
+  "Hey Jarvis" again after reconnecting from Sleeping Mode didn't work as
+  the step-2 wake request/confirmation there, only as OpenWakeWord's
+  step-1 reconnect trigger. This fork's `WAKE_PHRASES` (`_build_phrase_sets`)
+  already had all five — confirmed by direct comparison, not assumed —
+  so nothing to port here. Bumped purely to keep the two forks' version
+  numbers in lockstep; see the Mac fork's v3.26.1 CHANGELOG entry.
+
 ## v3.26.0 — 2026-10-04
 
 ### Changed
