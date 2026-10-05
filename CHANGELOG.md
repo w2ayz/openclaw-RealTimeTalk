@@ -1,3 +1,23 @@
+## v3.27.6 — 2026-10-05
+
+### Added
+
+- **Automatic mic gate calibration on every startup**, by request.
+  Ported from the Mac fork's v3.27.6, adapted for this fork's 3-way gate
+  selection: applies to the two raw-signal paths (`--input-source`
+  explicit, and AGC-unavailable fallback) via a small shared
+  `_auto_calibrate_raw_gate()` helper, and is deliberately **not**
+  applied to the AGC-active branch — `AGC_MIC_GATE` is a self-
+  normalizing light-touch constant by existing design, not something
+  meant to be calibrated away from (see that branch's own comment).
+  `--no-auto-calibrate` skips the ~2s measurement on both raw-signal
+  paths and restores the old fixed-`--mic-gate`-or-default behavior; the
+  two existing "never calibrated" OpenAI warnings now only fire when
+  auto-calibration was explicitly disabled AND no `--mic-gate` was given
+  either. Not independently verified on real Pi hardware from this
+  session (no local Pi runtime available) — verify before relying on it,
+  especially the AGC-path exclusion.
+
 ## v3.27.5 — 2026-10-05
 
 ### Changed

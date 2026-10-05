@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.5"
+__version__ = "3.27.6"
 
 import argparse
 import asyncio
@@ -8658,9 +8658,15 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
     log.info("Daemon stopped.")
 
 
-def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
-    """Record ambient noise and return a recommended MIC_GATE_PEAK value (2× noise peak)."""
-    print(f"Calibrating mic — measuring ambient noise for {duration:.0f}s. Stay quiet.")
+def calibrate_mic(input_device=None, duration: float = 3.0, verbose: bool = True) -> int:
+    """Record ambient noise and return a recommended MIC_GATE_PEAK value (1.5x noise peak).
+
+    verbose=False is used by the automatic startup calibration (see
+    __main__'s --no-auto-calibrate handling below) — no point printing
+    "stay quiet" to a terminal nobody's watching in a background daemon;
+    the caller logs the result itself instead."""
+    if verbose:
+        print(f"Calibrating mic — measuring ambient noise for {duration:.0f}s. Stay quiet.")
     peaks = []
     def cb(indata, frames, t, s):
         raw = indata[::RESAMPLE_RATIO, 0]
@@ -8672,7 +8678,8 @@ def calibrate_mic(input_device=None, duration: float = 3.0) -> int:
     peaks = peaks[2:]  # discard first two frames (hardware warmup)
     noise_peak = max(peaks) if peaks else 0
     recommended = max(MIC_GATE_MIN, min(MIC_GATE_MAX, int(noise_peak * 1.5)))
-    print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
+    if verbose:
+        print(f"Noise floor peak: {noise_peak}  →  recommended MIC_GATE_PEAK: {recommended} (clamped {MIC_GATE_MIN}–{MIC_GATE_MAX})")
     return recommended
 
 
@@ -8698,7 +8705,18 @@ if __name__ == "__main__":
     p.add_argument("--mic-gain",       type=float, default=MIC_GAIN,
                    help=f"Software mic gain multiplier (default: {MIC_GAIN})")
     p.add_argument("--mic-gate",       type=int, default=MIC_GATE_PEAK,
-                   help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK})")
+                   help=f"Noise gate threshold — pre-gain peak below this → silence (default: {MIC_GATE_PEAK}). "
+                        "Only used on the two non-AGC paths, and ignored on those unless "
+                        "--no-auto-calibrate is also set — see that flag.")
+    p.add_argument("--no-auto-calibrate", action="store_true",
+                   help="Skip the automatic ambient-noise mic calibration that normally runs "
+                        "on every startup (~2s) on the direct/--input-source and AGC-unavailable "
+                        "paths, and use --mic-gate (or the compiled-in default) as a fixed value "
+                        "there instead. Never affects the AGC-active path (AGC_MIC_GATE is a "
+                        "deliberate light-touch constant, not something to calibrate away from — "
+                        "see that branch's own comment). Auto-calibration re-measures every "
+                        "restart specifically so the gate tracks whatever this room/mic sounds "
+                        "like right now — pass this flag to pin a manually-tuned value instead.")
     p.add_argument("--spk-threshold",  type=float, default=None,
                    help=f"Speaker-verification cosine threshold override (default: {SPK_THRESHOLD_DEFAULT})")
     p.add_argument("--agent-name",     type=str, default="Zeebot",
@@ -8748,6 +8766,33 @@ if __name__ == "__main__":
     # rather than the resulting number, or a real calibrated value could
     # falsely trip this.
     _mic_gate_explicit = any(a == "--mic-gate" or a.startswith("--mic-gate=") for a in sys.argv)
+
+    # Automatic ambient-noise calibration for the two RAW-signal paths below
+    # (direct --input-source, and AGC-unavailable fallback) — runs on every
+    # startup, not just once, so the gate tracks whatever this room/mic
+    # sounds like right now rather than a value frozen the one time someone
+    # ran --calibrate by hand. Deliberately NOT applied to the AGC-active
+    # branch (AGC_MIC_GATE is a self-normalizing light-touch constant by
+    # design — see that branch's own comment) and overrides --mic-gate too
+    # unless --no-auto-calibrate is passed (the escape hatch for pinning a
+    # known-good value and skipping the ~2s startup measurement). Must run
+    # before the real mic stream opens — same single-concurrent-stream
+    # constraint as the Mac fork, though less likely to bite on PipeWire.
+    def _auto_calibrate_raw_gate(floor: int) -> int:
+        if args.no_auto_calibrate:
+            return floor
+        try:
+            measured = calibrate_mic(input_device=args.input_device, duration=2.0, verbose=False)
+            log.info("Auto-calibrated mic gate for this boot: %d "
+                     "(override with --mic-gate, or pass --no-auto-calibrate to stop "
+                     "re-measuring on every restart)", measured)
+            return measured
+        except Exception as _e:
+            log.warning("Auto-calibration failed (%s) — using %s %d", _e,
+                        "explicit --mic-gate" if _mic_gate_explicit else "compiled-in default",
+                        floor)
+            return floor
+
     # Load the per-device calibration store first: _activate_agc_source() may
     # switch the default sink and apply its calibration.
     _load_cal_store()
@@ -8756,16 +8801,17 @@ if __name__ == "__main__":
         # and use direct (non-AGC) gain/gate settings.
         _set_default_source(args.input_source)
         MIC_GAIN      = 6.0
-        MIC_GATE_PEAK = max(MIC_GATE_MIN, args.mic_gate)
+        MIC_GATE_PEAK = _auto_calibrate_raw_gate(max(MIC_GATE_MIN, args.mic_gate))
         log.info("Explicit --input-source %s — direct mode gain=%.1f gate=%d",
                  args.input_source, MIC_GAIN, MIC_GATE_PEAK)
-        if load_openai_key() and not _mic_gate_explicit:
+        if load_openai_key() and args.no_auto_calibrate and not _mic_gate_explicit:
             log.warning("Direct (non-AGC) mic mode with OpenAI STT: gate=%d is the "
-                         "compiled-in default, never calibrated for this mic/room, "
-                         "and is the ONLY signal deciding when you've stopped talking "
-                         "(no server-side VAD on gpt-live-transcribe). If transcripts "
-                         "never finalize, run --calibrate for this mic/room.",
-                         MIC_GATE_PEAK)
+                         "compiled-in default -- auto-calibration is disabled "
+                         "(--no-auto-calibrate) and no --mic-gate was given. It is the "
+                         "ONLY signal deciding when you've stopped talking (no "
+                         "server-side VAD on gpt-live-transcribe). If transcripts "
+                         "never finalize, drop --no-auto-calibrate or run --calibrate "
+                         "for this mic/room.", MIC_GATE_PEAK)
     elif _activate_agc_source():
         MIC_GAIN      = AGC_MIC_GAIN
         MIC_GATE_PEAK = AGC_MIC_GATE
@@ -8773,14 +8819,17 @@ if __name__ == "__main__":
                  "using gain=%.1f gate=%d", AGC_SOURCE_NAME,
                  MIC_GAIN, MIC_GATE_PEAK)
     else:
+        MIC_GATE_PEAK = _auto_calibrate_raw_gate(MIC_GATE_PEAK)
         log.info("AGC source unavailable — fallback to static gain=%.1f "
                  "gate=%d", MIC_GAIN, MIC_GATE_PEAK)
-        if load_openai_key() and not _mic_gate_explicit:
+        if load_openai_key() and args.no_auto_calibrate and not _mic_gate_explicit:
             log.warning("AGC unavailable — using the static, uncalibrated gate=%d "
-                         "with OpenAI STT: this is the ONLY signal deciding when "
-                         "you've stopped talking (no server-side VAD on "
-                         "gpt-live-transcribe). If transcripts never finalize, run "
-                         "--calibrate for this mic/room.", MIC_GATE_PEAK)
+                         "with OpenAI STT: auto-calibration is disabled "
+                         "(--no-auto-calibrate) and no --mic-gate was given. This is "
+                         "the ONLY signal deciding when you've stopped talking (no "
+                         "server-side VAD on gpt-live-transcribe). If transcripts "
+                         "never finalize, drop --no-auto-calibrate or run --calibrate "
+                         "for this mic/room.", MIC_GATE_PEAK)
     _mic_gate_ref[0] = MIC_GATE_PEAK
 
     # Apply saved calibration to the current default sink (store loaded above)
