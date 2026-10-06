@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.8"
+__version__ = "3.27.9"
 
 import argparse
 import asyncio
@@ -4259,12 +4259,9 @@ class BaseVoiceSession:
 
         # Wake phrase — always checked regardless of active state
         if _matches_phrase(normalized, WAKE_PHRASES):
-            # This agent's own name was heard — satisfies any pending shared
-            # "Hey Jarvis" name-check deadline (see NAME_WAKE_TIMEOUT); the
-            # _WAKE_CONFIRM_TIMEOUT round-trip below takes over from here.
-            _name_wake_deadline[0] = 0.0
             if self._active:
-                # Already active — acknowledge as before
+                # Already active — nothing pending to bound, no fallback needed.
+                _name_wake_deadline[0] = 0.0
                 self._busy.set()
                 try:
                     log.info("Wake phrase detected — already active")
@@ -4286,7 +4283,25 @@ class BaseVoiceSession:
             # no longer bypasses it — it only gates who's allowed to speak
             # commands at all (see _verify_speaker), not whether this
             # specific wake still gets reconfirmed.
+            #
+            # This agent's own name was heard — the step-1→step-2 shared
+            # "Hey Jarvis" deadline (if one was armed) is satisfied, but
+            # confirmation isn't yet: re-arm it fresh from now (rather than
+            # clearing it) so the step-2 "<AgentName>?" round-trip below is
+            # itself bounded by NAME_WAKE_TIMEOUT. Previously cleared to 0.0
+            # here on the assumption that the separate _WAKE_CONFIRM_TIMEOUT
+            # round-trip "takes over" enforcement — it doesn't on its own:
+            # that check only runs reactively, when the next transcript
+            # arrives (see _pending_wake_confirm above), so an unanswered or
+            # mis-fired confirmation left the agent connected in Silent with
+            # no automatic path back to Sleep short of the full idle
+            # timeout. _name_wake_watcher already polls this same deadline
+            # every 1s; re-arming it here gives step 2 that same backstop
+            # instead of a silent gap. Ported from the Mac fork, which had
+            # the identical bug (confirmed by reading this fork's actual
+            # code, not assumed from the fix description).
             import time as _twc2
+            _name_wake_deadline[0] = _twc2.time() + NAME_WAKE_TIMEOUT
             self._pending_wake_confirm = True
             self._pending_wake_t = _twc2.time()
             log.info("Wake phrase detected — requesting confirmation")
@@ -4684,14 +4699,18 @@ class BaseVoiceSession:
         """Enforce NAME_WAKE_TIMEOUT: _oww_wakeword_listener arms
         _name_wake_deadline whenever "Hey Jarvis" (shared, no per-agent
         model) wakes this agent to Silent or primes it while already
-        connected. If this agent's own name isn't heard — clearing the
-        deadline, see the WAKE_PHRASES branch in _handle_transcript —
-        before the deadline passes, drop straight back to full Sleep
-        rather than lingering in Silent. Important with multiple agents
-        sharing one wake word: an agent nobody actually addressed shouldn't
-        sit there connected (and listening) indefinitely. Polls at 1s
-        resolution, unlike _idle_watcher's 30s — this window is a fraction
-        of IDLE_SLEEP_MINS. No-op whenever _name_wake_deadline[0] is 0.0.
+        connected. If this agent's own name isn't heard before the
+        deadline passes, drop straight back to full Sleep rather than
+        lingering in Silent. Important with multiple agents sharing one
+        wake word: an agent nobody actually addressed shouldn't sit there
+        connected (and listening) indefinitely. Once the name IS heard,
+        the WAKE_PHRASES branch in _handle_transcript re-arms this same
+        deadline (rather than clearing it) to also bound the step-2
+        "<AgentName>?" confirmation round-trip — so this watcher covers
+        both "never said my name" and "said my name but never confirmed"
+        with one mechanism. Polls at 1s resolution, unlike _idle_watcher's
+        30s — this window is a fraction of IDLE_SLEEP_MINS. No-op whenever
+        _name_wake_deadline[0] is 0.0.
         """
         import time as _nw
         while not self.stop_event.is_set():
@@ -4838,17 +4857,24 @@ def _dashboard_dynamic(sess) -> dict:
     paused     = _paused_speech[0] is not None
     speaking   = _is_speaking[0]
     thinking   = _current_think_task[0] is not None
+    # Step-2 wake confirmation ("<AgentName>?" asked, waiting to hear the
+    # name back) — _name_wake_deadline is re-armed to pending_wake_t +
+    # NAME_WAKE_TIMEOUT the moment this starts (see the WAKE_PHRASES branch
+    # in _handle_transcript), so it's also the right deadline to show here.
+    confirming       = bool(sess and sess._pending_wake_confirm)
+    confirm_deadline = _name_wake_deadline[0] if confirming else 0.0
 
     state = ("SLEEPING"   if _idle_disconnected[0]
              else "MONITORING" if monitoring
              else "SPEAKING"   if speaking
              else "THINKING"   if thinking
              else "PAUSED"     if paused
+             else "CONFIRMING" if confirming
              else "ACTIVE"     if active else "SILENT")
     _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
            "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
            "PAUSED":("#150d2e","#a5b4fc"),"MONITORING":("#071a2e","#60a5fa"),
-           "SLEEPING":("#0e0e14","#475569"),
+           "SLEEPING":("#0e0e14","#475569"),"CONFIRMING":("#2e1065","#c4b5fd"),
            }.get(state,("#141d2b","#64748b"))
     state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
 
@@ -4864,7 +4890,11 @@ def _dashboard_dynamic(sess) -> dict:
         ' &nbsp;<a href="/continue" class="cont">&#9654; Continue</a>'
         ' &nbsp;<a href="/replay" class="rpl">&#8635; Replay</a>'
         ' &nbsp;<a href="/cancel" class="cnl">&#10005; Cancel</a></div>'
-        if paused else ""
+        if paused else
+        (f'<div class="spkbanner">&#128264; Say &ldquo;{AGENT_NAME}&rdquo; to confirm&hellip; '
+         f'back to sleep in <span class="cctr" data-deadline="{confirm_deadline:.3f}">'
+         f'{int(NAME_WAKE_TIMEOUT)}</span>s if not heard</div>')
+        if confirming else ""
     )
 
     # Pre-compute thinking durations
@@ -7393,6 +7423,9 @@ setInterval(function(){{
   var now=Date.now()/1000;
   document.querySelectorAll('.tctr').forEach(function(el){{
     el.textContent=Math.max(0,Math.floor(now-parseFloat(el.dataset.start)));
+  }});
+  document.querySelectorAll('.cctr').forEach(function(el){{
+    el.textContent=Math.max(0,Math.ceil(parseFloat(el.dataset.deadline)-now));
   }});
 }},500);
 (function(){{

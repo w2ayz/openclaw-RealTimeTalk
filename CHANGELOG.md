@@ -1,3 +1,28 @@
+## v3.27.9 — 2026-10-05
+
+### Fixed
+
+- **Same bug as Mac's v3.27.9**: a mis-addressed step-2 wake
+  ("<AgentName>?" asked, no valid reply) never fell back to Sleep in
+  the ~20s users expect — it lingered in Silent until the full idle
+  timeout. Checked this fork's actual `_handle_transcript` before
+  porting (not assumed): it had the byte-for-byte identical bug — the
+  WAKE_PHRASES branch cleared `_name_wake_deadline` to `0.0` the instant
+  a wake phrase was heard, same wrong assumption that the separate
+  `_WAKE_CONFIRM_TIMEOUT` round-trip "takes over" enforcement on its
+  own (it only runs reactively, on the next transcript). Now re-arms
+  the deadline fresh at step-2 entry instead, so `_name_wake_watcher`
+  (already polling it every 1s for step 1) covers step 2 too.
+
+### Added
+
+- **Dashboard now shows a live countdown during step-2 confirmation**,
+  ported from Mac's v3.27.9: a `<AgentName>?`-waiting banner (adapted to
+  this fork's `spkbanner` class, not Mac's `speaking`) with a counter
+  ticking down every 500ms from `NAME_WAKE_TIMEOUT`, mirroring the
+  existing `.tctr` "thinking…" counter as `.cctr`. New `CONFIRMING`
+  state-pill color too.
+
 ## v3.27.8 — 2026-10-05
 
 ### Not ported (version-lock bump only, no functional change)
