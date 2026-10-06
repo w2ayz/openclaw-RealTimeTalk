@@ -1,3 +1,19 @@
+## v3.27.7 — 2026-10-05
+
+### Not ported (version-lock bump only, no functional change)
+
+- **Mac's v3.27.7 fixed `/calibrate/run` sampling a stale zero-init
+  `_mic_level_current` before the mic stream's first callback had fired**
+  (right after a wake/reconnect), which could tank the gate to
+  `MIC_GATE_MIN`. Checked this fork's actual code before assuming it
+  didn't apply (not just the Mac commit message): `_oww_wakeword_listener`
+  runs an always-on background thread, independent of the main STT
+  session, whose own callback keeps `_mic_level_current` fed continuously
+  — PipeWire's multiple-simultaneous-consumer support (unlike Mac's
+  single-stream constraint) means this fork's `/calibrate/run` can never
+  observe a stale/never-yet-written value the way Mac's could. No code
+  change here; version bumped to stay in lockstep.
+
 ## v3.27.6 — 2026-10-05
 
 ### Added
