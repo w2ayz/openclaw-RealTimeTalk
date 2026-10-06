@@ -1,3 +1,21 @@
+## v3.27.8 — 2026-10-05
+
+### Not ported (version-lock bump only, no functional change)
+
+- **Mac's v3.27.8 made `_oww_wakeword_listener`'s callback feed
+  `_mic_level_current`/`_last_mic_cb` while Sleeping**, so its
+  `/calibration` page's live meter and `/calibrate/run` work before
+  waking, not just after. Checked this fork's actual `_cb` (the one
+  passed to `_oww_wakeword_listener`'s `sd.InputStream`) before assuming
+  anything needed to change: it already writes `_mic_level_current` on
+  every callback — the comment right there says so explicitly ("Feed mic
+  level meter so calibration page stays alive during sleep"). It doesn't
+  also write `_last_mic_cb`, but this fork's `/calibrate/run` has no
+  liveness wait on that global to begin with (no `if sess:` gate around
+  sampling here, ever — see the note in the v3.27.7 entry above), so
+  there's nothing for that omission to affect. No code change; version
+  bumped to stay in lockstep.
+
 ## v3.27.7 — 2026-10-05
 
 ### Not ported (version-lock bump only, no functional change)
