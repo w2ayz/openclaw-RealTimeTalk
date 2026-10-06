@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.10"
+__version__ = "3.27.11"
 
 import argparse
 import asyncio
@@ -4345,6 +4345,7 @@ class BaseVoiceSession:
                 )
             finally:
                 self._busy.clear()
+            _name_wake_deadline[0] = 0.0   # no pending name-check once back in Sleeping Mode
             _dtmf_force_deepsleep[0] = True
             return
 

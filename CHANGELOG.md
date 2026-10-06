@@ -1,3 +1,22 @@
+## v3.27.11 — 2026-10-05
+
+### Fixed
+
+- **Same bug as Mac's v3.27.11**: dashboard banner stuck on "CONFIRMING
+  … back to sleep in 0s" forever after saying the sleep phrase. Checked
+  this fork's actual `SLEEP_PHRASES` handler before porting: byte-for-
+  byte identical bug — unlike the DTMF deep-sleep sequence and the HTTP
+  `/sleep` endpoint (both of which already clear `_name_wake_deadline`
+  before/while setting `_dtmf_force_deepsleep`), the voice-phrase sleep
+  path never reset it. The stale deadline, armed by the last "Hey
+  Jarvis" wake window, was left in the past; with `active` false the
+  dashboard's `name_wake_pending` check (`_name_wake_deadline and not
+  active`, from v3.27.10) stayed true indefinitely, clamped to 0s, with
+  nothing left to ever clear it short of the next wake cycle re-arming
+  and re-expiring it. The daemon itself was never stuck — only the
+  banner. Fixed by clearing `_name_wake_deadline` in the `SLEEP_PHRASES`
+  handler too, matching the other two deep-sleep paths.
+
 ## v3.27.10 — 2026-10-05
 
 ### Fixed
