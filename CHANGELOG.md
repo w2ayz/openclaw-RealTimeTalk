@@ -1,3 +1,20 @@
+## v3.27.10 — 2026-10-05
+
+### Fixed
+
+- **The v3.27.9 confirm-countdown banner only showed during step 2
+  ("<AgentName>?" asked), never during step 1** (OWW's "Hey Jarvis"
+  reconnected to Silent, this agent's own name not yet heard at all) —
+  which is the half users actually hit most (e.g. the original "Grogu"
+  report: the shared wake word fired, nobody said this agent's name, no
+  step 2 ever started). Keyed the banner off `_name_wake_deadline`
+  itself (armed for both halves) instead of `_pending_wake_confirm`
+  (step 2 only), with the message text still varying by which half it
+  is. Also fixed the displayed number jumping to `20` for an instant on
+  every 3s `/dashboard-frag` poll before the next 500ms tick corrected
+  it — now computed from the live deadline at render time so it starts
+  accurate.
+
 ## v3.27.9 — 2026-10-05
 
 ### Fixed

@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.9"
+__version__ = "3.27.10"
 
 import argparse
 import asyncio
@@ -4857,19 +4857,27 @@ def _dashboard_dynamic(sess) -> dict:
     paused     = _paused_speech[0] is not None
     speaking   = _is_speaking[0]
     thinking   = _current_think_task[0] is not None
-    # Step-2 wake confirmation ("<AgentName>?" asked, waiting to hear the
-    # name back) — _name_wake_deadline is re-armed to pending_wake_t +
-    # NAME_WAKE_TIMEOUT the moment this starts (see the WAKE_PHRASES branch
-    # in _handle_transcript), so it's also the right deadline to show here.
-    confirming       = bool(sess and sess._pending_wake_confirm)
-    confirm_deadline = _name_wake_deadline[0] if confirming else 0.0
+    # Shared wake window — covers BOTH halves of the two-step wake, since
+    # both now use the same _name_wake_deadline (see NAME_WAKE_TIMEOUT):
+    #   step 1: OWW's "Hey Jarvis" reconnected to Silent, this agent's own
+    #           name hasn't been heard yet (_pending_wake_confirm False).
+    #   step 2: the name WAS heard, "<AgentName>?" was asked, waiting on
+    #           the confirmation reply (_pending_wake_confirm True) —
+    #           _name_wake_deadline gets re-armed fresh for this half by
+    #           the WAKE_PHRASES branch in _handle_transcript.
+    # Keying off the deadline itself (rather than _pending_wake_confirm
+    # alone) means the banner — and the fallback-to-Sleep it's promising —
+    # actually line up for both halves, not just step 2.
+    name_wake_pending = bool(_name_wake_deadline[0] and not active)
+    confirming        = bool(sess and sess._pending_wake_confirm)
+    wake_deadline      = _name_wake_deadline[0] if name_wake_pending else 0.0
 
     state = ("SLEEPING"   if _idle_disconnected[0]
              else "MONITORING" if monitoring
              else "SPEAKING"   if speaking
              else "THINKING"   if thinking
              else "PAUSED"     if paused
-             else "CONFIRMING" if confirming
+             else "CONFIRMING" if name_wake_pending
              else "ACTIVE"     if active else "SILENT")
     _sc = {"ACTIVE":("#0d2818","#34d399"),"SILENT":("#141d2b","#64748b"),
            "THINKING":("#1c1304","#f59e0b"),"SPEAKING":("#031a10","#2dd4bf"),
@@ -4877,6 +4885,9 @@ def _dashboard_dynamic(sess) -> dict:
            "SLEEPING":("#0e0e14","#475569"),"CONFIRMING":("#2e1065","#c4b5fd"),
            }.get(state,("#141d2b","#64748b"))
     state_pill_style = f"background:{_sc[0]};color:{_sc[1]};border-color:{_sc[1]};"
+    import time as _dtime
+    _wake_ctr = (f'<span class="cctr" data-deadline="{wake_deadline:.3f}">'
+                 f'{max(0, int(wake_deadline - _dtime.time()))}</span>s')
 
     speaking_banner = (
         '<div class="spkbanner" style="background:#3b0000;border-color:#dc2626;color:#fca5a5;">'
@@ -4892,9 +4903,11 @@ def _dashboard_dynamic(sess) -> dict:
         ' &nbsp;<a href="/cancel" class="cnl">&#10005; Cancel</a></div>'
         if paused else
         (f'<div class="spkbanner">&#128264; Say &ldquo;{AGENT_NAME}&rdquo; to confirm&hellip; '
-         f'back to sleep in <span class="cctr" data-deadline="{confirm_deadline:.3f}">'
-         f'{int(NAME_WAKE_TIMEOUT)}</span>s if not heard</div>')
-        if confirming else ""
+         f'back to sleep in {_wake_ctr} if not heard</div>'
+         if confirming else
+         f'<div class="spkbanner">&#128266; Say &ldquo;{AGENT_NAME} wake up&rdquo;&hellip; '
+         f'back to sleep in {_wake_ctr} if not heard</div>')
+        if name_wake_pending else ""
     )
 
     # Pre-compute thinking durations
