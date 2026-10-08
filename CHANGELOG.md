@@ -1,3 +1,35 @@
+## v3.27.12 — 2026-10-07
+
+### Fixed
+
+- **Same bug as Mac's v3.27.12 (confirmed byte-for-byte identical here
+  before porting)**: saying "Hey Jarvis" correctly sends every
+  co-located agent into step 1 (shared OWW wake word, by design), but
+  saying e.g. "Zeebot wake up" to pick one was ALSO sending every OTHER
+  agent into its own step-2 "<Name>?" confirmation. Root cause:
+  `_matches_phrase`'s fuzzy pass (word overlap ≥60% of a *phrase*'s
+  words) never required the matching agent's own name among the
+  overlapping words — "zeebot wake up" vs. another agent's own default
+  "grogu wake up" share 2 of 3 words ("wake", "up"), clearing that
+  agent's bar too regardless of whose name was said. `_matches_phrase`
+  now takes a `require_words` param; WAKE_PHRASES' one call site passes
+  this agent's own name (`AGENT_NAME_LC`), so the fuzzy pass still
+  tolerates garbling of the *other* words but can no longer fire on a
+  phrase that never named this agent.
+- **Step-2 confirmation no longer accepts a bare "yes"/"ok"/etc. with no
+  name**, same reasoning: with multiple agents possibly mid-confirmation
+  together, a bare affirmative doesn't say which one it answers.
+  `_WAKE_CONFIRM_AFFIRM` replaced by `_WAKE_CONFIRM_WORDS`/
+  `_WAKE_CONFIRM_IDIOMS` plus a name+affirm combination check in
+  `_handle_transcript`: accepted replies are now the bare agent name
+  alone, the name combined with any confirmative word/idiom in either
+  order ("Yes Zeebot", "Zeebot yes", "Only Zeebot", "Zeebot only", ...),
+  or a repeat of the full wake phrase — never a bare affirmative alone.
+  Verified against the real source (import blocked here by Python
+  3.9/missing hardware deps — this dev machine isn't the Pi target, so
+  the touched functions/constants were extracted verbatim from the real
+  file and exercised directly, not reimplemented) before committing.
+
 ## v3.27.11 — 2026-10-05
 
 ### Fixed

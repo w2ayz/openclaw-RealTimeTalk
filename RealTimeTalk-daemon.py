@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.11"
+__version__ = "3.27.12"
 
 import argparse
 import asyncio
@@ -1418,26 +1418,33 @@ def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
 # "<AGENT_NAME>?" (echoes its own name back, rather than a generic "Yes?",
 # so the confirmation itself re-confirms which agent is being addressed).
 #
-# Bare "<AgentName>" and "yes <AgentName>" are ALSO accepted — handled
-# separately in _handle_transcript (not added as literal strings here)
-# because AGENT_NAME_LC is rebuilt per --agent-name at startup, and this
-# set is not. Ported from the Mac fork's v3.27.4 (by request, not a Pi
-# bug fix — Pi's noise-hallucination filter already runs after this
-# block's unconditional early return, so it never had the Mac fork's
-# bare-prompt-echo-drop problem; only the accepted-phrase widening
-# applies here).
-#
-# Deliberately NOT "wake up" / "wake" (removed 2026-10-05, ported from
-# the Mac fork's v3.27.5, by request): those don't name the agent at
-# all, so in a room with more than one listener/agent a bare "wake up"
-# meant for someone else — or even for a human — would silently confirm
-# this one. "<AgentName> wake up" itself is still accepted — via
-# _matches_phrase_exact(WAKE_PHRASES) below, which requires the name.
-_WAKE_CONFIRM_AFFIRM = {
+# As of 2026-10-07, ported from the Mac fork's v3.27.12 (by request, not
+# a Pi-specific bug — confirmed byte-for-byte identical here before
+# porting): a bare affirmative with NO name — plain "yes"/"ok"/etc. — is
+# no longer accepted on its own. With multiple agents in the same room,
+# "Hey Jarvis" (step 1, shared OWW phrase) plus one agent's "<Name> wake
+# up" can leave more than one of them mid-"<Name>?" at once (see
+# _matches_phrase's require_words for the related step-1 false-trigger
+# fix); a bare "yes" at that point doesn't say which agent it answers.
+# Every acceptance path below now requires this agent's own name — bare
+# "<AgentName>" alone, or the name combined with ANY word in
+# _WAKE_CONFIRM_WORDS/_WAKE_CONFIRM_IDIOMS in either order ("yes
+# zeebot", "zeebot yes", "only zeebot", "zeebot only", ...), or a full
+# repeat of the wake phrase itself ("<AgentName> wake up", via
+# _matches_phrase_exact(WAKE_PHRASES) below, which already requires the
+# name as literal phrase text). The actual combination check lives in
+# _handle_transcript (AGENT_NAME_LC, rebuilt per --agent-name at
+# startup, isn't available to a module-level set built once here).
+_WAKE_CONFIRM_WORDS = {
     "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "correct", "affirmative",
-    "go ahead", "activate", "please", "do it", "yes please",
+    "activate", "please", "only",
     "好", "是", "对", "好的", "可以", "醒来",
 }
+# Multi-word idioms — kept separate from _WAKE_CONFIRM_WORDS rather than
+# split into individual words: some of their words ("it", "ahead") are too
+# generic to safely count alone even combined with the name ("zeebot, read
+# it" shouldn't confirm just because "it" + the name both appear).
+_WAKE_CONFIRM_IDIOMS = {"go ahead", "do it", "yes please"}
 _WAKE_CONFIRM_TIMEOUT = 15.0  # seconds to wait for confirmation before treating as mis-fire
 
 def _is_english_or_chinese(text: str) -> bool:
@@ -1550,7 +1557,7 @@ def _matches_phrase_exact(transcript: str, phrases: set) -> bool:
             return True
     return False
 
-def _matches_phrase(transcript: str, phrases: set) -> bool:
+def _matches_phrase(transcript: str, phrases: set, require_words: set = None) -> bool:
     """True if the transcript contains any trigger phrase, or is a fuzzy word-overlap match.
 
     Two-pass:
@@ -1558,21 +1565,35 @@ def _matches_phrase(transcript: str, phrases: set) -> bool:
     2. Fuzzy: if the transcript shares ≥ 60% of a phrase's words it counts as a match
        (handles car-noise garbling like 'five wake up' → 'five break up').
 
+    require_words: if given, pass 2 additionally requires every one of these
+    words present in the transcript. WAKE_PHRASES passes this agent's own
+    name here — without it, two co-located agents' default phrases
+    ("zeebot wake up" / "grogu wake up") share 2 of 3 words ("wake", "up"),
+    so saying ONE agent's wake phrase cleared the other's 60% bar too and
+    sent it into its own step-2 confirmation — confirmed live 2026-10-07
+    (ported from the Mac fork's v3.27.12), multiple agents all asking
+    "<Name>?" off a single "Zeebot wake up". Pass 1 needs no such gate: a
+    literal substring match already contains the phrase's own name text
+    by construction.
+
     Only safe for phrase sets where a false positive is cheap to recover from
     — currently just WAKE_PHRASES, gated by a confirmation step right after.
     Everything else uses _matches_phrase_exact (see its docstring for why).
     """
     t = _normalize(transcript)
+    t_words = set(t.split())
     for phrase in phrases:
         p = _normalize(phrase)
         # Pass 1: substring
         if p in t:
             return True
-        # Pass 2: word overlap ratio
-        t_words = set(t.split())
-        p_words  = set(p.split())
-        if p_words and len(t_words & p_words) / len(p_words) >= 0.6:
-            return True
+        # Pass 2: word overlap ratio, gated by require_words if given
+        p_words = set(p.split())
+        if not p_words or len(t_words & p_words) / len(p_words) < 0.6:
+            continue
+        if require_words and not require_words <= t_words:
+            continue
+        return True
     return False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -4215,11 +4236,21 @@ class BaseVoiceSession:
                 return
             # Use _normalize() here, not the shared `normalized` (which only
             # strips TRAILING punctuation) — "Yes, Zeebot." must collapse to
-            # "yes zeebot" (internal comma too) to match f"yes {NAME}" below.
-            _confirm_norm = _normalize(transcript)
-            if (_confirm_norm in _WAKE_CONFIRM_AFFIRM
-                  or _confirm_norm == AGENT_NAME_LC                 # bare "<AgentName>"
-                  or _confirm_norm == f"yes {AGENT_NAME_LC}"        # "yes <AgentName>" / "yes, <AgentName>"
+            # "yes zeebot" (internal comma too) to match the combination
+            # check below regardless of word order.
+            _confirm_norm  = _normalize(transcript)
+            _confirm_words = set(_confirm_norm.split())
+            _name_words    = set(AGENT_NAME_LC.split())
+            _has_name      = bool(_name_words) and _name_words <= _confirm_words
+            # As of 2026-10-07: a bare affirmative with no name no longer
+            # qualifies — see _WAKE_CONFIRM_WORDS' comment. Every path here
+            # requires the agent's own name, in combination (any order) with
+            # a confirmative word/idiom, or as the sole reply, or repeated
+            # as the full wake phrase.
+            _has_affirm = (bool(_confirm_words & _WAKE_CONFIRM_WORDS)
+                           or any(idiom in _confirm_norm for idiom in _WAKE_CONFIRM_IDIOMS))
+            if (_confirm_norm == AGENT_NAME_LC                            # bare "<AgentName>"
+                  or (_has_name and _has_affirm)                          # "yes zeebot" / "zeebot yes" / "only zeebot" / "zeebot only" / ...
                   # Exact substring, NOT the fuzzy pass: this check IS the
                   # confirmation gate (nothing after it), so the ≥60%-of-
                   # phrase-words fuzzy match is unsafe here — it let a bare
@@ -4258,7 +4289,7 @@ class BaseVoiceSession:
             return
 
         # Wake phrase — always checked regardless of active state
-        if _matches_phrase(normalized, WAKE_PHRASES):
+        if _matches_phrase(normalized, WAKE_PHRASES, require_words=set(AGENT_NAME_LC.split())):
             if self._active:
                 # Already active — nothing pending to bound, no fallback needed.
                 _name_wake_deadline[0] = 0.0
