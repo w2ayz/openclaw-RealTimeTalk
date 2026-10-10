@@ -5658,8 +5658,25 @@ class BaseVoiceSession:
         if not _speaker_verified:
             return
 
-        # Wake phrase — always checked regardless of active state
-        if _matches_phrase(normalized, WAKE_PHRASES, require_words=set(AGENT_NAME_LC.split())):
+        # Wake phrase — always checked regardless of active state.
+        # While already Active, a hit here is NOT cheap to recover from: the
+        # branch below returns immediately with "Yes, I'm here." and drops
+        # the transcript entirely — no confirmation round-trip, no fallback
+        # to normal routing like the Silent/Monitoring branch has. That
+        # makes _matches_phrase's 60%-word-overlap fuzzy pass unsafe here
+        # specifically: an ordinary command containing the agent's name plus
+        # any one wake-phrase word ("Echo, can you clean UP the...") cleared
+        # the 60%-of-3-words bar and got swallowed instead of routed —
+        # confirmed live 2026-10-10. Require an exact phrase match once
+        # already active; the fuzzy pass still applies for Silent/
+        # Monitoring→Active below, where a mis-fire only costs a "<Name>?"
+        # that self-corrects.
+        if self._active:
+            wake_hit = _matches_phrase_exact(normalized, WAKE_PHRASES)
+        else:
+            wake_hit = _matches_phrase(normalized, WAKE_PHRASES,
+                                        require_words=set(AGENT_NAME_LC.split()))
+        if wake_hit:
             if self._active:
                 # Already active — nothing pending to bound, no fallback needed.
                 _name_wake_deadline[0] = 0.0
@@ -6014,6 +6031,16 @@ class BaseVoiceSession:
             # break cleanly and drop the still-pending text.
             speaker.reset()
             _http_interrupt[0] = False   # reset() arms the flag; clear it so the apology isn't cut
+            # Unlike a `replace` event, a timeout means no rewritten answer is
+            # ever coming — this turn is abandoned, not restarted. reset()
+            # itself only pauses the stale read-along (st["running"] = False,
+            # text left intact) because it's shared with the `replace` path,
+            # where a fresh frame arrives momentarily and naturally overwrites
+            # it. Here nothing will post that fresh frame, so without this the
+            # dashboard's read-along banner is left frozen on the abandoned
+            # partial reply indefinitely — confirmed live 2026-10-10.
+            with _live_speech_lock:
+                _live_speech[0] = None
             _log_entry("five", "")   # clears the thinking counter on dashboard
             await asyncio.get_running_loop().run_in_executor(
                 None, speak, "Sorry, I timed out on that.", self.alsa_output
