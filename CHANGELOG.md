@@ -1,3 +1,17 @@
+## v3.27.14 — 2026-10-10
+
+### Fixed
+
+- **Same bug as Mac's v3.27.14 (confirmed identical here by reading the
+  code, not assumed)**: dashboard banner stuck on "CONFIRMING … back to
+  sleep in 0s" after idle auto-sleep. A successful step-2 wake
+  confirmation re-arms `_name_wake_deadline` but never cleared it; the
+  banner ignores it while Active, and `_idle_watcher`'s auto-sleep
+  didn't clear it either, so once the session went inactive the stale
+  expired deadline made `name_wake_pending` true forever. Both spots now
+  clear it. Same class as v3.27.11. (Mac's v3.27.13 has no Pi
+  counterpart yet — this bump just restores the version lock.)
+
 ## v3.27.12 — 2026-10-07
 
 ### Fixed

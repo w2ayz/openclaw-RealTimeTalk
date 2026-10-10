@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.27.12"
+__version__ = "3.27.14"
 
 import argparse
 import asyncio
@@ -4269,6 +4269,7 @@ class BaseVoiceSession:
                         self._monitoring = False
                         _persist_monitoring[0] = False
                     self._active = True
+                    _name_wake_deadline[0] = 0.0   # confirmed — step-2 window satisfied, don't leave it armed
                     _persist_active[0] = True
                     import time as _tact; _last_activity[0] = _tact.time()
                     await asyncio.get_running_loop().run_in_executor(
@@ -4717,6 +4718,7 @@ class BaseVoiceSession:
                     self._multilang = "off"
                     _persist_multilang[0] = "off"
                     log.info("Auto-sleep: multi-lang reset to off")
+                _name_wake_deadline[0] = 0.0   # no pending name-check once back in Sleeping Mode
                 _persist_active[0] = False
                 _idle_disconnected[0] = True
                 _save_sleep_state(True)
