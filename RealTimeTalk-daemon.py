@@ -257,7 +257,7 @@ BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
-IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
+IDLE_SLEEP_MINS   = 99999        # effectively disable automatic idle disconnect on this Pi
 OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
 # Ham radio interfaces (AIOC, Digirig, ...) — see radio_interfaces.py for each
@@ -2571,7 +2571,7 @@ def _build_phrase_sets(name_lc: str, wake_phrase: str = None):
             f"{name_lc} 醒来", f"{name_lc} 醒", f"{name_lc} 开始", f"wake up {name_lc}"}
     if name_lc == "five":
         wake |= {"5 wake up", "wake up 5"}  # digit synonym, historical default agent name
-    sleep = {f"{name_lc} go to sleep", "real time talk off", "real-time talk off", "realtimetalk off",
+    sleep = {f"{name_lc} go to sleep", f"{name_lc} sleep", "real time talk off", "real-time talk off", "realtimetalk off",
              f"{name_lc} 睡觉", f"{name_lc} 休息", f"{name_lc} 停", f"sleep {name_lc}"}
     if name_lc == "five":
         sleep |= {"5 go to sleep"}
