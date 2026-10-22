@@ -359,7 +359,7 @@ Safe to re-run any time (e.g. after `git pull`) — every step checks first and 
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected); resolves the optional edge-tts skill (sibling dir → `$OPENCLAW_WORKSPACE` → official path), installs Node.js + its `npm` deps if the skill is present, and records the path in the systemd unit as `RTT_EDGE_TTS_SCRIPT` — warns and continues if the skill is absent
 4. Downloads the CAM++ speaker-verification model
 5. STT keys/engine, TTS keys/engine order, and STT vocabulary — a choice menu
-   (OpenAI / Gemini / both / keep existing / **skip for TTS-only**), hidden
+   (OpenAI / Gemini / Muse / **choose the default engine** / keep existing / **skip for TTS-only**), hidden
    key input verified against each provider's API, an ElevenLabs key prompt,
    and a reorderable/droppable TTS engine chain. These three steps live in
    `RealTimeTalk-config-lib.sh` so you can re-run just this part later with

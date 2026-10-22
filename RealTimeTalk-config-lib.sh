@@ -191,6 +191,26 @@ PYEOF
     echo "      ✓ STT engine → $1${2:+ (fallback: $2)} written to $STT_CFG"
 }
 
+# _stt_has <engine> — exit 0 if that engine's key is configured.
+_stt_has() {
+    case "$1" in
+        openai) has_openai_key ;;
+        gemini) has_gemini_key ;;
+        muse)   has_muse_key ;;
+        *)      return 1 ;;
+    esac
+}
+
+# _stt_first_other <engine> — prints the first OTHER configured STT engine
+# (preference order openai, gemini, muse) to use as the fallback, or nothing.
+_stt_first_other() {
+    local e
+    for e in openai gemini muse; do
+        if [ "$e" != "$1" ] && _stt_has "$e"; then printf '%s' "$e"; return 0; fi
+    done
+    return 0
+}
+
 # run_stt_setup — interview for which STT provider key(s) to use, or skip STT
 # entirely for TTS-only (text-only) mode. Re-runnable: every choice defaults
 # to "keep what's already there."
@@ -214,15 +234,16 @@ PYEOF
     echo "      STT engine setup — which provider key(s) do you want to use?"
     echo "        [1] OpenAI Realtime        (regular sk-... API key — NOT the ChatGPT OAuth profile)"
     echo "        [2] Gemini Transcribe Live (Gemini API key, AQ.... or AIza...)"
-    echo "        [3] Both                   (pick the default engine; the other becomes the fallback)"
-    echo "        [4] Keep existing configuration"
-    echo "        [5] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"
+    echo "        [3] Muse Voice Transcribe  (Meta Model API key, LLM_...; Mandarin + English)"
+    echo "        [4] Choose the default STT engine (set up any of the three, then pick which one is"
+    echo "            the default; the next configured engine becomes the fallback)"
+    echo "        [5] Keep existing configuration"
+    echo "        [6] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"
     echo "            RealTimeTalk to read aloud (POST /speak) — there's just no mic/wake-word listening."
-    echo "        [6] Muse Voice Transcribe  (Meta Model API key, LLM_...; Mandarin + English)"
     echo "      (Enter to keep existing configuration; nothing here is final — re-run this anytime.)"
     while true; do
         read -rp "      Choice [1/2/3/4/5/6, Enter = keep existing]: " STT_CHOICE
-        STT_CHOICE="${STT_CHOICE:-4}"
+        STT_CHOICE="${STT_CHOICE:-5}"
         case "$STT_CHOICE" in 1|2|3|4|5|6) break ;; esac
         echo "      → enter 1, 2, 3, 4, 5 or 6"
     done
@@ -230,49 +251,49 @@ PYEOF
     case "$STT_CHOICE" in
         1)
             ensure_provider_key openai || true
-            if has_openai_key; then
-                if has_gemini_key; then write_stt_engine openai gemini; else write_stt_engine openai ""; fi
-            fi
+            if has_openai_key; then write_stt_engine openai "$(_stt_first_other openai)"; fi
             ;;
         2)
             ensure_provider_key gemini || true
-            if has_gemini_key; then
-                if has_openai_key; then write_stt_engine gemini openai; else write_stt_engine gemini ""; fi
-            fi
+            if has_gemini_key; then write_stt_engine gemini "$(_stt_first_other gemini)"; fi
             ;;
         3)
+            ensure_provider_key muse || true
+            if has_muse_key; then write_stt_engine muse "$(_stt_first_other muse)"; fi
+            ;;
+        4)
             ensure_provider_key openai || true
             ensure_provider_key gemini || true
-            if has_openai_key && has_gemini_key; then
-                while true; do
-                    read -rp "      Default STT engine [gemini/openai, Enter = openai]: " DEFAULT_ENGINE
-                    DEFAULT_ENGINE="$(echo "${DEFAULT_ENGINE:-openai}" | tr '[:upper:]' '[:lower:]')"
-                    case "$DEFAULT_ENGINE" in gemini|openai) break ;; esac
-                    echo "      → enter 'gemini' or 'openai'"
-                done
-                if [ "$DEFAULT_ENGINE" = "gemini" ]; then write_stt_engine gemini openai
-                else write_stt_engine openai gemini; fi
-            else
-                echo "      → 'Both' needs both keys — set the engine manually in $STT_CFG"
-            fi
-            ;;
-        6)
             ensure_provider_key muse || true
-            if has_muse_key; then
-                if has_openai_key; then write_stt_engine muse openai
-                elif has_gemini_key; then write_stt_engine muse gemini
-                else write_stt_engine muse ""; fi
+            CONFIGURED=""
+            for e in openai gemini muse; do
+                _stt_has "$e" && CONFIGURED="$CONFIGURED $e"
+            done
+            CONFIGURED="${CONFIGURED# }"
+            if [ -z "$CONFIGURED" ]; then
+                echo "      → no STT key is configured yet — nothing to choose a default from"
+            elif [[ "$CONFIGURED" != *" "* ]]; then
+                write_stt_engine "$CONFIGURED" ""
+            else
+                first="${CONFIGURED%% *}"
+                while true; do
+                    read -rp "      Default STT engine [${CONFIGURED// /\/}, Enter = $first]: " DEFAULT_ENGINE
+                    DEFAULT_ENGINE="$(echo "${DEFAULT_ENGINE:-$first}" | tr '[:upper:]' '[:lower:]')"
+                    case " $CONFIGURED " in *" $DEFAULT_ENGINE "*) break ;; esac
+                    echo "      → enter one of: ${CONFIGURED// /, }"
+                done
+                write_stt_engine "$DEFAULT_ENGINE" "$(_stt_first_other "$DEFAULT_ENGINE")"
             fi
             ;;
-        4) echo "      ✓ keeping existing configuration" ;;
-        5)
+        5) echo "      ✓ keeping existing configuration" ;;
+        6)
             write_stt_engine none ""
             echo "      ✓ STT bypassed — RealTimeTalk will run TTS-only. OpenClaw can still speak via /speak."
             return 0
             ;;
     esac
 
-    if [ "$STT_CHOICE" != "4" ] && ! has_any_stt_key; then
+    if [ "$STT_CHOICE" != "5" ] && ! has_any_stt_key; then
         echo "      → No STT provider key ended up configured (openai, gemini or muse)."
         read -rp "      Continue anyway in TTS-only (no STT) mode? [Y/n]: " CONT_TEXT_ONLY
         case "$CONT_TEXT_ONLY" in [Nn]*)
@@ -283,7 +304,7 @@ PYEOF
         esac
         write_stt_engine none ""
         echo "      ✓ STT bypassed — RealTimeTalk will run TTS-only."
-    elif [ "$STT_CHOICE" != "4" ]; then
+    elif [ "$STT_CHOICE" != "5" ]; then
         echo "      ✓ STT provider key(s) ready"
     fi
 }

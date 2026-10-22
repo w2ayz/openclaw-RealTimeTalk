@@ -22,7 +22,7 @@ the Pi-specific install path (systemd instead of launchd, `apt` instead of
 |---|---|
 | [OpenClaw](https://openclaw.ai) gateway running locally | RealTimeTalk routes all AI through it (`ws://127.0.0.1:18789`, protocol v4). Won't start without it. |
 | OpenClaw 2026.5+ | Gateway protocol v4 required. |
-| STT provider key (OpenAI **and/or** Gemini) | Either one works on its own; with both configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. Gemini: `AQ.` key (usually 53 characters) or legacy `AIza...` key from AI Studio, stored at `talk.providers.gemini.apiKey`. See §3. |
+| STT provider key (OpenAI, Gemini **and/or** Muse) | Any one works on its own; with several configured you can pick the engine and a boot-time fallback (§3.2). OpenAI: installer prompts for it (hidden input) if `talk.providers.openai.apiKey` isn't already set in `~/.openclaw/openclaw.json`. Unlike the Mac fork, the `openai-codex` OAuth provider **is** supported here too — the daemon falls back to `chat.history` since the codex harness delivers replies via a message tool rather than chat content. Gemini: `AQ.` key (usually 53 characters) or legacy `AIza...` key from AI Studio, stored at `talk.providers.gemini.apiKey`. See §3. |
 | ElevenLabs API key (optional) | First tier of the Chinese/mixed TTS chain (ElevenLabs → Edge → OpenAI → Piper). Read from `~/.openclaw/secrets/elevenlabs`, not `openclaw.json` — see [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 | edge-tts skill + Node.js (optional) | Second tier of that chain — free, no key, native zh/en neural voices. Install at `~/.openclaw/workspace/skills/edge-tts/`; installer resolves it. See [§3.5](#35-chinesemixed-tts-chain-elevenlabs--edge--openai--piper). |
 
@@ -93,17 +93,20 @@ git, all of it is safe to delete to reset that specific piece of state:
 
 ## 3. Adding API keys
 
-### 3.1 STT provider key(s) — OpenAI and/or Gemini
+### 3.1 STT provider key(s) — OpenAI, Gemini and/or Muse
 
-Either provider works on its own. The installer prompts for whichever you
-choose (choice menu: [1] OpenAI / [2] Gemini / [3] both / [4] keep existing,
-hidden input, verified against the provider API). To set keys by hand:
+Any one provider works on its own. The installer prompts for whichever you
+choose (choice menu: [1] OpenAI / [2] Gemini / [3] Muse / [4] choose the
+default STT engine / [5] keep existing / [6] skip, TTS-only; hidden input,
+OpenAI and Gemini keys verified against the provider API — Muse keys can't be
+pre-verified, a rejected one shows in the daemon log). To set keys by hand:
 
 ```bash
 python3 - <<'PY'
 import json, os
 KEY    = "sk-..."    # your OpenAI key — regular sk-... or the openai-codex OAuth profile both work; or ""
 GEMKEY = "AQ...."   # your Gemini API key from AI Studio; or ""
+MUSEKEY = ""        # your Meta Model API key (LLM_...) for Muse Voice Transcribe; or ""
 path = os.path.expanduser("~/.openclaw/openclaw.json")
 d = json.load(open(path))
 p = d.setdefault("talk", {}).setdefault("providers", {})
@@ -111,6 +114,8 @@ if KEY:
     p.setdefault("openai", {})["apiKey"] = KEY
 if GEMKEY:
     p.setdefault("gemini", {})["apiKey"] = GEMKEY
+if MUSEKEY:
+    p.setdefault("muse", {})["apiKey"] = MUSEKEY
 json.dump(d, open(path, "w"), indent=2)
 os.chmod(path, 0o600)
 PY
@@ -128,8 +133,10 @@ disappearing on the Mac fork).
 { "provider": "gemini", "fallback": "openai" }
 ```
 
-- `provider` — the engine to boot with: `openai` (Realtime transcription)
-  or `gemini` (Gemini 3.5 Transcribe Live).
+- `provider` — the engine to boot with: `openai` (Realtime transcription),
+  `gemini` (Gemini 3.5 Transcribe Live) or `muse` (Meta Muse Voice Transcribe:
+  raw 24 kHz audio to `wss://api.meta.ai/v1/asr/realtime`, Mandarin + English,
+  opt-in — never chosen implicitly when several keys exist).
 - `fallback` — used when `provider` is set but its key is missing: the daemon
   boots on the fallback provider instead (resolved at startup and on each
   wake from sleep). It is **not** a live-failure failover mid-session.
@@ -184,7 +191,7 @@ skips what's already installed. The installer:
 2. Creates a Python venv at `~/.local/realtimetalk-venv` and installs everything in `requirements.txt`
 3. Downloads the Piper native binary + English/Chinese voice models (architecture-detected: aarch64/x86_64/armv7l); resolves the optional edge-tts skill, installs Node.js + its deps if present, and records `RTT_EDGE_TTS_SCRIPT` in the systemd unit (§3.5)
 4. Downloads the CAM++ speaker-verification model (~28MB)
-5. Prompts for STT provider keys — OpenAI and/or Gemini (choice menu, hidden input, each key verified against its provider API before being written to `openclaw.json`); writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json` (§3.2). Lenient: warns and continues if no key is configured, so an offline install still completes
+5. Prompts for STT provider keys — OpenAI, Gemini and/or Muse (choice menu: [1] OpenAI / [2] Gemini / [3] Muse / [4] choose the default STT engine / [5] keep existing / [6] skip; hidden input, OpenAI and Gemini keys verified against their provider API before being written to `openclaw.json`; [4] sets up any of the three then asks which configured engine is the default, the next configured one becoming the fallback); writes the engine choice to `~/.openclaw/workspace/rtt_stt_config.json` (§3.2). Lenient: warns and continues if no key is configured, so an offline install still completes
 6. Lists detected audio devices for reference — no manual device index needed; PipeWire's own default source/sink is followed at runtime, changeable from the dashboard
 7. **Prompts for agent name and wake phrase** (see [§5](#5-agent-name--wake-phrase) below), then writes `~/.config/systemd/user/openclaw-realtimetalk.service`
 8. Enables linger and starts the service

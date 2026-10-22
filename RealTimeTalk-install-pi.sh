@@ -195,6 +195,10 @@ fi
 # `openclaw config validate`. The daemon still reads a legacy openclaw.json
 # talk.stt block as a fallback source, but this installer never writes one.
 #
+# STT providers: OpenAI Realtime, Gemini Transcribe Live, Muse Voice
+# Transcribe (Meta) — menu [1]-[3] pick one, [4] chooses the default engine
+# among those with keys.
+#
 # All three interview steps live in RealTimeTalk-config-lib.sh so
 # RTT-Config.sh can re-run them later without repeating the rest
 # of this installer. run_stt_setup now includes a Skip option (TTS-only, no
@@ -209,6 +213,9 @@ TTS_CFG="$HOME/.openclaw/workspace/rtt_tts_config.json"
 source "$SKILL_DIR/RealTimeTalk-config-lib.sh"
 
 run_stt_setup
+# HAS_KEY feeds the end-of-install reminder below; it was never set anywhere
+# before, so the "no STT key" warning printed on every install.
+HAS_KEY=0; has_any_stt_key && HAS_KEY=1
 run_tts_setup
 run_elevenlabs_setup
 echo ""
@@ -317,7 +324,7 @@ echo "  Stop:    systemctl --user stop $SERVICE_NAME"
 echo "  Dashboard: http://<pi-ip>:19000/dashboard"
 echo ""
 if [ "$HAS_KEY" != "1" ]; then
-    echo "  ⚠ Reminder: no STT provider key set yet (openai or gemini) — the service"
+    echo "  ⚠ Reminder: no STT provider key set yet (openai, gemini or muse) — the service"
     echo "    will not stay running until one is set in $OPENCLAW_CONFIG"
     echo ""
 fi

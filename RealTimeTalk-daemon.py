@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.28.0"
+__version__ = "3.28.1"
 
 import argparse
 import asyncio
