@@ -16,7 +16,7 @@ dashboard (port 19000) accessible from any phone browser on the local network or
 ## Features
 
 - Voice conversation routed through the AI Agent's main OpenClaw session (memory, tools, identity)
-- **Dual STT engines**: OpenAI Realtime Transcription (`gpt-live-transcribe`) or Google Gemini 3.5 Transcribe Live; Gemini uses server-side VAD, OpenAI a client-side one (the model rejects all server-side turn detection)
+- **Triple STT engines** (Muse added in v3.28.0 — opt-in via `provider: "muse"`, key `talk.providers.muse.apiKey`): OpenAI Realtime Transcription (`gpt-live-transcribe`), Google Gemini 3.5 Transcribe Live; Gemini uses server-side VAD, OpenAI a client-side one (the model rejects all server-side turn detection)
 - **WebRTC AGC** — PipeWire virtual mic source applies automatic gain control + noise suppression upstream; daemon falls back to static gain/gate if unavailable
 - **Adaptive mic** — no manual gain tuning needed in normal use; AGC normalises quiet USB mics (PCM2902 etc.) automatically
 - Mixed-language TTS — configurable engine chain (default ElevenLabs → Edge TTS → OpenAI TTS → Piper) applies uniformly to English and Chinese; Piper's own English (`en_US-lessac-medium`) / Chinese (`zh_CN-huayan-medium`) voices are selected per segment when it's the engine that ends up producing the audio; transcribed Chinese normalised to Simplified automatically
@@ -408,7 +408,7 @@ read if the daemon config file is absent, so old configs keep working until
 migrated.
 
 Priority (first match wins):
-1. `--stt-engine gemini` (or `openai`) at startup
+1. `--stt-engine gemini` (or `openai`, or `muse`) at startup
 2. `provider` in `~/.openclaw/workspace/rtt_stt_config.json`
 3. `talk.stt.provider` in `~/.openclaw/openclaw.json` (legacy)
 4. `fallback` if the primary provider's key is unavailable (same source order)
@@ -425,7 +425,7 @@ Example `~/.openclaw/workspace/rtt_stt_config.json`:
 }
 ```
 
-`"vocabulary"` is a **single shared list sent to both engines** — Gemini's
+`"vocabulary"` is a **single shared list sent to all engines** (Gemini's `custom_vocabulary`, Muse's `keywords`, and OpenAI's `keywords`) — Gemini's
 `custom_vocabulary` and OpenAI's `keywords` (OpenAI's `gpt-live-transcribe`
 model only; the daemon always uses that model for this reason). Add proper
 nouns, names, or jargon that either engine tends to mishear. Both treat it
@@ -449,7 +449,7 @@ If only a Gemini key is present, the daemon starts in Gemini-only mode with no O
 
 Set `"provider": "none"` (what `RTT-Config.sh`'s Skip option
 writes) to run TTS-only on purpose even if a key is configured. With
-neither an OpenAI nor a Gemini key present at all, the daemon resolves to
+no OpenAI, Gemini, or Muse key present at all, the daemon resolves to
 this same TTS-only mode automatically regardless of what `"provider"`
 says — no more crash-looping under systemd waiting for a key.
 

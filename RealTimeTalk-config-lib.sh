@@ -29,8 +29,15 @@ sys.exit(0 if json.load(open(sys.argv[1])).get("talk", {}).get("providers", {}).
 PYEOF
 }
 
+has_muse_key() {
+    "$PYTHON" - "$OPENCLAW_CONFIG" <<'PYEOF'
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1])).get("talk", {}).get("providers", {}).get("muse", {}).get("apiKey", "") else 1)
+PYEOF
+}
+
 has_any_stt_key() {
-    has_openai_key || has_gemini_key
+    has_openai_key || has_gemini_key || has_muse_key
 }
 
 # ensure_provider_key <provider> — prompts (hidden) if needed and writes the
@@ -48,6 +55,7 @@ ensure_provider_key() {
     # checked below) and legacy "AIza" keys (39 chars).
     [ "$prov" = "gemini" ] && { prefix="^(AQ\\.|AIza)"; prefix_hint="AQ.... or AIza..."; }
     [ "$prov" = "elevenlabs" ] && { prefix=""; prefix_hint=""; }
+    [ "$prov" = "muse" ] && { prefix="^LLM_"; prefix_hint="LLM_..."; }
     local existing
     existing=$("$PYTHON" - "$OPENCLAW_CONFIG" "$prov" <<'PYEOF'
 import json, sys
@@ -59,8 +67,13 @@ PYEOF
     local envvar="OPENAI_API_KEY" env_val="" src_var=""
     [ "$prov" = "gemini" ] && envvar="GEMINI_API_KEY"
     [ "$prov" = "elevenlabs" ] && envvar="ELEVENLABS_API_KEY"
+    [ "$prov" = "muse" ] && envvar="META_MODEL_API_KEY"
     env_val="${!envvar:-}"
     src_var="$envvar"
+    if [ -z "$env_val" ] && [ "$prov" = "muse" ]; then
+        env_val="${MUSE_API_KEY:-}"
+        src_var="MUSE_API_KEY"
+    fi
     if [ -z "$env_val" ] && [ "$prov" = "gemini" ]; then
         env_val="${GOOGLE_API_KEY:-}"
         src_var="GOOGLE_API_KEY"
@@ -110,6 +123,11 @@ if prov == "openai":
     url, hdr = "https://api.openai.com/v1/models", {"Authorization": "Bearer " + key}
 elif prov == "elevenlabs":
     url, hdr = "https://api.elevenlabs.io/v1/user", {"xi-api-key": key}
+elif prov == "muse":
+    # No cheap REST probe for the realtime ASR key (WebSocket-only handshake)
+    # — saved unverified; the daemon logs a rejected key.
+    print(-1)
+    raise SystemExit
 else:
     url, hdr = "https://generativelanguage.googleapis.com/v1beta/models", {"x-goog-api-key": key}
 try:
@@ -122,6 +140,7 @@ except Exception:
 PYEOF
 )
     case "$code" in
+        -1)      echo "      → $prov keys can't be pre-verified here — saving; the daemon logs if it is rejected" ;;
         200)     echo "      ✓ $prov key verified against the provider API" ;;
         0)       echo "      → could not reach the $prov API to verify (offline?) — continuing" ;;
         401|403) echo "      ✗ $prov key was REJECTED by the provider (HTTP $code) — not saving it"
@@ -187,7 +206,7 @@ run_stt_setup() {
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 prov = cfg.get("talk", {}).get("providers", {})
-for name in ("openai", "gemini"):
+for name in ("openai", "gemini", "muse"):
     k = (prov.get(name) or {}).get("apiKey", "")
     print(f"        {name:8s} {'configured' if k else '- not set'}")
 PYEOF
@@ -199,12 +218,13 @@ PYEOF
     echo "        [4] Keep existing configuration"
     echo "        [5] Skip — no STT, TTS-only (text-only) mode. OpenClaw can still push text to"
     echo "            RealTimeTalk to read aloud (POST /speak) — there's just no mic/wake-word listening."
+    echo "        [6] Muse Voice Transcribe  (Meta Model API key, LLM_...; Mandarin + English)"
     echo "      (Enter to keep existing configuration; nothing here is final — re-run this anytime.)"
     while true; do
-        read -rp "      Choice [1/2/3/4/5, Enter = keep existing]: " STT_CHOICE
+        read -rp "      Choice [1/2/3/4/5/6, Enter = keep existing]: " STT_CHOICE
         STT_CHOICE="${STT_CHOICE:-4}"
-        case "$STT_CHOICE" in 1|2|3|4|5) break ;; esac
-        echo "      → enter 1, 2, 3, 4 or 5"
+        case "$STT_CHOICE" in 1|2|3|4|5|6) break ;; esac
+        echo "      → enter 1, 2, 3, 4, 5 or 6"
     done
 
     case "$STT_CHOICE" in
@@ -236,6 +256,14 @@ PYEOF
                 echo "      → 'Both' needs both keys — set the engine manually in $STT_CFG"
             fi
             ;;
+        6)
+            ensure_provider_key muse || true
+            if has_muse_key; then
+                if has_openai_key; then write_stt_engine muse openai
+                elif has_gemini_key; then write_stt_engine muse gemini
+                else write_stt_engine muse ""; fi
+            fi
+            ;;
         4) echo "      ✓ keeping existing configuration" ;;
         5)
             write_stt_engine none ""
@@ -245,7 +273,7 @@ PYEOF
     esac
 
     if [ "$STT_CHOICE" != "4" ] && ! has_any_stt_key; then
-        echo "      → No STT provider key ended up configured (openai or gemini)."
+        echo "      → No STT provider key ended up configured (openai, gemini or muse)."
         read -rp "      Continue anyway in TTS-only (no STT) mode? [Y/n]: " CONT_TEXT_ONLY
         case "$CONT_TEXT_ONLY" in [Nn]*)
             echo "      ✗ No STT key configured. Re-run this when you have one:"

@@ -1451,6 +1451,30 @@ Behavioral major: with owner-only mode enabled, voice input that previously work
 
 # Changelog
 
+## [3.28.0] — 2026-10-21
+
+### Added
+
+- **Meta Muse Voice Transcribe as the third STT engine** (`--stt-engine muse`,
+  or `"provider": "muse"` / `"fallback": "muse"` in `rtt_stt_config.json`).
+  Ported from the Mac fork's v3.28.0 (same version, lockstep). New
+  `MuseTranscribeSession` speaks the Meta Model API realtime protocol
+  (`wss://api.meta.ai/v1/asr/realtime`, model `muse-voice-transcribe-1.0`):
+  bearer token in the first JSON handshake frame, wait for the
+  `{"sessionId"}` ack, then raw 24 kHz int16 mono binary frames (the Pi's
+  native 24 kHz capture, no resampling). ENDPOINTING mode:
+  `speechStart` / `speechEnd` / `speechComplete` map onto
+  `_on_speech_started` / `_on_speech_stopped` / `_on_transcript`; partials
+  are ignored. Shared STT vocabulary becomes `keywords`; the Gemini language
+  list becomes `languageBias`. Proactive reconnect at 55 min, 80 ms silence
+  keepalive, `endStream` on shutdown. Key: `talk.providers.muse.apiKey`
+  (`load_muse_key()`). Opt-in: the default stays OpenAI. Pi adaptation: the
+  auto-sleep return uses this fork's `_idle_disconnected[0]` (the Mac fork
+  uses `_sleep_requested[0]`). `_resolve_stt_engine()` takes a third key.
+  Not run on a Pi: validated on the Mac (engine-selection matrix + the real
+  session I/O against Meta's API with the Mac class); compile/pyflakes only here.
+- `RTT-Config.sh` STT menu gains "[6] Muse Voice Transcribe".
+
 ## v2.6.0 — 2026-06-04
 
 ### Added
