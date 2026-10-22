@@ -8902,7 +8902,7 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             session = MuseTranscribeSession(
                 api_key=muse_key, loop=loop, gw=gw,
                 stop_event=stop_event,
-                input_device=_selected_input_device[0], alsa_output=alsa_output,
+                input_device=input_device, alsa_output=alsa_output,
                 session_key=session_key,
             )
         elif engine_name == STT_ENGINE_GEMINI:
