@@ -1,3 +1,38 @@
+## v3.29.5 — 2026-10-22
+
+### Added
+
+- **Call audio: mix a second input with the mic for Muse.** While
+  Monitoring, a loopback input (`Call audio` selector in Meeting Notes) is
+  mixed with the microphone before the gate/NS chain, so Zoom/Meet/Teams or
+  YouTube audio and your own voice reach the transcriber digitally instead of
+  through the room. Ported from the Mac fork, where it defaults to BlackHole 2ch (macOS-only
+  virtual device, documented in the Mac README/DEPLOYMENT §7.5). On the Pi there
+  is no default — pick any input in the dropdown (e.g. a PipeWire monitor
+  source if PortAudio lists one); the choice is saved in
+  `~/.openclaw/workspace/call_audio_prefs.json`. Untested on a Pi.
+- **Optimize progress in the live box**: step, batch, progress bar, counts
+  (lines, segments, corrections, speaker points, meeting summary, summary
+  language) and example corrections, kept ~25 s after it finishes.
+- **Unpunctuated speech is punctuated.** The live box pushes to the log at
+  ~3 lines even with no full stops (clause break, else a word boundary), and
+  OpenClaw then adds punctuation and sentence breaks to those lines without
+  changing any word (words-only check; raw text kept).
+- **Sentence re-flow**: an opening fragment that continues the previous line is
+  moved onto its end and lower-cased, so lines start at sentence starts.
+- Proper English capitalization on every line (sentence starts, "I").
+
+### Changed
+
+- Meeting Notes panel: one-line button row (✨ Optimize · EN · 中文 · 🔎 Names ·
+  ⬇ .md · Call audio · New meeting), a short parenthetical beside the title
+  instead of the intro paragraph.
+- Optimize notes can be pressed again at any time (v3.29.4 behaviour kept).
+
+### Fixed
+
+- `/call-audio` routes were unreachable (registered under `/meeting/`).
+
 ## v3.29.4 — 2026-10-22
 
 ### Changed
