@@ -257,7 +257,7 @@ BLOCKSIZE         = 2400         # 100 ms at 24 kHz
 DEVICE_BLOCKSIZE  = BLOCKSIZE    # same as BLOCKSIZE when RESAMPLE_RATIO == 1
 DEFAULT_HTTP_PORT = 19000
 RECONNECT_DELAY   = 5
-IDLE_SLEEP_MINS   = 99999        # effectively disable automatic idle disconnect on this Pi
+IDLE_SLEEP_MINS   = 10           # disconnect from OpenAI after this many minutes of silence
 OWW_THRESHOLD     = 0.60         # openwakeword confidence threshold (0–1); raise to reduce false wakes
 
 # Ham radio interfaces (AIOC, Digirig, ...) — see radio_interfaces.py for each
