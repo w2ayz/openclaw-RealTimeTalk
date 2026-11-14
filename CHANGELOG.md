@@ -1,3 +1,22 @@
+## v3.29.8 — 2026-11-13
+
+### Added
+
+- **Log order toggle.** A new header button (`⬇ Newest first` / `⬆ Newest last`)
+  flips the dashboard log between newest-on-top and a normal-document order with
+  the newest at the bottom. Remembered per browser (`localStorage`); in
+  newest-last mode the view follows new lines only while you are already at the
+  bottom. The "Main points" block stays on top with its speakers in
+  first-to-last order. Ported from Mac v3.29.8.
+
+### Fixed
+
+- **No false "Owner-only… accepting ALL speakers" banner while Monitoring.**
+  Owner-only is a Wake-mode gate; Monitoring records everyone and never routes
+  to the agent. (Mac v3.29.8 also has a BlackHole-banner suppression and a
+  device-switch-while-speaking guard; both are PortAudio-specific and do not
+  apply here, since the Pi switches devices via pactl.)
+
 ## v3.29.7 — 2026-10-23
 
 ### Fixed

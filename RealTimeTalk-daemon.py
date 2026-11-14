@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.29.7"
+__version__ = "3.29.8"
 
 import argparse
 import asyncio
@@ -6215,7 +6215,8 @@ def _dashboard_dynamic(sess) -> dict:
             f'{_radio_owner_warn}'
             '</div>'
         )
-    elif _owner_only[0] and not _verification_available():
+    elif _owner_only[0] and not _verification_available() and not (sess and sess._monitoring):
+        # Owner-only is a Wake-mode gate; Monitoring records everyone (no voice check).
         device_banner = (
             '<div id="dbanner" style="background:#3a1500;border:1px solid #7a3000;'
             'color:#f59e0b;padding:3px 8px;">'
@@ -9145,7 +9146,7 @@ a.cnl:hover{{background:var(--mu);color:#000;}}
 @media(min-width:900px){{body{{font-size:17px;}}#top{{padding:14px 24px 10px;}}a.btn{{font-size:13px;padding:6px 12px;}}#dp{{font-size:13px;}}#log{{padding:14px 24px;}}}}
 </style></head><body>
 <div id="top">
-<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a></div>
+<div class="hrow"><span class="brand">&#9679;&nbsp;RealTimeTalk</span><span class="spill" id="pill" style="{state_pill_style}">{state}</span><a href="/calibration" class="btn" data-hint="Open speaker &amp; mic level calibration">&#9999; Calibrate</a><a href="#" class="btn" id="orderbtn" style="margin-left:6px;" data-hint="Flip the log between newest-on-top and newest-at-bottom (like a document)">&#11015; Newest first</a></div>
 <div class="nav" id="navbar">{nav_html}</div>
 {device_panel}{device_banner}</div>
 <div id="nowreading" hidden></div>
@@ -9169,6 +9170,50 @@ setInterval(function(){{
   // producing a visible flash. Fetching a small JSON fragment and updating
   // only the changed text/HTML avoids that.
   var _hover=false;
+  // Log order toggle: the server always renders newest-first; oldest-first
+  // is produced here by reversing the entries (summary block stays on top
+  // with its own order flipped, the live banner moves to the bottom).
+  // Choice is per-browser (localStorage).
+  var oldestFirst=false;
+  try{{oldestFirst=localStorage.getItem('rttLogOrder')==='oldest';}}catch(e){{}}
+  function _kids(html){{var t=document.createElement('div');t.innerHTML=html;return Array.prototype.slice.call(t.childNodes);}}
+  window._renderLog=function(d,forceScroll){{
+    var log=document.getElementById('log');
+    if(!log||!d) return;
+    var btn=document.getElementById('orderbtn');
+    if(btn) btn.innerHTML=oldestFirst?'&#11014; Newest last':'&#11015; Newest first';
+    if(!oldestFirst){{
+      log.innerHTML=d.speaking_banner+d.rows;
+      if(forceScroll) log.scrollTop=0;
+      return;
+    }}
+    var atBottom=(log.scrollHeight-log.scrollTop-log.clientHeight)<40;
+    var rows=_kids(d.rows),head=[],body=[];
+    rows.forEach(function(n){{
+      if(n.nodeType===1&&n.classList.contains('sumblock')){{
+        var hd=n.querySelector('.sumh'),sums=Array.prototype.slice.call(n.querySelectorAll('.sum')).reverse();
+        while(n.firstChild) n.removeChild(n.firstChild);
+        if(hd) n.appendChild(hd);
+        sums.forEach(function(x){{n.appendChild(x);}});
+        head.push(n);
+      }} else body.push(n);
+    }});
+    body.reverse();
+    log.innerHTML='';
+    head.concat(body,_kids(d.speaking_banner)).forEach(function(n){{log.appendChild(n);}});
+    if(forceScroll||atBottom) log.scrollTop=log.scrollHeight;
+  }};
+  (function(){{
+    var b=document.getElementById('orderbtn');
+    if(!b) return;
+    b.addEventListener('click',function(e){{
+      e.preventDefault();
+      oldestFirst=!oldestFirst;
+      try{{localStorage.setItem('rttLogOrder',oldestFirst?'oldest':'newest');}}catch(x){{}}
+      if(window._lastFrag) window._renderLog(window._lastFrag,true); else _refresh();
+    }});
+    if(oldestFirst) setTimeout(function(){{window._forceScroll=true;_refresh();}},0);
+  }})();
   function _refresh(){{
     if(_hover) return;
     fetch('/dashboard-frag').then(function(r){{return r.json();}}).then(function(d){{
@@ -9180,8 +9225,8 @@ setInterval(function(){{
       if(dp) dp.outerHTML=d.device_panel;
       var db=document.getElementById('dbanner');
       if(db) db.outerHTML=d.device_banner;
-      var log=document.getElementById('log');
-      if(log) log.innerHTML=d.speaking_banner+d.rows;
+      window._lastFrag=d;
+      window._renderLog(d,!!window._forceScroll);window._forceScroll=false;
       if(window._meetingUpdate) window._meetingUpdate(d.meeting);
     }}).catch(function(){{}});
   }}
