@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.29.8"
+__version__ = "3.29.9"
 
 import argparse
 import asyncio
@@ -3160,7 +3160,7 @@ def _call_audio_open(name: str) -> tuple:
     """Open the loopback input `name`. Returns (ok, message)."""
     _call_audio_close()
     if not name:
-        return True, "Call audio off — microphone only"
+        return True, "Mixed Input off — microphone only"
     idx = _call_audio_find(name)
     if idx is None:
         return False, f"Input device {name!r} not found"
@@ -3171,10 +3171,10 @@ def _call_audio_open(name: str) -> tuple:
                                 blocksize=DEVICE_BLOCKSIZE, callback=_call_audio_cb, device=idx)
             st.start()
         _call_audio["stream"] = st
-        log.info("Call audio on: %s (%d ch) — mixed into the mic while Monitoring", name, ch)
-        return True, f"Call audio: {name}"
+        log.info("Mixed Input on: %s (%d ch) — mixed into the mic while Monitoring", name, ch)
+        return True, f"Mixed Input: {name}"
     except Exception as e:
-        log.warning("Call audio open failed for %r: %s", name, e)
+        log.warning("Mixed Input open failed for %r: %s", name, e)
         return False, f"Could not open {name!r}: {e}"
 
 def _call_audio_set(name: str) -> tuple:
@@ -3196,7 +3196,7 @@ def _call_audio_load() -> None:
     for d in (_call_audio_devices()):
         if d.get("max_input_channels", 0) > 0 and d["name"].lower().startswith("blackhole"):
             _call_audio["name"] = d["name"]
-            log.info("Call audio defaulting to %s", d["name"])
+            log.info("Mixed Input defaulting to %s", d["name"])
             return
 
 def _call_audio_ensure() -> None:
@@ -6122,7 +6122,7 @@ class BaseVoiceSession:
         try:
             _call_audio_ensure()
         except Exception as e:
-            log.warning("Call audio unavailable: %s", e)
+            log.warning("Mixed Input unavailable: %s", e)
 
     def _close_mic_stream(self):
         s = self._mic_stream_ref[0]
@@ -9313,12 +9313,12 @@ setInterval(function(){{
     var dl=mk('a','btn','⬇ .md'); dl.href='/meeting/download?fmt=md'; dl.title='Download the notes as Markdown'; acts.appendChild(dl);
     // Call audio: mix a loopback input (default BlackHole 2ch) with the mic while Monitoring.
     var sel=document.createElement('select'); sel.className='casel';
-    sel.title='Call audio: a loopback input (e.g. BlackHole 2ch) mixed with the mic while Monitoring, to capture a call or video digitally. Off = microphone only.';
+    sel.title='Mixed Input: a second input (e.g. a loopback source carrying computer audio such as a call or video) mixed with the mic input while Monitoring. Off = the mic input alone.';
     function fillCa(){{
       fetch('/call-audio').then(function(r){{return r.json();}}).then(function(d){{
         sel.textContent='';
-        var o0=document.createElement('option'); o0.value=''; o0.textContent='Call audio: off'; sel.appendChild(o0);
-        d.devices.forEach(function(n){{var o=document.createElement('option'); o.value=n; o.textContent='Call: '+n; sel.appendChild(o);}});
+        var o0=document.createElement('option'); o0.value=''; o0.textContent='Mixed Input: off'; sel.appendChild(o0);
+        d.devices.forEach(function(n){{var o=document.createElement('option'); o.value=n; o.textContent='Mixed Input: '+n; sel.appendChild(o);}});
         sel.value=d.current||'';
         sel.classList.toggle('on',!!d.active);
       }}).catch(function(){{}});

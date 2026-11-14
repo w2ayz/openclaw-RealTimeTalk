@@ -1,3 +1,13 @@
+## v3.29.9 — 2026-11-13
+
+### Changed
+
+- **"Call audio" is now "Mixed Input"** (dropdown, tooltip, log lines), in
+  lockstep with Mac v3.29.9. Pref file and `/call-audio` endpoints unchanged.
+  The Mac-only same-device greying, the 10 s open limit and the BlackHole docs
+  (PortAudio/CoreAudio-specific) are not ported; this fork's Mixed Input is
+  still untested on a Pi.
+
 ## v3.29.8 — 2026-11-13
 
 ### Added
