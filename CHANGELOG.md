@@ -1,3 +1,20 @@
+## v3.30.0 — 2026-11-17
+
+### Added
+
+- **Meeting Notes panel shows a live auto-sleep countdown with manual extend
+  buttons**, ported from Mac v3.30.0. While Monitoring, the dashboard shows
+  "⏳ Auto-sleep in MM:SS" (turns amber under 60s) plus "+5 min" / "+10 min"
+  buttons. New `/meeting/extend?secs=N` endpoint adds `N` seconds to the
+  *current* deadline (not a flat reset), so repeated clicks stack. Uses this
+  fork's own idle-clock names (`_last_activity`, `IDLE_SLEEP_MINS*60`) in
+  place of Mac's `_last_interaction`/`AUTO_SLEEP_SECS`.
+  Mac v3.30.0 also fixed a stale-idle-after-wake bug in `_pending_monitor_wake`
+  — **not applicable here**: this fork has no `_pending_monitor_wake`:
+  `/monitor`'s sleeping-branch already resets `_last_activity` at the moment
+  it arms the wake (see `do_GET`'s `/monitor` handler), before the new
+  session even starts, so the stale-clock race Mac had doesn't exist here.
+
 ## v3.29.9 — 2026-11-13
 
 ### Changed
