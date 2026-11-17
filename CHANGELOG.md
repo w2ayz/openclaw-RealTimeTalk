@@ -1,3 +1,10 @@
+## v3.30.2 — 2026-11-17
+
+### Changed
+
+- **The custom extend/shorten input moved onto the same row as the countdown
+  and presets** (was its own line below), ported from Mac v3.30.2.
+
 ## v3.30.1 — 2026-11-17
 
 ### Added
