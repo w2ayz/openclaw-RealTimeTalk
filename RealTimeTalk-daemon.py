@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.30.2"
+__version__ = "3.30.3"
 
 import argparse
 import asyncio
@@ -10472,6 +10472,10 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             _snk_m = _re_lb.search(r'sink=(\S+)', _ml)
             _src = _src_m.group(1) if _src_m else None
             _snk = _snk_m.group(1) if _snk_m else None
+            if _src and "rtt_agc" in _src:
+                # Our own reserved loopback (e.g. the Mixed Input capture sink) —
+                # not radio-related; leave it alone, don't adopt or kill it.
+                continue
             if _src and _src in _source_names:
                 # Valid loopback — restore tracking state
                 _radio_monitor_module[0] = int(_mid)

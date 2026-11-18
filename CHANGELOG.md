@@ -1,3 +1,22 @@
+## v3.30.3 — 2026-11-17 (Pi-only — no AIOC radio monitor on the Mac fork)
+
+### Fixed
+
+- **Startup loopback-module recovery could mistake an unrelated
+  `module-loopback` for the AIOC radio monitor loopback.** `main()`'s
+  "recover loopback modules from a previous run" scan adopted *any*
+  currently-loaded `module-loopback` whose source still existed, with no
+  check that it was actually radio-related — so a user-created loopback
+  (e.g. a Mixed Input capture pipeline feeding `rtt_agc_loop`) got
+  misidentified as the radio monitor on every daemon restart, even with no
+  AIOC interface connected. Symptom: the Calibration page's Monitor button
+  showed active/✓ with no radio plugged in, and clicking it to turn off a
+  radio feature that didn't exist would actually `pactl unload-module` the
+  unrelated loopback, silently breaking it. Fix: the scan now skips any
+  loopback whose source contains `rtt_agc` — the same reserved-prefix
+  exclusion already used by the radio fallback-sink picker and AGC source
+  checks elsewhere in this file (lines ~971/8777), just missing here.
+
 ## v3.30.2 — 2026-11-17
 
 ### Changed
