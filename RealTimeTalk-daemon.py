@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.30.3"
+__version__ = "3.30.4"
 
 import argparse
 import asyncio
@@ -408,6 +408,10 @@ def _detect_headset() -> bool:
 
 _headset_cal_loop = [False]    # flag to stop the looping playback
 _headset_cal_proc = [None]     # current aplay subprocess so stop can kill it immediately
+_headset_cal_gen  = [0]        # bumped on every start/stop so a stale loop thread
+                                # from a previous Play-test click (sharing the same
+                                # _headset_cal_loop flag) never keeps running
+                                # alongside a newer one
 
 
 def _alsa_card_info(source_name: str) -> str:
@@ -557,13 +561,16 @@ def _get_audio_fingerprint() -> str:
         return ""
 
 def _safe_volume_new_sinks(safe_pct: int = 70):
-    """Cap all PipeWire sinks to safe_pct% — protects against newly connected speakers at 100%."""
+    """Cap all PipeWire sinks to safe_pct% — protects against newly connected speakers at 100%.
+    Skips our own reserved rtt_agc_* sinks (e.g. the Mixed Input capture loop) —
+    they're internal routing points, not real speakers a human listens to, so
+    the "new/unknown device" ear-protection logic doesn't apply to them."""
     try:
         sinks = subprocess.run(["pactl", "list", "short", "sinks"],
                                capture_output=True, text=True).stdout.strip()
         for line in sinks.splitlines():
             parts = line.split()
-            if parts:
+            if parts and "rtt_agc" not in parts[1]:
                 subprocess.run(
                     ["pactl", "set-sink-volume", parts[0], f"{safe_pct}%"],
                     capture_output=True,
@@ -3355,8 +3362,15 @@ def _apply_device_cal(sink_name: str) -> bool:
 
     Returns True if a previously calibrated level was found and applied,
     False if minimum/default levels were applied (new/unknown device).
+
+    Our own reserved rtt_agc_* sinks (e.g. the Mixed Input capture loop) are
+    never calibrated here and never "unknown devices" in the ear-protection
+    sense — they're internal routing points, not real speakers — so this is
+    a no-op for them regardless of caller.
     """
     import re as _rec
+    if "rtt_agc" in sink_name:
+        return True
     if sink_name in _cal_store:
         entry   = _cal_store[sink_name]
         pw      = entry.get("pw_pct", CAL_FALLBACK_PW)
@@ -7757,10 +7771,6 @@ Restart daemon after training to reload profiles.</p>
   <button class="bS" onclick="stopLoop()">Stop</button>
   <button class="bSet" onclick="setLevel()">Set this level</button>
 </div>
-<div class="row" style="margin:4px 0;">
-  <button class="bL" onclick="runLatencyTest()">Latency test</button>
-  <span id="latstatus" class="info" style="font-size:13px;"></span>
-</div>
 <div id="mstatus" class="info"></div></div>"""
                 auto_cal_section = ("" if is_headset else f"""
 <div class="sect"><h4>Auto calibration (mic leakage)</h4>
@@ -7838,9 +7848,11 @@ a:hover{{text-decoration:underline;}}
   <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
   <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
   {_voice_id_btn}
+  <button id="configbtn" onclick="toggleConfigPanel()" style="padding:4px 11px;font-size:13px;color:#38bdf8;border-color:#38bdf8;" title="Show the command to add/change STT/TTS keys, engine order, or vocabulary">&#9881; RTT-Config</button>
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
   <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _radio_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _radio_monitor_module[0] is not None else ''}</button>
-  <button id="configbtn" onclick="toggleConfigPanel()" style="padding:4px 11px;font-size:13px;color:#38bdf8;border-color:#38bdf8;" title="Show the command to add/change STT/TTS keys, engine order, or vocabulary">&#9881; RTT-Config</button>
   {_playback_btn}
   {_dtmf_btns}
 </div>
@@ -7855,9 +7867,11 @@ a:hover{{text-decoration:underline;}}
   </div>
 </div>
 {spk_adj_section}
-<div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;">
+<div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
   <button id="devbtn" onclick="toggleDevices()">Audio Devices</button>
   <span id="devtoggle" onclick="toggleDevices()">▼ expand</span>
+  <button class="bL" onclick="runLatencyTest()">Latency test</button>
+  <span id="latstatus" class="info" style="font-size:13px;"></span>
 </div>
 <div id="devlist" style="display:none;">
   <div id="devout" style="font-size:14px;">Loading…</div>
@@ -8492,13 +8506,23 @@ setInterval(upd, 2000);
             elif self.path == "/speaker-cal/loop-start":
                 # Headset mode: start looping test speech.
                 # When Radio profile is active, keys PTT before each playback iteration.
+                # Clicking Play test again while a loop is already running must not
+                # stack a second concurrent playback — kill whatever's currently
+                # playing and invalidate the old loop thread (via the generation
+                # token) before starting the new one.
+                _old_proc = _headset_cal_proc[0]
+                if _old_proc and _old_proc.poll() is None:
+                    _old_proc.kill()
+                _headset_cal_gen[0] += 1
+                _my_gen = _headset_cal_gen[0]
                 _headset_cal_loop[0] = True
                 _use_radio  = _radio_profile_active[0]
                 _aioc_sink_name  = _find_radio_sink() if _use_radio else None
                 _mon_sink_name   = _radio_monitor_sink[0]   # monitor device if active
                 alsa = sess.alsa_output if sess else ALSA_OUTPUT
                 def _loop(alsa=alsa, radio=_use_radio,
-                          aioc_sink=_aioc_sink_name, mon_sink=_mon_sink_name):
+                          aioc_sink=_aioc_sink_name, mon_sink=_mon_sink_name,
+                          my_gen=_my_gen):
                     import tempfile as _tf, os as _os, time as _tl
                     _pre = _tf.mktemp(suffix=".wav")
                     try:
@@ -8508,7 +8532,7 @@ setInterval(upd, 2000);
                             input=b"This is an audio test. 1, 2, 3, 4, 5.",
                             capture_output=True, env=PIPER_ENV,
                         )
-                        while _headset_cal_loop[0]:
+                        while _headset_cal_loop[0] and _headset_cal_gen[0] == my_gen:
                             if radio and aioc_sink:
                                 # Radio profile active → PTT + transmit over AIOC
                                 _ptt_key()
@@ -8533,7 +8557,10 @@ setInterval(upd, 2000);
                                                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                             _headset_cal_proc[0] = proc
                             proc.wait()
-                            _headset_cal_proc[0] = None
+                            # Only clear if a newer loop-start hasn't already
+                            # replaced this with its own process reference.
+                            if _headset_cal_proc[0] is proc:
+                                _headset_cal_proc[0] = None
                             if radio and aioc_sink:
                                 _tl.sleep(_ptt_tail_s())
                                 _ptt_release()
@@ -8550,6 +8577,7 @@ setInterval(upd, 2000);
 
             elif self.path == "/speaker-cal/loop-stop":
                 _headset_cal_loop[0] = False
+                _headset_cal_gen[0] += 1
                 proc = _headset_cal_proc[0]
                 if proc and proc.poll() is None:
                     proc.kill()
@@ -9002,6 +9030,7 @@ setInterval(upd, 2000);
                 # Headset mode: save current PipeWire level as calibrated
                 import json as _json, re as _re6
                 _headset_cal_loop[0] = False
+                _headset_cal_gen[0] += 1
                 ds = _get_device_status()
                 _update_service_alsa_output(ds["speaker_alsa"])
                 # Always use the PipeWire default sink (currently selected speaker)
@@ -10719,6 +10748,19 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
             log.info("Wake-from-sleep: session started active (HTTP wake)")
         elif _woke_from_sleep:
             log.info("Wake-from-sleep: session started silent (OWW wake) — say '%s wake up' to activate", AGENT_NAME)
+        if _woke_from_sleep and (session._active or session._monitoring):
+            # Belt-and-suspenders against a stale idle clock on the freshly
+            # built session — every known wake trigger already resets
+            # _last_activity at the point it fires (HTTP /wake, /monitor,
+            # DTMF, OWW) and again a few lines above when the sleep-wait
+            # returns, but this mirrors the Mac fork's v3.30.0
+            # stale-idle-after-wake fix at its exact spot (right where the
+            # restored active/monitoring state lands on the new session) so
+            # the two forks stay structurally aligned: without a reset here,
+            # a long sleep would leave _last_activity far in the past and
+            # _idle_watcher's very first 30s check would auto-sleep the new
+            # session again almost immediately.
+            _last_activity[0] = __import__("time").time()
         session_ref[0] = session
         try:
             await session.run()

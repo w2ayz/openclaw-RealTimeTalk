@@ -1,3 +1,53 @@
+## v3.30.4 — 2026-11-18
+
+### Changed
+
+- **Calibration page button layout regrouped** — RTT-Config moved onto the
+  same row as Voice ID/Headset/Speaker/Auto mode; Radio, Monitor, Playback
+  and DTMF buttons (everything radio-related) now sit together in their own
+  row below, instead of RTT-Config splitting them from Radio/Monitor; Latency
+  test moved onto the Audio Devices toggle row (was its own line under
+  Play/Stop/Set-this-level).
+
+### Fixed
+
+- **Play Test could stack multiple overlapping test-audio playbacks.**
+  Clicking `/speaker-cal/loop-start` more than once spawned a new playback
+  thread each time with no check for one already running, and the shared
+  `_headset_cal_loop`/`_headset_cal_proc` flags couldn't safely distinguish
+  threads once more than one was alive — confirmed live, 4 rapid clicks left
+  4 `aplay` processes running concurrently. Fixed with a generation token
+  (`_headset_cal_gen`, bumped on every start/stop): a new loop-start now
+  kills whatever's currently playing and invalidates the old thread's loop
+  condition before starting fresh, with a compare-and-clear guard on
+  `_headset_cal_proc[0]` to avoid a narrow clobbering race between an old
+  thread's cleanup and a new thread's process reference. Also ported to the
+  Mac fork (v3.30.3), adapted to its `sd.OutputStream`-callback loop instead
+  of a subprocess.
+- **`rtt_agc_loop` (the Mixed Input/Zoom loopback virtual sink) kept getting
+  reset to ~1% volume.** Root cause: `_safe_volume_new_sinks()` and
+  `_apply_device_cal()` — RTT's own "unknown device" safety clamp, meant to
+  protect ears/speakers from a surprise-loud *real* new speaker — ran
+  unconditionally over every sink, including our own internal routing sink,
+  which never has (or needs) a calibration entry and so got clamped to the
+  minimum-safe 1% on every device-change event (headset/radio connect or
+  disconnect, or the loopback sink itself being recreated). Same bug class
+  as v3.30.3's loopback-misidentification fix: code iterating "all
+  sinks/modules" without excluding the reserved `rtt_agc_*` prefix. Both
+  functions now skip any sink name containing `rtt_agc`. Local-tooling-only
+  symptom (the loopback sink isn't part of this repo's shipped feature set),
+  but the fix is in the daemon itself.
+- **Waking directly into Monitoring/Active from Sleeping Mode could leave a
+  stale idle clock on the new session**, ported defensively from the Mac
+  fork's v3.30.0 fix (same symptom: a long sleep followed by an almost
+  immediate re-auto-sleep after waking). Pi's wake paths already reset
+  `_last_activity` inline at the trigger point (HTTP `/wake`, `/monitor`,
+  DTMF, OWW) and again when the main loop's sleep-wait returns, so no live
+  repro of the bug itself was found here — this adds the same reset at the
+  exact point Mac's fix targeted (where the new session's restored
+  active/monitoring state lands) to close any path not already covered and
+  keep the two forks structurally aligned.
+
 ## v3.30.3 — 2026-11-17 (Pi-only — no AIOC radio monitor on the Mac fork)
 
 ### Fixed
