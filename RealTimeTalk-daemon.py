@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.30.4"
+__version__ = "3.30.5"
 
 import argparse
 import asyncio
@@ -10580,7 +10580,8 @@ async def main(http_port: int, input_device=None, alsa_output: str = ALSA_OUTPUT
         try:
             await gw.connect()
             break
-        except (ConnectionRefusedError, OSError) as e:
+        except (ConnectionRefusedError, OSError, asyncio.TimeoutError,
+                websockets.exceptions.WebSocketException) as e:
             log.warning("Gateway not ready (%s) — retrying in 5s…", e)
             await asyncio.sleep(5)
     if stop_event.is_set():

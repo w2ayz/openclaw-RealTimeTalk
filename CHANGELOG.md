@@ -1792,6 +1792,18 @@ Behavioral major: with owner-only mode enabled, voice input that previously work
 
 # Changelog
 
+## [3.30.5] — 2026-11-18
+
+### Fixed
+
+- **Daemon no longer dies if the gateway is slow to start at boot** — the
+  startup `gw.connect()` retry loop only caught refused connections/`OSError`,
+  so a websocket opening-handshake timeout (gateway up but not yet answering,
+  as after a reboot) raised an uncaught `TimeoutError` and the daemon exited
+  instead of retrying. The loop now also retries on `asyncio.TimeoutError`
+  and `websockets.exceptions.WebSocketException`. Found on the Mac fork
+  (v3.30.5), ported here; not separately reproduced on the Pi.
+
 ## [3.29.2] — 2026-10-22
 
 ### Added
