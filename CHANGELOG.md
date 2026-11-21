@@ -1792,6 +1792,14 @@ Behavioral major: with owner-only mode enabled, voice input that previously work
 
 # Changelog
 
+## [3.31.3] — 2026-11-20
+
+### Changed
+
+- Version lock only — the Mac fork's v3.31.3 makes its installer build the
+  macOS mic-permission wrapper app unconditionally, which has no Pi
+  equivalent.
+
 ## [3.31.2] — 2026-11-20
 
 ### Changed
