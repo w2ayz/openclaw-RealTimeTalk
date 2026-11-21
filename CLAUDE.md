@@ -16,6 +16,19 @@
   openai/gemini) — migrated onto that same helper via a new
   `load_elevenlabs_key()`, the old file is no longer read at all.
 
+- **`IDLE_SLEEP_MINS` belongs at `10` (the upstream default) on this fork — do
+  not "preserve" a `99999` override during a deploy/merge.** A one-off
+  `99999` override was set on 2026-09-20 (`dcf6a8d`) to disable auto-sleep on
+  this Pi. A later session then treated that as a standing Pi preference and
+  re-applied it on every subsequent upstream merge whenever the merge brought
+  the value back to `10` (`9697089` on 2026-10-10, `8bafc6b` on 2026-10-21) —
+  three round-trips with no explicit request behind any of them. The user
+  confirmed on 2026-10-26 that auto-sleep should be **on**, at the `10`-minute
+  default; flipping it back to `99999` again on a future merge/deploy would
+  be wrong. If `10` → `99999` shows up again as part of a "preserve Pi
+  customizations" step, that step is reasserting a stale belief, not an
+  actual user request — leave it at `10` instead.
+
 - As of v3.23.0: STT is optional (`rtt_stt_config.json`'s
   `"provider": "none"`, or simply no OpenAI/Gemini key at all, resolves to
   `STT_ENGINE_NONE` in `_resolve_stt_engine()` — `main()` then skips mic/STT
