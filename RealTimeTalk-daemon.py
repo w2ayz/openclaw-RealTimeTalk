@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.30.5"
+__version__ = "3.31.0"
 
 import argparse
 import asyncio
@@ -7679,8 +7679,6 @@ Restart daemon after training to reload profiles.</p>
                     is_headset = False
                 else:
                     is_headset = _detect_headset()
-                _mode_label = ("Headset" if is_headset else "Speaker") + \
-                              (" (auto)" if _override is None else " (manual)")
                 _dtmf_btns = (
                     '<a href="/dtmf-monitor" style="padding:4px 11px;font-size:13px;'
                     'text-decoration:none;border:1px solid #334155;border-radius:8px;'
@@ -7740,7 +7738,7 @@ Restart daemon after training to reload profiles.</p>
                     warn = ('<div class="warn">Mic cannot hear speaker — use Manual adjustment below.</div>'
                             ) if prev.get("status") == "no_mic" else ""
                     prev_html = (warn +
-                        f'<p>Last result: PW <b>{prev.get("safe_vol")}%</b> + software <b>{sw_pct}%</b></p>'
+                        f'<p>Last result: System Vol <b>{prev.get("safe_vol")}%</b> + Software Vol <b>{sw_pct}%</b></p>'
                         f'<table class="snrtbl"><tr><th>Level</th><th>Mic SNR</th></tr>{spk_rows}</table>')
                 headset_notice = ('<p class="info" style="margin:4px 0;color:#fa0;">'
                     'Headset mode — use Manual adjustment to set volume.</p>'
@@ -7750,7 +7748,7 @@ Restart daemon after training to reload profiles.</p>
 {headset_notice}
 <table style="border-collapse:collapse;margin:4px 0;width:100%;">
   <tr>
-    <td style="color:#aaa;font-size:13px;width:32px;">Vol</td>
+    <td style="color:#aaa;font-size:13px;width:110px;">System Vol</td>
     <td style="font-weight:bold;font-size:1.1em;width:52px;" id="volval">{ds["spk_vol"]}</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjVol(-10)">− Quieter</button>
@@ -7758,7 +7756,7 @@ Restart daemon after training to reload profiles.</p>
     </div></td>
   </tr>
   <tr>
-    <td style="color:#aaa;font-size:13px;">SW</td>
+    <td style="color:#aaa;font-size:13px;">Software Vol</td>
     <td style="font-weight:bold;font-size:1.1em;" id="swval">{ds["sw_pct"]}%</td>
     <td><div class="row" style="margin:0;gap:5px;">
       <button class="bQ" onclick="adjSW(-10)">− Softer</button>
@@ -7779,6 +7777,14 @@ Restart daemon after training to reload profiles.</p>
 {prev_html}
 <div class="row"><button id="acbtn" onclick="runCal()">Run auto calibration</button></div>
 </div>""")
+                # Whole radio row only renders while a radio interface is connected (Radio Mode
+                # on also counts, so it can still be switched off if the hardware vanished).
+                _radio_row = f"""<div class="radiorow">
+  <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
+  <button id="monitorbtn" onclick="toggleAiocMonitor()" title="Radio Listen: play received radio audio (AIOC in) through a local speaker" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _radio_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Radio Listen{'&nbsp;&#10003;' if _radio_monitor_module[0] is not None else ''}</button>
+  {_playback_btn}
+  {_dtmf_btns}
+</div>""" if (find_radio_port() or _radio_profile_active[0]) else ""
                 body = f"""<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Calibration — RealTimeTalk</title>
@@ -7804,6 +7810,8 @@ canvas{{width:100%;height:38px;border-radius:5px;display:block;margin:6px 0;}}
 #calstatus{{margin:4px 0;font-size:13px;min-height:16px;color:var(--mu);font-family:'JetBrains Mono',monospace;}}
 #mstatus{{margin-top:4px;font-size:13px;color:var(--mu);}}
 .row{{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;}}
+.radiorow{{display:flex;gap:6px;margin:4px 0 10px;flex-wrap:nowrap;}}
+.radiorow>button,.radiorow>a{{flex:0 1 auto;min-width:0;white-space:nowrap;padding:4px 8px!important;font-size:12px!important;overflow:hidden;text-overflow:ellipsis;}}
 button{{padding:7px 14px;border:1px solid var(--bd);color:var(--mu);background:var(--sf2);border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;cursor:pointer;transition:border-color .12s,color .12s,background .12s;}}
 button:hover{{border-color:var(--you);color:var(--you);background:#1e2d3d;box-shadow:0 0 0 2px rgba(56,189,248,.25);}}
 button:disabled{{opacity:.4;cursor:default;border-color:var(--bd);color:var(--mu);background:var(--sf2);box-shadow:none;}}
@@ -7839,23 +7847,15 @@ a:hover{{text-decoration:underline;}}
 </div>
 <div class="devpanel" id="curdev">
   <b>Mic:</b> <span id="panelmic">{ds["mic"]}</span> &nbsp;&middot;&nbsp; Gate: <span id="panelgate">{ds["gate"]}</span> &nbsp;&middot;&nbsp; Gain: <span id="panelgain">{ds["gain"]}</span>x<br>
-  <b>Speaker:</b> <span id="panelspk">{ds["speaker_name"]}</span> &nbsp;&middot;&nbsp; Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
+  <b>Speaker:</b> <span id="panelspk">{ds["speaker_name"]}</span> &nbsp;&middot;&nbsp; Sys Vol: <span id="panelvol">{ds["spk_vol"]}</span> &nbsp;&middot;&nbsp; SW Vol: <span id="panelsw">{ds["sw_pct"]}%</span> &nbsp;&middot;&nbsp; <b>Eff: <span id="paneleff" style="color:var(--gn)">{ds["effective_pct"]}%</span></b>
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
   <span style="font-size:12px;color:var(--mu);font-family:'JetBrains Mono',monospace;">Cal mode:</span>
-  <b style="font-size:13px;color:{'#f59e0b' if is_headset else '#34d399'};">{_mode_label}</b>
-  <button onclick="setCalMode('headset')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset and _override else ''}">Headset</button>
-  <button onclick="setCalMode('speaker')" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if not is_headset and _override else ''}">Speaker</button>
-  <button onclick="setCalMode('auto')" style="padding:4px 11px;font-size:13px;{'color:#38bdf8;border-color:#38bdf8;background:#051928;' if _override is None else ''}">Auto</button>
+  <button id="calmodebtn" onclick="setCalMode('{'speaker' if is_headset else 'headset'}')" style="padding:4px 11px;font-size:13px;{'color:#f59e0b;border-color:#f59e0b;background:#130e02;' if is_headset else 'color:#34d399;border-color:#34d399;background:#021a0e;'}" title="Click to switch to {'Speaker' if is_headset else 'Headset'} mode. Headset hides Auto calibration (the mic cannot hear a headset).">{'&#127911; Headset' if is_headset else '&#128266; Speaker'}{'' if _override is None else '&nbsp;&#9998;'}</button>
   {_voice_id_btn}
   <button id="configbtn" onclick="toggleConfigPanel()" style="padding:4px 11px;font-size:13px;color:#38bdf8;border-color:#38bdf8;" title="Show the command to add/change STT/TTS keys, engine order, or vocabulary">&#9881; RTT-Config</button>
 </div>
-<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px;flex-wrap:wrap;">
-  <button id="radiobtn" onclick="toggleRadio()" style="padding:4px 11px;font-size:13px;{'color:#dc2626;border-color:#dc2626;background:#3b0000;' if _radio_profile_active[0] else 'color:#475569;border-color:#334155;'}">&#128225; Radio{'&nbsp;&#10003;' if _radio_profile_active[0] else ''}</button>
-  <button id="monitorbtn" onclick="toggleAiocMonitor()" style="padding:4px 11px;font-size:13px;{'color:#34d399;border-color:#34d399;background:#021a0e;' if _radio_monitor_module[0] is not None else 'color:#475569;border-color:#334155;'}">&#128266; Monitor{'&nbsp;&#10003;' if _radio_monitor_module[0] is not None else ''}</button>
-  {_playback_btn}
-  {_dtmf_btns}
-</div>
+{_radio_row}
 <div id="configpanel" style="display:none;background:var(--sf2);border:1px solid #38bdf8;border-radius:var(--r);padding:10px 12px;margin:0 0 10px;">
   <div style="font-size:13px;color:var(--tx);margin-bottom:6px;">
     Run this in a terminal (SSH) to add/change STT or TTS keys, reorder the TTS engine chain, or extend the STT vocabulary — safe to re-run anytime:
@@ -7965,6 +7965,7 @@ function startMicCal(){{
     micinfo.textContent='Calibration failed — try again.';}});
 }}
 /* --- Speaker controls --- */
+let _lastRadioPresent={str(bool(find_radio_port()) or _radio_profile_active[0]).lower()};
 function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   const vv=document.getElementById('volval');
   const sv=document.getElementById('swval');
@@ -7989,6 +7990,9 @@ function upd(){{fetch('/speaker-cal/vol').then(r=>r.json()).then(d=>{{
   if(pv) pv.textContent=d.spk_vol;
   if(ps) ps.textContent=d.sw_pct+'%';
   if(pg) pg.textContent=d.gate;
+  // Radio hardware plugged/unplugged (or Radio Mode flipped) with no click on
+  // this page — reload so the radio button row appears/disappears.
+  if(d.radio_present!==_lastRadioPresent) location.reload();
 }});}}
 function adjVol(d){{fetch('/speaker-cal/adjust?type=vol&delta='+d).then(()=>upd());}}
 function adjSW(d){{fetch('/speaker-cal/adjust?type=sw&delta='+d).then(()=>upd());}}
@@ -7998,10 +8002,10 @@ function setAiocMonitor(sink){{
     const mb=document.getElementById('monitorbtn');
     if(mb){{
       if(d.active){{
-        mb.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+        mb.innerHTML='&#128266; Radio Listen&nbsp;&#10003;';
         mb.style.color='#34d399';mb.style.borderColor='#34d399';mb.style.background='#021a0e';
       }} else {{
-        mb.innerHTML='&#128266; Monitor';
+        mb.innerHTML='&#128266; Radio Listen';
         mb.style.color='#475569';mb.style.borderColor='#334155';mb.style.background='';
       }}
     }}
@@ -8013,10 +8017,10 @@ function toggleAiocMonitor(){{
     const mb=document.getElementById('monitorbtn');
     if(!mb) return;
     if(d.active){{
-      mb.innerHTML='&#128266; Monitor&nbsp;&#10003;';
+      mb.innerHTML='&#128266; Radio Listen&nbsp;&#10003;';
       mb.style.color='#34d399';mb.style.borderColor='#34d399';mb.style.background='#021a0e';
     }} else {{
-      mb.innerHTML='&#128266; Monitor';
+      mb.innerHTML='&#128266; Radio Listen';
       mb.style.color='#475569';mb.style.borderColor='#334155';mb.style.background='';
     }}
   }});
@@ -8115,7 +8119,7 @@ function loadDevices(){{
     const showMonCol=!!radioSink||!!monSink; // show Monitor column if a radio interface is present OR loopback active
     h+='<p style="margin:4px 0 8px;color:#9cf;font-weight:bold">Speakers</p>';
     h+='<table class="snrtbl"><tr><th>Name</th><th>Card</th><th>State</th><th></th>'
-      +(showMonCol?'<th style="color:#34d399;white-space:nowrap">&#128266; Monitor</th>':'')
+      +(showMonCol?'<th style="color:#34d399;white-space:nowrap">&#128266; Radio Listen</th>':'')
       +'</tr>';
     (d.sinks||[]).forEach(s=>{{
       if(s.name.startsWith('rtt_agc')||s.name.includes('monitor')) return;
@@ -8992,6 +8996,7 @@ setInterval(upd, 2000);
             elif self.path == "/speaker-cal/vol":
                 import json as _json, time as _tvol, re as _rvol
                 _status = _get_device_status()
+                _status["radio_present"] = bool(find_radio_port()) or _radio_profile_active[0]
                 _now = _tvol.time()
                 _in_tx_window = _tx_display_until[0] > _now
                 _tx_remaining = max(0, int(_tx_display_until[0] - _now)) if _in_tx_window else 0

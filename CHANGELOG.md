@@ -1792,6 +1792,27 @@ Behavioral major: with owner-only mode enabled, voice input that previously work
 
 # Changelog
 
+## [3.31.0] — 2026-11-20
+
+### Changed
+
+- **Radio buttons only show when a radio is connected** — the whole radio row
+  (Radio, Radio Listen, EchoTest, DTMF) is hidden unless a radio interface is
+  present (`find_radio_port()`) or Radio Mode is on, as a single non-wrapping
+  line; the Calibration page's status poll reloads it when the radio is
+  plugged/unplugged. Ported from the Mac fork (v3.31.0).
+- **"Monitor" renamed "Radio Listen"** (button and Speakers table column).
+- **Cal mode is now one toggle button** (Speaker / Headset, ✎ when manually
+  overridden) replacing the Headset / Speaker / Auto buttons. Auto-detection
+  still sets the initial mode.
+- **Volume labels**: Vol → System Vol, SW → Software Vol (Sys Vol / SW Vol in
+  the top panel).
+
+Not ported from the Mac fork's v3.31.0: per-input-device mic gate (the Pi's
+AGC path uses a fixed gate for every mic) and the RTT-Config "open Terminal"
+button (headless Pi — keeps the copy-command panel). Static-checked only
+(`py_compile`, `pyflakes`); **not verified on real Pi hardware**.
+
 ## [3.30.5] — 2026-11-18
 
 ### Fixed
