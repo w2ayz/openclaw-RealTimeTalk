@@ -1792,6 +1792,13 @@ Behavioral major: with owner-only mode enabled, voice input that previously work
 
 # Changelog
 
+## [3.31.2] — 2026-11-20
+
+### Changed
+
+- Version lock only — the Mac fork's v3.31.2 changes the RealTimeTalk.app
+  wrapper icon, which the Pi has no equivalent of.
+
 ## [3.31.1] — 2026-11-20
 
 ### Changed
