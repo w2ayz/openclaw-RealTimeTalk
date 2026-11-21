@@ -30,7 +30,7 @@ Requires:
     MP3 output decoded via mpg123
 """
 
-__version__ = "3.31.3"
+__version__ = "3.31.4"
 
 # Dashboard header logo: voice-bar icon + RealTimeTalk with R/T/T enlarged and
 # the version in small type. Built from __version__ so it never goes stale.

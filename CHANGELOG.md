@@ -1,3 +1,27 @@
+## v3.31.4 — 2026-11-20
+
+### Added
+
+- **Bare `"<name> sleep"` voice phrase** now puts the agent to sleep, alongside
+  `"<name> go to sleep"` (exact match only, like the rest of `SLEEP_PHRASES`).
+  Ported to the Mac fork (v3.31.4).
+
+### Fixed
+
+- **Active-state wake false positive.** While already Active, a wake-phrase
+  hit returns "Yes, I'm here." and drops the transcript, so the fuzzy
+  word-overlap match swallowed ordinary commands like "Echo, clean up the…".
+  Active now requires an exact `WAKE_PHRASES` match; the fuzzy pass still
+  applies for Silent/Monitoring → Active. (Already present on the Mac fork.)
+- **Read-along banner frozen after an agent-call timeout.** The timeout path
+  now clears `_live_speech`, so the dashboard no longer sticks on the
+  abandoned partial reply. (Already present on the Mac fork.)
+
+### Docs
+
+- CLAUDE.md: `IDLE_SLEEP_MINS` stays at the upstream default of `10` on this
+  fork — don't re-apply the old `99999` override on merges.
+
 ## v3.30.4 — 2026-11-18
 
 ### Changed
